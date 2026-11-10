@@ -12,7 +12,7 @@ from core.storage import (
     list_sessions, get_session, create_session, save_session, delete_session,
     is_valid_session_id, session_lock, SessionDeletedError
 )
-from core.engine import MeetingEngine, generate_msg_id, bump_document_revision
+from core.engine import MeetingEngine, generate_msg_id, bump_document_revision, run_with_retry
 from core.executor import Executor, validate_cli_template
 from core.scanner import scan_local_models
 
@@ -620,6 +620,239 @@ def api_resume(session_id):
 
     request_resume(session_id)
     return jsonify({"success": True, "status": "running"})
+
+
+# ----------------- 单个成员的异常恢复（重试 / 跳过） -----------------
+# 某个 CLI 偶发超时/报错时，过去只能「整场重开」——这对一场已经聊了半天的会议代价太高。
+# 这里提供两件更细的工具：
+#   1) 单独重试那一条发言：原地覆盖结果，不产生重复消息，也不重跑其他人；
+#   2) 跳过该成员：它不再占用发言位，余下成员照常推进（配置与历史发言都保留，可随时恢复）。
+_RETRY_LOCK = threading.Lock()
+_RETRY_INFLIGHT: set = set()
+
+
+def _find_message(session: dict, msg_id: str) -> Optional[dict]:
+    for m in session.get("messages") or []:
+        if isinstance(m, dict) and m.get("id") == msg_id:
+            return m
+    return None
+
+
+def _append_system_message(session: dict, text: str, verdict: str = "RECOVER") -> None:
+    session.setdefault("messages", []).append({
+        "id": generate_msg_id(),
+        "sender": "system",
+        "sender_name": "系统广播",
+        "content": text,
+        "phase": session.get("phase", 1),
+        "verdict": verdict,
+        "elapsed_time": 0,
+        "created_at": int(time.time()),
+        "sent_prompt": "",
+        "raw_response": "",
+    })
+
+
+def _resolve_turn_employee(msg: dict, require_cli: bool = True) -> Optional[dict]:
+    """取出发言人配置；主持人 / 系统消息 / 已删除角色不允许被单独重试或跳过。"""
+    settings = load_settings()
+    moderator = MeetingEngine.get_moderator(settings)
+    emp_id = msg.get("sender")
+    if not isinstance(emp_id, str) or not emp_id or emp_id in ("user", "system"):
+        return None
+    if emp_id == moderator.get("id"):
+        return None
+
+    emp = MeetingEngine.get_employee(settings, emp_id)
+    if emp.get("id") == moderator.get("id"):
+        return None
+    if require_cli and (not emp.get("cli_cmd") or not emp.get("enabled", True)):
+        return None
+    return emp
+
+
+@app.route("/api/sessions/<session_id>/messages/<msg_id>/retry", methods=["POST"])
+def api_retry_message(session_id, msg_id):
+    if not is_valid_session_id(session_id):
+        return jsonify({"error": "非法 session_id"}), 400
+    if not _require_action_header():
+        return jsonify({"error": "缺少操作确认头"}), 400
+
+    with _RETRY_LOCK:
+        if msg_id in _RETRY_INFLIGHT:
+            return jsonify({"error": "这条发言正在重试中，请稍候"}), 409
+        with session_lock(session_id):
+            session = get_session(session_id)
+            if not session:
+                return jsonify({"error": "会话不存在"}), 404
+            if session_id in _ACTIVE_SESSIONS:
+                return jsonify({"error": "会议正在推进中（有人正在发言），请等本轮结束再重试"}), 409
+            msg = _find_message(session, msg_id)
+            if not msg:
+                return jsonify({"error": "找不到这条发言"}), 404
+            if msg.get("verdict") not in ("ERROR", "TIMEOUT"):
+                return jsonify({"error": "只有报错/超时的发言才需要重试"}), 400
+            if msg.get("phase") != 1:
+                return jsonify({
+                    "error": "阶段二的异常可以直接「恢复讨论」重问同一位成员；"
+                             "若不想再等它，点「跳过此人」即可"
+                }), 400
+            if session.get("phase", 1) != 1:
+                return jsonify({"error": "会议已进入阶段二，补一条阶段一的立论已经没有意义"}), 400
+            prompt = str(msg.get("sent_prompt") or "").strip()
+            if not prompt:
+                return jsonify({"error": "这条记录没有留存 Prompt（早于该功能上线），无法原样重试"}), 400
+            emp = _resolve_turn_employee(msg)
+            if not emp:
+                return jsonify({"error": "该角色已删除或未配置 CLI，无法重试"}), 400
+
+            workspace_dir = session.get("workspace_dir", "")
+            emp_name = emp.get("name") or emp.get("id")
+            session["current_speaker"] = f"{emp_name} (重新发言中)"
+            save_session(session)
+
+        _RETRY_INFLIGHT.add(msg_id)
+
+    def _worker():
+        resume = False
+        try:
+            res = run_with_retry(emp, prompt, session_id, workspace_dir)
+            with session_lock(session_id):
+                curr = get_session(session_id)
+                if not curr:
+                    return
+                target = _find_message(curr, msg_id)
+                if not target:
+                    return
+                target["content"] = res.output
+                target["raw_response"] = res.raw_output
+                target["elapsed_time"] = res.elapsed
+                target["retry_count"] = int(target.get("retry_count") or 0) + 1
+                target["retried_at"] = int(time.time())
+                curr["current_speaker"] = None
+
+                if res.status == "success":
+                    target["verdict"] = "OPINION"
+                    curr["status"] = "running"
+                    _append_system_message(
+                        curr,
+                        f"🔄 已单独重试 [{emp_name}]，这一条发言用新结果替换（其他人不受影响）。会议继续。"
+                    )
+                    resume = True
+                elif res.status == "stopped":
+                    target["verdict"] = "TIMEOUT" if msg.get("verdict") == "TIMEOUT" else "ERROR"
+                    curr["status"] = "paused"
+                    _append_system_message(curr, f"⏸️ 单独重试 [{emp_name}] 已被用户手动暂停中断。")
+                else:
+                    target["verdict"] = "TIMEOUT" if res.status == "timeout" else "ERROR"
+                    curr["status"] = "paused"
+                    _append_system_message(
+                        curr,
+                        f"⚠️ [{emp_name}] 重试仍然失败（{res.status}）。"
+                        "可以点该条发言旁的「跳过此人」继续推进，或先修好它的 CLI"
+                        "（例如 --tools 参数）再重试。"
+                    )
+                save_session(curr)
+        except Exception as ex:
+            print("[Retry] 单独重试失败:", ex)
+            try:
+                with session_lock(session_id):
+                    curr = get_session(session_id)
+                    if curr:
+                        curr["current_speaker"] = None
+                        curr["status"] = "paused"
+                        _append_system_message(curr, f"⚠️ 重试过程出现异常: {ex}")
+                        save_session(curr)
+            except Exception as e2:
+                print("[Retry] 异常状态落盘失败:", e2)
+        finally:
+            with _RETRY_LOCK:
+                _RETRY_INFLIGHT.discard(msg_id)
+        if resume:
+            request_resume(session_id)
+
+    threading.Thread(target=_worker, daemon=True, name=f"retry-{msg_id[:12]}").start()
+    return jsonify({
+        "success": True,
+        "retrying": True,
+        "session": get_session(session_id) or {}
+    }), 202
+
+
+@app.route("/api/sessions/<session_id>/messages/<msg_id>/skip", methods=["POST"])
+def api_skip_message(session_id, msg_id):
+    """跳过一位成员：它不再占用发言位，会议继续推进（可随时恢复）。"""
+    if not is_valid_session_id(session_id):
+        return jsonify({"error": "非法 session_id"}), 400
+    if not _require_action_header():
+        return jsonify({"error": "缺少操作确认头"}), 400
+
+    with session_lock(session_id):
+        session = get_session(session_id)
+        if not session:
+            return jsonify({"error": "会话不存在"}), 404
+        if session_id in _ACTIVE_SESSIONS:
+            return jsonify({"error": "会议正在推进中，请等本次发言结束再操作"}), 409
+
+        msg = _find_message(session, msg_id)
+        if not msg:
+            return jsonify({"error": "找不到这条发言"}), 404
+        if msg.get("verdict") not in ("ERROR", "TIMEOUT"):
+            return jsonify({"error": "只有报错/超时的发言才能跳过"}), 400
+
+        emp = _resolve_turn_employee(msg, require_cli=False)
+        if not emp:
+            return jsonify({"error": "主持人或系统记录不能被跳过"}), 400
+
+        emp_id, emp_name = emp.get("id"), emp.get("name") or emp.get("id")
+        skipped = [e for e in (session.get("skipped_employees") or []) if isinstance(e, str)]
+        if emp_id not in skipped:
+            skipped.append(emp_id)
+        session["skipped_employees"] = skipped
+
+        # 若当前正在验收该成员提出的 BLOCKER，清理阻断状态让其他成员继续
+        blocker = session.get("blocker_under_review")
+        if blocker and blocker.get("raised_by") == emp_id:
+            session["blocker_under_review"] = None
+            session["blocker_retry_count"] = 0
+
+        msg["verdict"] = "SKIPPED"
+        session["current_speaker"] = None
+        session["status"] = "running"
+        _append_system_message(
+            session,
+            f"⏭ 已将 [{emp_name}] 跳过：它不再占用本次会议的发言位，余下成员照常推进。\n"
+            "配置与历史发言都保留，在「参会成员」面板点「恢复」即可把它拉回来。"
+        )
+        save_session(session)
+
+    request_resume(session_id)
+    return jsonify({"success": True, "session": get_session(session_id) or {}})
+
+
+@app.route("/api/sessions/<session_id>/members/<emp_id>/restore", methods=["POST"])
+def api_restore_member(session_id, emp_id):
+    """把被跳过的成员放回发言位（下一轮/下一位审阅时重新点名）。"""
+    if not is_valid_session_id(session_id):
+        return jsonify({"error": "非法 session_id"}), 400
+    if not _require_action_header():
+        return jsonify({"error": "缺少操作确认头"}), 400
+
+    with session_lock(session_id):
+        session = get_session(session_id)
+        if not session:
+            return jsonify({"error": "会话不存在"}), 404
+        session["skipped_employees"] = [
+            e for e in (session.get("skipped_employees") or []) if e != emp_id
+        ]
+        restored = MeetingEngine.get_employee(load_settings(), emp_id)
+        _append_system_message(
+            session,
+            f"↩️ 已把 [{restored.get('name') or emp_id}] 恢复到发言位，会在下一次点名时参与。",
+        )
+        save_session(session)
+
+    return jsonify({"success": True, "session": get_session(session_id) or {}})
 
 
 # ----------------- 服务生命周期（状态 / 重启 / 停止） -----------------

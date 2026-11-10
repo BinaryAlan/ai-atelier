@@ -224,6 +224,7 @@ def create_session(
         "blocker_retry_count": 0,
         "review_comment_retries": {},
         "passed_employees": [],
+        "skipped_employees": [],   # 被群主跳过的成员（CLI 报错后不再占用发言位）
         "messages": []
     }
     save_session(session_data)

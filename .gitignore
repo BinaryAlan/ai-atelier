@@ -8,3 +8,4 @@ data/sessions/*.json
 data/scanned_models.json
 data/*.tmp*
 .workbuddy/
+.run/

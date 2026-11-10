@@ -33,7 +33,7 @@
 
     <!-- 1. 左侧边栏：会话管理与设置 -->
     <div class="w-64 bg-white border-r border-gray-200 flex flex-col shrink-0">
-      <div class="p-4 border-b border-gray-100 flex items-center justify-between">
+      <div id="service-menu-wrap" class="relative p-4 border-b border-gray-100 flex items-center justify-between">
         <div class="flex items-center gap-2">
           <span class="text-2xl">🏛️</span>
           <div>
@@ -41,7 +41,7 @@
             <p class="text-xs text-gray-500">多 AI 协同圆桌讨论中枢</p>
           </div>
         </div>
-        <div id="service-menu-wrap" class="relative flex items-center gap-0.5">
+        <div class="flex items-center gap-0.5">
           <button @click="toggleServiceMenu" class="p-1.5 rounded-lg transition hover:bg-gray-100" :class="systemStatus?.hot_reload ? 'text-emerald-600' : 'text-gray-500 hover:text-gray-800'" title="服务状态 · 重启 · 停止">
             ⏻
           </button>
@@ -49,8 +49,9 @@
             ⚙️
           </button>
 
-          <!-- 服务控制浮层 -->
-          <div v-if="showServiceMenu" class="absolute right-0 top-full mt-1.5 w-64 bg-white border border-gray-200 rounded-xl shadow-lg z-40 p-3 space-y-2 text-xs">
+          <!-- 服务控制浮层（锚定在侧栏标题栏的下方左缘：侧栏只有 256px，
+               若按 right-0 贴按钮右侧展开，256px 宽的浮层会整体跑到屏幕左侧外看不见） -->
+          <div v-if="showServiceMenu" class="absolute left-2 top-full mt-1.5 w-72 max-w-[calc(100vw-1.5rem)] max-h-[80vh] overflow-y-auto bg-white border border-gray-200 rounded-xl shadow-xl z-40 p-3 space-y-2 text-xs">
             <div class="flex items-center justify-between font-semibold text-gray-600 pb-1.5 border-b border-gray-100">
               <span>服务进程</span>
               <button @click="showServiceMenu = false" class="text-gray-400 hover:text-gray-600">✕</button>
@@ -81,6 +82,11 @@
               <button @click="shutdownService" :disabled="serviceBusy" class="w-full py-1.5 rounded-lg bg-red-50 text-red-700 hover:bg-red-100 font-medium transition disabled:opacity-50">
                 ⏻ 停止服务
               </button>
+              <p class="text-[10px] text-gray-400 leading-relaxed pt-1">
+                终端里等价命令：<code class="font-mono text-gray-600">./run.sh restart</code> /
+                <code class="font-mono text-gray-600">./run.sh stop</code> /
+                <code class="font-mono text-gray-600">./run.sh status</code>
+              </p>
             </div>
           </div>
         </div>
@@ -161,6 +167,7 @@
             >
               <span>👥</span>
               <span>参会成员 ({{ totalParticipantsCount }}人)</span>
+              <span v-if="skippedCount > 0" class="text-[10px] bg-amber-100 text-amber-800 px-1 rounded font-bold">{{ skippedCount }} 已跳过</span>
               <span class="text-[10px] text-gray-400">▾</span>
             </button>
 
@@ -190,15 +197,26 @@
                 >
                   <div class="flex items-center gap-2 truncate">
                     <span class="text-sm">{{ emp.avatar || '🤖' }}</span>
-                    <span class="truncate font-medium text-gray-700">{{ emp.name }}</span>
+                    <span :class="['truncate font-medium', isSkipped(emp.id) ? 'text-gray-400 line-through' : 'text-gray-700']">{{ emp.name }}</span>
+                    <span v-if="isSkipped(emp.id)" class="text-[9px] bg-gray-200 text-gray-600 px-1 rounded font-bold shrink-0">已跳过</span>
                   </div>
-                  <button 
-                    @click.stop="quickRemoveMember(emp.id)" 
-                    class="text-[10px] text-gray-400 hover:text-red-600 px-1.5 py-0.5 rounded hover:bg-red-50 transition shrink-0"
-                    title="从当前会议移除"
-                  >
-                    ✕ 移出
-                  </button>
+                  <div class="flex items-center gap-1 shrink-0">
+                    <button 
+                      v-if="isSkipped(emp.id)"
+                      @click.stop="restoreMember(emp.id)" 
+                      class="text-[10px] text-emerald-600 hover:underline px-1.5 py-0.5 rounded hover:bg-emerald-50 transition"
+                      title="把该成员恢复到发言位"
+                    >
+                      ↩️ 恢复
+                    </button>
+                    <button 
+                      @click.stop="quickRemoveMember(emp.id)" 
+                      class="text-[10px] text-gray-400 hover:text-red-600 px-1.5 py-0.5 rounded hover:bg-red-50 transition shrink-0"
+                      title="从当前会议移除"
+                    >
+                      ✕ 移出
+                    </button>
+                  </div>
                 </div>
                 <div v-if="activeSessionEmployees.length === 0" class="text-[11px] text-gray-400 py-2.5 text-center">
                   暂未添加其他参会员工
@@ -283,7 +301,22 @@
                 <span v-else-if="msg.verdict === 'TIMEOUT'" class="px-1.5 py-0.2 rounded bg-orange-100 text-orange-700 font-bold text-[10px]">⚠️ 响应超时</span>
                 <span v-else-if="msg.verdict === 'ERROR'" class="px-1.5 py-0.2 rounded bg-red-100 text-red-700 font-bold text-[10px]">❌ 执行报错</span>
                 <span v-else-if="msg.verdict === 'ACCEPT'" class="px-1.5 py-0.2 rounded bg-emerald-100 text-emerald-700 font-bold text-[10px]">ACCEPT 验收</span>
+                <span v-else-if="msg.verdict === 'SKIPPED'" class="px-1.5 py-0.2 rounded bg-gray-200 text-gray-600 font-bold text-[10px]">⏭ 已跳过</span>
                 <span v-if="msg.elapsed_time > 0" class="text-[11px] opacity-75">⏱️ {{ msg.elapsed_time }}s</span>
+
+                <!-- 单人故障恢复：只重跑这一条 / 把这个人踢出本轮，避免为一次报错重开整场会议 -->
+                <button
+                  v-if="canRetryMsg(msg)"
+                  @click.stop="retryMessage(msg)"
+                  class="text-[10px] px-1.5 py-0.5 rounded bg-blue-50 text-blue-700 border border-blue-200 hover:bg-blue-100 transition shrink-0"
+                  title="用同一条 Prompt 单独重跑这位成员，结果原地覆盖，不影响其他人"
+                >🔄 重试</button>
+                <button
+                  v-if="canSkipMsg(msg)"
+                  @click.stop="skipMember(msg)"
+                  class="text-[10px] px-1.5 py-0.5 rounded bg-amber-50 text-amber-700 border border-amber-200 hover:bg-amber-100 transition shrink-0"
+                  title="跳过这位成员并继续推进（可随时在参会成员面板恢复）"
+                >⏭ 跳过此人</button>
 
                 <button 
                   v-if="msg.sender !== 'user'" 
@@ -861,7 +894,7 @@
         <p class="text-xs text-gray-500 leading-relaxed">
           后端进程已退出，本页无法再读写数据。<br />
           在项目目录执行
-          <code class="bg-gray-100 px-1 py-0.5 rounded font-mono">./run.sh</code>
+          <code class="bg-gray-100 px-1 py-0.5 rounded font-mono">./run.sh start</code>
           重新启动后，点下方按钮重连。
         </p>
         <button @click="retryConnect" :disabled="serviceBusy" class="w-full py-2 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium transition disabled:opacity-50">

@@ -18,12 +18,13 @@ MAX_PROMPT_CHARS = 100_000
 MIN_TIMEOUT = 10
 MAX_TIMEOUT = 3600
 
-# 模型把「工具调用」当正文吐出来时的产物（CodeBuddy 在 --tools "" 下尤其明显）。
-# 这些不是回答内容，必须剥掉，否则会被当成发言正文入库、甚至干扰结论解析。
+# 模型把「工具调用」或思考链当正文吐出来时的产物（CodeBuddy 在 --tools "" 下尤其明显，
+# 或 DeepSeek 等推理模型外溢的 think 块）。这些不是发言内容，必须剥掉，避免干扰结论解析。
 _TOOL_TAGS = (
     "tool_calls", "system_calls", "function_calls", "tool_use",
     "tool_reminder", "system_reminder", "system_prompt",
     "invoke", "parameter", "result",
+    "thought", "think", "antthinking",
 )
 
 

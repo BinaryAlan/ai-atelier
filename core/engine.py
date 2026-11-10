@@ -15,18 +15,22 @@ def generate_msg_id() -> str:
 # 否则「不通过 / 无法通过 / 未通过」会被判成 PASS，把隐患直接定稿。
 
 _LEADING_NOISE = re.compile(r"^[\s\*_`#>~\-•·\[\]【】()（）<>,，.。!！?？\"'“”‘’]+")
-_VERDICT_LABEL = re.compile(r"^(结论|判定|审查结论|审阅结论|审查结果|审阅结果|结果)\s*[:：]?\s*")
+_VERDICT_LABEL = re.compile(
+    r"^(结论|判定|审查结论|审阅结论|审查结果|审阅结果|评审结论|评审意见|审阅意见|审查意见|验收结论|验收结果|验收意见|意见|结果)\s*[:：]?\s*",
+    re.IGNORECASE
+)
 
 
 def _first_line(text: str) -> str:
     for line in (text or "").strip().splitlines():
-        if line.strip():
-            return line.strip()
+        s = line.strip()
+        if s and not s.startswith("```"):
+            return s
     return ""
 
 
-def _verdict_head(text: str) -> str:
-    head = _LEADING_NOISE.sub("", _first_line(text))
+def _verdict_head(line: str) -> str:
+    head = _LEADING_NOISE.sub("", line)
     head = _VERDICT_LABEL.sub("", head)
     head = _LEADING_NOISE.sub("", head)
     return head.upper()
@@ -34,19 +38,35 @@ def _verdict_head(text: str) -> str:
 
 def parse_review_verdict(output: str) -> str:
     """阶段二审阅结论：仅返回 PASS / BLOCKER / COMMENT。"""
-    head = _verdict_head(output)
-    if head.startswith("BLOCKER"):
-        return "BLOCKER"
-    if head.startswith("PASS"):
-        return "PASS"
+    for line in (output or "").strip().splitlines()[:5]:
+        s = line.strip()
+        if not s or s.startswith("```"):
+            continue
+        head = _verdict_head(s)
+        if head.startswith("BLOCKER"):
+            return "BLOCKER"
+        if head.startswith("PASS"):
+            return "PASS"
+        if _VERDICT_LABEL.match(_LEADING_NOISE.sub("", s)):
+            continue
+        break
     return "COMMENT"
 
 
 def parse_accept_verdict(output: str) -> str:
     """闭环验收结论：仅返回 ACCEPT / REJECT（无法识别按 REJECT 处理，谨慎优先）。"""
-    head = _verdict_head(output)
-    if head.startswith("ACCEPT"):
-        return "ACCEPT"
+    for line in (output or "").strip().splitlines()[:5]:
+        s = line.strip()
+        if not s or s.startswith("```"):
+            continue
+        head = _verdict_head(s)
+        if head.startswith("ACCEPT"):
+            return "ACCEPT"
+        if head.startswith("REJECT"):
+            return "REJECT"
+        if _VERDICT_LABEL.match(_LEADING_NOISE.sub("", s)):
+            continue
+        break
     return "REJECT"
 
 
@@ -221,6 +241,10 @@ def run_with_retry(
     res2.elapsed += res.elapsed
     if res2.status == "success":
         res2.output = sanitize_model_output(res2.output)
+
+    if res2.status in ("stopped", "timeout"):
+        res2.raw_output = f"{res.raw_output}\n--- retry ---\n{res2.raw_output}"
+        return res2
 
     if res2.status == "success" and not looks_like_incomplete(res2.output):
         res2.raw_output = f"{res.raw_output}\n--- retry ---\n{res2.raw_output}"
@@ -489,6 +513,9 @@ class MeetingEngine:
         moderator = MeetingEngine.get_moderator(settings)
 
         # 参会成员去重 + 过滤（已删除/已停用/未配置 CLI 的角色不再占用发言位）
+        # 另外剔除被群主「跳过」的成员：某个 CLI 挂了不该拖住整场会议，
+        # 跳过只影响本会话的发言席位，配置与历史发言都保留，随时可恢复。
+        skipped = {eid for eid in (session.get("skipped_employees") or []) if isinstance(eid, str)}
         workers: List[str] = []
         for eid in session.get("employee_ids") or []:
             if not isinstance(eid, str) or eid in workers:
@@ -498,10 +525,21 @@ class MeetingEngine:
                 continue
             if not emp.get("enabled", True) or not emp.get("cli_cmd"):
                 continue
+            if eid in skipped:
+                continue
             workers.append(eid)
 
         if not workers:
             session["status"] = "idle"
+            session["current_speaker"] = None
+            if skipped:
+                session["messages"].append(
+                    MeetingEngine._create_pause_message(
+                        moderator["id"], moderator["name"], session.get("phase", 1),
+                        "⏸️ 当前没有可继续发言的参会成员（已被跳过或不可用）。"
+                        "流程回到空闲：可在「参会成员」面板恢复被跳过的成员，或直接发消息给出新指令。"
+                    )
+                )
             save_session(session, merge=True)
             return False, "没有可用的参会成员"
 
@@ -672,9 +710,17 @@ class MeetingEngine:
             else:
                 # 阶段一全部人发表完毕 ➡️ 主持人合成首版草案文档
                 user_topic = session["messages"][last_user_idx]["content"] if last_user_idx != -1 else "方案研讨"
-                opinions = [m for m in relevant_msgs
-                            if m.get("phase") == 1 and m.get("verdict") == "OPINION"]
-                valid_ops, silent_names = split_valid_opinions(opinions)
+                p1_worker_msgs = [m for m in relevant_msgs
+                                  if m.get("phase") == 1 and m.get("sender") in workers]
+                valid_ops, dropped_names = split_valid_opinions(p1_worker_msgs)
+                valid_senders = {m.get("sender") for m in valid_ops}
+                silent_names = []
+                for wid in workers:
+                    if wid not in valid_senders:
+                        w_emp = MeetingEngine.get_employee(settings, wid)
+                        w_name = w_emp["name"] if w_emp else wid
+                        if w_name not in silent_names:
+                            silent_names.append(w_name)
                 p1_context = [f"[{m['sender_name']}]: {m['content']}" for m in valid_ops]
                 context_str = "\n".join(p1_context) if p1_context else "（本轮没有任何成员给出有效发言，下面只能依据议题本身整理）"
                 gap_note = ""
@@ -759,6 +805,22 @@ class MeetingEngine:
         elif phase == 2:
             blocker = session.get("blocker_under_review")
 
+            # 提出阻断问题的成员已被跳过：没人能验收，只能视为该阻断撤回，
+            # 否则每次推进都会去找它要 [ACCEPT]，会议永远卡在同一个阻断上。
+            if blocker and blocker.get("raised_by") in skipped:
+                withdrawn = MeetingEngine.get_employee(settings, blocker.get("raised_by"))
+                session["blocker_under_review"] = None
+                session["blocker_retry_count"] = 0
+                session["messages"].append(
+                    MeetingEngine._create_pause_message(
+                        moderator["id"], moderator["name"], 2,
+                        f"⏭ 阻断问题的提出者 [{withdrawn.get('name')}] 已被跳过，该阻断视为撤回 "
+                        f"（问题原文仍留在上方，可人工判断是否还成立）。流程继续询问余下成员。"
+                    )
+                )
+                save_session(session, merge=True)
+                return True, "提出阻断的成员已被跳过，阻断视为撤回"
+
             # 子分支 A: 存在等待验收的阻断问题
             if blocker:
                 raiser_id = blocker.get("raised_by")
@@ -821,7 +883,7 @@ class MeetingEngine:
                 session["current_speaker"] = f"{raiser_emp['name']} (正在验收方案修改)"
                 save_session(session, merge=True)
 
-                res_verify = Executor.run_employee(raiser_emp, verify_prompt, session_id=session_id, workspace_dir=workspace_dir)
+                res_verify = run_with_retry(raiser_emp, verify_prompt, session_id, workspace_dir)
 
                 stop = MeetingEngine._stop_if_interrupted(session, session_id, res_verify.status)
                 if stop:

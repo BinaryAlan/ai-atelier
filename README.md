@@ -52,7 +52,21 @@
 * 发送 `@所有人` 会让会议**重置回阶段一**，以群主最新意志重新立论；
 * 定向 `@某位 AI` 只让该成员单独应答，不会打断正在进行中的会议状态。
 
-### 5. 虚拟员工（Employee）配置系统
+### 5. 单个 AI 掉线不再拖垮整场会议（重试 / 跳过）
+某个成员超时或报错时，会议会挂起等你处理，此时**不必重开会议**：
+
+| 你看到的 | 可以做什么 |
+| --- | --- |
+| 阶段一某条发言标了 `❌ 执行报错` / `⚠️ 响应超时` | 点该条旁边的 **🔄 重试**：用同一条 Prompt 单独重跑这位成员，结果**原地覆盖**这一条（不新增消息、不重跑别人），成功后会议自动继续 |
+| 重试仍然失败，或不想再等它 | 点 **⏭ 跳过此人**：该成员不再占用发言位，余下成员照常审阅与结案 |
+| 阶段二的审阅 / 验收异常 | 直接点 **恢复讨论** 会重问同一位成员；若一直失败就 **跳过此人**，流程继续 |
+| 想把它拉回来 | 「👥 参会成员」面板里被跳过的成员会显示 `已跳过`，点 **↩️ 恢复** 即回到发言位 |
+
+> 跳过的只是「本会话的发言席位」：角色配置和历史发言全部保留，也不会改动其他人的结论。
+> 若提出 `[BLOCKER]` 的成员被你跳过，系统会把该阻断视为撤回并在群里说明（问题原文仍留在上方可人工判断）。
+> 如果全部成员都被跳过，会议回到空闲而不是空转。
+
+### 6. 虚拟员工（Employee）配置系统
 * 每一位参会 AI 是一个“虚拟员工”：
   * 支持自定义姓名、工号、头像颜色、职能职位、专属 Prompt 人设；
   * **执行模式**：当前原生支持本地 CLI 命令（免 API Key，直接驱动 `agy` 与 `codebuddy` 模型），底层架构已解耦，未来无缝扩展 HTTP/API 模式。
@@ -79,10 +93,25 @@ cd ai-meeting
 pip install -r requirements.txt
 
 # 3. 运行服务
-python3 app.py
+./run.sh            # 等价于 ./run.sh start
 ```
 
 浏览器打开 `http://127.0.0.1:5050` 即可开始会议！
+
+### 命令行管理（start / stop / restart / status）
+
+`run.sh` 现在就是服务的管理脚本，不用再回终端按 Ctrl+C 或 `kill`：
+
+```bash
+./run.sh start      # 前台启动（Ctrl+C 退出）；已在运行会提示改用 restart
+./run.sh status     # 查看 PID、已运行时长、热重载、在跑会议数
+./run.sh restart    # 重启：终止在跑的 CLI → 会议转暂停 → 进程重启（终端里那个进程会自己重拉）
+./run.sh stop       # 优雅停止：先走 API，失败再按端口 / PID 兜底 SIGTERM→SIGKILL
+```
+
+* `restart` / `stop` 优先调用 `/api/system/*`，所以和网页上的 ⏻ 按钮**完全等价**（都会终止 CLI 子进程、把 running 会议落盘为 paused 并写入系统广播）；
+* 若服务已经卡死、HTTP 不响应，`stop` 会自动退化为按 `lsof -ti tcp:$PORT` 找监听进程并发信号；
+* PID 记录在 `.run/app.pid`（已加入 `.gitignore`），换端口只需 `PORT=5051 ./run.sh status`。
 
 ### 服务生命周期（左侧栏 ⏻ 按钮）
 
@@ -92,10 +121,12 @@ python3 app.py
 | --- | --- |
 | ⏻ 服务状态 | 显示 PID、已运行时长、在跑会议数、热重载是否开启 |
 | 🔄 重启服务 | 终止在跑的 CLI 子进程 → 会议转为暂停 → 进程重启 → 页面自动刷新 |
-| ⏻ 停止服务 | 同上，但退出后不再拉起，界面显示「服务已停止」，重新运行 `./run.sh` 后点「重试连接」 |
+| ⏻ 停止服务 | 同上，但退出后不再拉起，界面显示「服务已停止」，重新运行 `./run.sh start` 后点「重试连接」 |
 
 对应接口：`GET /api/system/status`、`POST /api/system/restart`、`POST /api/system/shutdown`
 （后两者要求请求头 `X-Meeting-Action: 1`，用于挡住跨站表单误触发；且沿用本机 Host 校验）。
+
+单人故障恢复接口：`POST /api/sessions/<id>/messages/<msg_id>/retry`、`.../skip`、`POST /api/sessions/<id>/members/<emp_id>/restore`（同样要求 `X-Meeting-Action: 1`）。
 
 > **关于热重载**：`FLASK_DEBUG=1`（默认）时改 `.py` 会自动重启 worker 进程，无需手动重启；
 > 改 `static/` 下的 html / js、或改 `data/settings.json` 本来就不需要重启。
@@ -141,7 +172,7 @@ ai-meeting/
 │   ├── index.html      # 现代化极简响应式 Web 界面
 │   └── js/app.js       # Vue.js 前端交互驱动
 ├── requirements.txt
-├── run.sh              # 一键启动脚本
+├── run.sh              # 服务管理脚本（start / stop / restart / status）
 ├── LICENSE
 └── README.md
 ```

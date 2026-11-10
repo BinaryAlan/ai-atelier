@@ -114,6 +114,12 @@ createApp({
       // 仅统计：主持人 (1) + 本场实际参会员工数 (未选中的不被计数)
       return 1 + this.activeSessionEmployees.length;
     },
+    // 被群主「跳过」的成员（CLI 报错后不再占发言位，可随时恢复）
+    skippedCount() {
+      return Array.isArray(this.currentSession?.skipped_employees)
+        ? this.currentSession.skipped_employees.length
+        : 0;
+    },
     favoriteSessions() {
       return this.sessions.filter(s => s.is_favorite);
     },
@@ -480,6 +486,90 @@ createApp({
       }
     },
 
+    // ---------------- 单个成员的异常恢复（重试 / 跳过 / 恢复） ----------------
+    isSkipped(empId) {
+      return Array.isArray(this.currentSession?.skipped_employees)
+        && this.currentSession.skipped_employees.includes(empId);
+    },
+
+    // 只有「阶段一里某个成员自己没答好」才值得原地重跑：
+    // 阶段二的异常靠「恢复讨论」本来就会重问同一个人，重跑固定一条反而会打乱阻断闭环。
+    canRetryMsg(msg) {
+      if (!msg) return false;
+      if (msg.verdict !== "ERROR" && msg.verdict !== "TIMEOUT") return false;
+      if (msg.phase !== 1) return false;
+      // 会议已经走到阶段二了，再回头补一条立论没有意义
+      if ((this.currentSession?.phase || 1) !== 1) return false;
+      if (!msg.sent_prompt) return false;
+      return !this.isModerator(msg.sender) && msg.sender !== "user" && msg.sender !== "system";
+    },
+
+    canSkipMsg(msg) {
+      if (!msg) return false;
+      if (msg.verdict !== "ERROR" && msg.verdict !== "TIMEOUT") return false;
+      return !this.isModerator(msg.sender) && msg.sender !== "user" && msg.sender !== "system";
+    },
+
+    async retryMessage(msg) {
+      if (!this.currentSessionId || !msg) return;
+      try {
+        const res = await fetch(`/api/sessions/${this.currentSessionId}/messages/${msg.id}/retry`, {
+          method: "POST",
+          headers: { "X-Meeting-Action": "1" }
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          alert(data.error || `重试失败: HTTP ${res.status}`);
+          return;
+        }
+        if (data.session) this.currentSession = data.session;
+      } catch (e) {
+        alert("重试请求失败: " + e);
+      }
+    },
+
+    async skipMember(msg) {
+      if (!this.currentSessionId || !msg) return;
+      const name = msg.sender_name || "该成员";
+      if (!confirm(
+        `跳过 [${name}] 并继续推进？\n\n` +
+        "它不再占用本次会议的发言位，余下成员照常推进；\n" +
+        "配置与历史发言都保留，可在「参会成员」面板点「恢复」拉回来。"
+      )) return;
+      try {
+        const res = await fetch(`/api/sessions/${this.currentSessionId}/messages/${msg.id}/skip`, {
+          method: "POST",
+          headers: { "X-Meeting-Action": "1" }
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          alert(data.error || `跳过失败: HTTP ${res.status}`);
+          return;
+        }
+        if (data.session) this.currentSession = data.session;
+      } catch (e) {
+        alert("跳过请求失败: " + e);
+      }
+    },
+
+    async restoreMember(empId) {
+      if (!this.currentSessionId || !empId) return;
+      try {
+        const res = await fetch(`/api/sessions/${this.currentSessionId}/members/${empId}/restore`, {
+          method: "POST",
+          headers: { "X-Meeting-Action": "1" }
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          alert(data.error || `恢复失败: HTTP ${res.status}`);
+          return;
+        }
+        if (data.session) this.currentSession = data.session;
+      } catch (e) {
+        alert("恢复请求失败: " + e);
+      }
+    },
+
     // ---------------- 服务进程控制 ----------------
     formatUptime(sec) {
       const s = Math.max(0, Math.floor(sec || 0));
@@ -598,7 +688,10 @@ createApp({
     async pollActiveSession() {
       const targetId = this.currentSessionId;
       if (!targetId) return;
-      if (this.currentSession && this.currentSession.status === "running") {
+      // 单独重试期间 status 可能仍是 paused，只有 current_speaker 能反映「正在跑」
+      const busy = this.currentSession
+        && (this.currentSession.status === "running" || this.currentSession.current_speaker);
+      if (busy) {
         try {
           const res = await fetch(`/api/sessions/${targetId}`);
           if (res.ok) {
