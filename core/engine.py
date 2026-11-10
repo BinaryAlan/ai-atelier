@@ -9,23 +9,21 @@ class MeetingEngine:
     def get_moderator(settings: Dict[str, Any]) -> Dict[str, Any]:
         return settings.get("moderator", {
             "id": "moderator",
-            "name": "首席主持 (Antigravity)",
-            "title": "会议主持人兼总架构师",
+            "name": "会议主持人",
+            "title": "会议主持人",
             "avatar": "👑",
             "avatar_color": "#d97706",
             "type": "cli",
             "cli_cmd": 'agy -p "{prompt}"',
-            "system_prompt": "你是会议主持人兼全局首席架构师。注重工程规范、模块解耦与可靠性。负责综合立论生成方案草案、协调分歧并出具最终定稿。",
+            "system_prompt": "你是会议主持人。负责主持会议进程、客观梳理各方意见、汇总生成方案草案，并在全员达成共识时出具终稿文档。",
             "timeout": 180
         })
 
     @staticmethod
     def get_employee(settings: Dict[str, Any], emp_id: str) -> Optional[Dict[str, Any]]:
-        # 优先匹配普通员工
         for e in settings.get("employees", []):
             if e["id"] == emp_id:
                 return e
-        # 匹配主持人
         moderator = MeetingEngine.get_moderator(settings)
         if moderator.get("id") == emp_id:
             return moderator
@@ -36,12 +34,10 @@ class MeetingEngine:
         if "@所有人" in content or "@all" in content.lower() or "@All" in content:
             return True, None
 
-        # 检查主持人
         mod = MeetingEngine.get_moderator(settings)
         if f"@{mod['name']}" in content or "@主持人" in content:
             return False, mod["id"]
 
-        # 检查普通员工角色
         for emp in settings.get("employees", []):
             if f"@{emp['name']}" in content or f"@{emp['id']}" in content:
                 return False, emp["id"]
@@ -99,7 +95,7 @@ class MeetingEngine:
         moderator = MeetingEngine.get_moderator(settings)
         workers = session.get("employee_ids", [])
         if not workers:
-            session["status"] = "concluded"
+            session["status"] = "idle"
             save_session(session)
             return False, "没有选定参会成员"
 
@@ -107,7 +103,7 @@ class MeetingEngine:
         workspace_dir = session.get("workspace_dir", "")
 
         # -------------------------------------------------------------
-        # 1. 针对特定员工/主持人的点名直接应答 (单挑问答，完成后即停)
+        # 1. 针对特定成员的点名直接应答 (定向呼叫，完成后转为等待)
         # -------------------------------------------------------------
         direct_target = session.get("target_direct_mention")
         if direct_target:
@@ -119,13 +115,13 @@ class MeetingEngine:
                         last_user_msg = m["content"]
                         break
 
-                prompt = f"""【群内用户指令】: {last_user_msg}
+                prompt = f"""【会议用户指令】: {last_user_msg}
 
-你是【{target_emp['name']}】({target_emp['title']})。
-人设定位: {target_emp['system_prompt']}
-本地工作目录: {workspace_dir}
+你是【{target_emp['name']}】({target_emp.get('title', '参会专家')})。
+人设背景: {target_emp.get('system_prompt', '')}
+当前工作目录: {workspace_dir}
 
-请直接回答群主的上述要求。言简意赅，发挥你的专业特长。"""
+请直接回应群主的上述要求。请保持专业、客观、务实，直奔核心。"""
 
                 session["current_speaker"] = target_emp["name"]
                 save_session(session)
@@ -157,7 +153,7 @@ class MeetingEngine:
         phase = session.get("phase", 1)
 
         # -------------------------------------------------------------
-        # 2. 阶段一：参会员工自由立论 (Brainstorm / Opening)
+        # 2. 阶段一：参会专家自由发表意见 (Brainstorm / Opening)
         # -------------------------------------------------------------
         if phase == 1:
             spoken_in_p1 = set()
@@ -179,22 +175,24 @@ class MeetingEngine:
 
             if next_emp_id:
                 emp = MeetingEngine.get_employee(settings, next_emp_id)
-                user_topic = session["messages"][last_user_idx]["content"] if last_user_idx != -1 else "技术架构设计"
+                user_topic = session["messages"][last_user_idx]["content"] if last_user_idx != -1 else "方案讨论"
 
                 p1_context = [f"[{m['sender_name']}]: {m['content']}" for m in relevant_msgs if m.get("phase") == 1]
                 context_str = "\n".join(p1_context) if p1_context else "(你是第一个发言人)"
 
                 prompt = f"""【会议议题】: {user_topic}
 本地工作目录: {workspace_dir}
-你的身份是【{emp['name']}】({emp['title']})。
-人设定位: {emp['system_prompt']}
+你的身份是【{emp['name']}】({emp.get('title', '参会专家')})。
+人设定位: {emp.get('system_prompt', '')}
 
-【其他专家已发表的初步观点】:
+【其他参会人已发表的初步观点】:
 {context_str}
 
 【你的任务】:
-请基于你的专业视角，直接给出你对该议题的初步架构思路、关键技术选型与核心考量。
-要求：直奔核心，言简意赅，控制在 100~200 字。"""
+请基于你的专业视角，直接给出你对该议题的核心见解、关键思路与落地建议。
+要求：
+1. 语言精炼，务实客观，控制在 100~200 字左右；
+2. 提出有建设性的方案要点，不讲套话。"""
 
                 session["current_speaker"] = emp["name"]
                 save_session(session)
@@ -220,42 +218,45 @@ class MeetingEngine:
                 })
 
                 if is_timeout or is_error:
-                    now = int(time.time())
+                    # 如果超时或报错，挂起会议等待群主介入
+                    session["status"] = "paused"
                     session["messages"].append({
-                        "id": f"msg_mod_fallback_{now}",
+                        "id": f"msg_mod_fallback_{int(time.time())}",
                         "sender": moderator["id"],
                         "sender_name": f"{moderator['name']} (主持人)",
-                        "content": f"⚠️ 参会专家 [{emp['name']}] {'响应超时' if is_timeout else '执行报错'}。主持人已记录，暂不影响其他成员继续立论。",
+                        "content": f"⚠️ 参会人 [{emp['name']}] {'响应超时未回复' if is_timeout else '执行报错'}。会议已自动挂起，等待群主介入处理。",
                         "phase": 1,
-                        "verdict": "FALLBACK",
+                        "verdict": "PAUSE",
                         "elapsed_time": 0,
-                        "created_at": now,
+                        "created_at": int(time.time()),
                         "sent_prompt": "",
                         "raw_response": ""
                     })
+                    save_session(session)
+                    return True, f"[{emp['name']}] 阶段一立论超时，已挂起"
 
                 save_session(session)
-                return True, f"[{emp['name']}] 阶段一立论完毕"
+                return True, f"[{emp['name']}] 阶段一发言完毕"
 
             else:
-                # 阶段一全部打工仔立论完毕 ➡️ 主持人合成首版草案，切入阶段二！
-                user_topic = session["messages"][last_user_idx]["content"] if last_user_idx != -1 else "技术架构设计"
+                # 阶段一全部人发表完毕 ➡️ 主持人合成首版草案文档
+                user_topic = session["messages"][last_user_idx]["content"] if last_user_idx != -1 else "方案讨论"
                 p1_context = [f"[{m['sender_name']}]: {m['content']}" for m in relevant_msgs if m.get("phase") == 1 and m.get("verdict") == "OPINION"]
                 context_str = "\n".join(p1_context)
 
-                synth_prompt = f"""【技术方案草案合成任务】
+                synth_prompt = f"""【会议纪要与方案草案整理任务】
 议题: "{user_topic}"
-本地工作目录: {workspace_dir}
-各专家初步立论汇总如下：
+工作目录: {workspace_dir}
+各专家初步发言汇总如下：
 {context_str}
 
-你是会议主持人兼总架构师【{moderator['name']}】。
-请综合各方专家的共识与合理建议，输出一份标准 Markdown 格式的《技术方案架构设计草案 (v1)》。
+你是【{moderator['name']}】。
+请综合各方建议与共识，输出一份标准的《方案草案与工作纪要 (初稿)》。
 要求：
-- 结构清晰，包含：1. 总体设计原则; 2. 核心架构与技术选型; 3. 关键实现流程; 4. 潜在风险点。
-- 输出纯 Markdown 内容，便于后续各专家进行严格审查。"""
+- 结构清晰、条理规整，涵盖核心结论、执行要点与待办细节；
+- 输出纯 Markdown 格式。"""
 
-                session["current_speaker"] = f"{moderator['name']} (主持人正在合成草案)"
+                session["current_speaker"] = f"{moderator['name']} (主持人正在整理草案)"
                 save_session(session)
 
                 draft_doc, elapsed = Executor.run_employee(moderator, synth_prompt, session_id=session_id)
@@ -268,7 +269,7 @@ class MeetingEngine:
                     "id": f"msg_{int(time.time())}_{len(session['messages'])}",
                     "sender": moderator["id"],
                     "sender_name": f"{moderator['name']} (主持人)",
-                    "content": f"📋 主持人已综合大家立论合成首版方案草案（已更新在右侧面板）。现正式进入【阶段二：严格审查与重大阻断质询】！",
+                    "content": f"📋 主持人已综合整理首版方案纪要（已更新在右侧面板）。现正式进入【阶段二：审阅与隐患质询】！",
                     "phase": 2,
                     "verdict": "SYNTHESIS",
                     "elapsed_time": elapsed,
@@ -280,45 +281,45 @@ class MeetingEngine:
                 return True, "主持人已合成首版方案草案，进入阶段二"
 
         # -------------------------------------------------------------
-        # 3. 阶段二：严格审查与重大阻断阶段 (Strict Review & Blocker Fix)
+        # 3. 阶段二：方案审阅与重大隐患质询
         # -------------------------------------------------------------
         elif phase == 2:
             blocker = session.get("blocker_under_review")
 
-            # 子分支 A: 存在等待验收的阻断缺陷
+            # 子分支 A: 存在等待验收的阻断问题
             if blocker:
                 raiser_id = blocker.get("raised_by")
                 raiser_emp = MeetingEngine.get_employee(settings, raiser_id) or moderator
                 issue_text = blocker.get("issue", "")
 
-                fix_prompt = f"""【阻断缺陷修复任务】
+                fix_prompt = f"""【方案修订任务】
 当前方案草案如下：
 {session['document']}
 
-专家【{raiser_emp['name']}】指出了以下致命缺陷：
+参会人【{raiser_emp['name']}】指出了以下重大问题：
 "{issue_text}"
 
-请对当前方案进行针对性修订以消除该致命缺陷。
+请对方案草案进行针对性修订以解决该问题。
 请直接输出修订后的完整 Markdown 方案文档。"""
 
-                session["current_speaker"] = f"{moderator['name']} (主持人正在修复阻断)"
+                session["current_speaker"] = f"{moderator['name']} (主持人正在修改草案)"
                 save_session(session)
 
                 updated_doc, elapsed_fix = Executor.run_employee(moderator, fix_prompt, session_id=session_id)
                 session["document"] = updated_doc
 
-                verify_prompt = f"""【阻断缺陷闭环验收】
-你刚才指出的致命阻断缺陷为: "{issue_text}"
-主持人已根据你的意见更新了方案文档（最新文档已更新在右侧共享面板）。
+                verify_prompt = f"""【方案修订闭环验收】
+你刚才指出的重大问题为: "{issue_text}"
+主持人已根据你的建议更新了方案草案（最新文档见右侧面板）。
 
 【封闭式验收要求】:
-请仅针对修改是否消除了你指出的致命缺陷进行判定。
+请仅针对修改是否解决了你指出的核心问题进行判定。
 回答第一行必须严格为以下两者之一：
-[ACCEPT] - 致命缺陷已消除，接受方案
-[REJECT: 仍有致命缺陷简述] - 仍存在致命隐患
+[ACCEPT] - 核心问题已解决，接受修改
+[REJECT: 仍有问题简述] - 仍存在严重漏洞
 随后用 50~100 字阐述依据。严禁扩散引入不相关的新议题！"""
 
-                session["current_speaker"] = f"{raiser_emp['name']} (正在验收方案修复)"
+                session["current_speaker"] = f"{raiser_emp['name']} (正在验收方案修改)"
                 save_session(session)
 
                 verify_reply, elapsed_verify = Executor.run_employee(raiser_emp, verify_prompt, session_id=session_id)
@@ -328,6 +329,7 @@ class MeetingEngine:
                 is_error = "【CLI 执行报错" in verify_reply or "【执行异常" in verify_reply
 
                 if is_timeout or is_error:
+                    # 关键修复：超时/报错绝不能判定为通过！
                     session["messages"].append({
                         "id": f"msg_{int(time.time())}_{len(session['messages'])}",
                         "sender": raiser_emp["id"],
@@ -340,24 +342,21 @@ class MeetingEngine:
                         "sent_prompt": verify_prompt,
                         "raw_response": verify_reply
                     })
-                    session["blocker_under_review"] = None
-                    session["passed_employees"] = [raiser_id]
-                    
-                    now = int(time.time())
+                    session["status"] = "paused"
                     session["messages"].append({
-                        "id": f"msg_mod_accept_fallback_{now}",
+                        "id": f"msg_mod_pause_{int(time.time())}",
                         "sender": moderator["id"],
                         "sender_name": f"{moderator['name']} (主持人)",
-                        "content": f"⚠️ 专家 [{raiser_emp['name']}] 验收回复超时。主持人复核该修改有效，默认予以裁定通过，继续推进后续审查。",
+                        "content": f"⚠️ 参会人 [{raiser_emp['name']}] 验收回复超时。流程已自动暂停，等待群主决策。",
                         "phase": 2,
-                        "verdict": "FALLBACK",
+                        "verdict": "PAUSE",
                         "elapsed_time": 0,
-                        "created_at": now,
+                        "created_at": int(time.time()),
                         "sent_prompt": "",
                         "raw_response": ""
                     })
                     save_session(session)
-                    return True, "验收超时，主持人介入兜底"
+                    return True, "验收回复超时，已挂起流程"
 
                 is_accepted = "[ACCEPT]" in verify_reply or "ACCEPT" in verify_reply[:20]
                 session["messages"].append({
@@ -384,17 +383,18 @@ class MeetingEngine:
                     save_session(session)
                     return True, f"[{raiser_emp['name']}] 仍有异议已记录"
 
-            # 子分支 B: 无未决阻断，让下一位打工仔专家审查
+            # 子分支 B: 无未决问题，让下一位参会人审阅
             passed = set(session.get("passed_employees", []))
             unpassed_ids = [eid for eid in workers if eid not in passed]
 
             if not unpassed_ids:
-                session["status"] = "concluded"
+                # 真正全员通过！平稳结案，留出后续交流空间
+                session["status"] = "idle"
                 session["messages"].append({
                     "id": f"msg_{int(time.time())}_{len(session['messages'])}",
                     "sender": moderator["id"],
                     "sender_name": f"{moderator['name']} (主持人)",
-                    "content": "🎉 全体参会专家均已审核通过（PASS），无任何重大阻断缺陷！最终方案已定稿，会议圆满闭幕！",
+                    "content": "📋 本轮讨论方案全员已审阅完成，最新共识已整理在右侧面板。群主如有新想法或要调整方向，可随时输入新消息继续讨论。",
                     "phase": 2,
                     "verdict": "CONCLUDED",
                     "elapsed_time": 0,
@@ -403,26 +403,26 @@ class MeetingEngine:
                     "raw_response": ""
                 })
                 save_session(session)
-                return True, "全体专家达成一致，会议圆满结束"
+                return True, "全体审阅完成，转为空闲等待"
 
             reviewer_id = unpassed_ids[0]
             reviewer_emp = MeetingEngine.get_employee(settings, reviewer_id)
 
-            review_prompt = f"""【方案客观技术审查】
-你是【{reviewer_emp['name']}】({reviewer_emp['title']})。
-人设定位: {reviewer_emp['system_prompt']}
-本地工作目录: {workspace_dir}
+            review_prompt = f"""【方案客观审阅】
+你是【{reviewer_emp['name']}】({reviewer_emp.get('title', '参会专家')})。
+人设背景: {reviewer_emp.get('system_prompt', '')}
+当前工作目录: {workspace_dir}
 
-请审阅最新版技术方案：
+请仔细审阅最新版方案草案：
 {session['document']}
 
-【审查原则】:
-1. 保持客观理性与专业严谨。代码风格、细微命名等非原则性小建议不作为阻断项；
-2. 只有导致系统崩溃、并发死锁、严重安全隐患或不可逆架构冲突的致命缺陷，才允许标注为 BLOCKER；
+【审阅原则】:
+1. 保持客观理性与专业严谨。细微措辞等非原则性小建议不作为阻断项；
+2. 只有发现存在严重逻辑漏洞、重大事实硬伤或不可行隐患，才允许标注为 BLOCKER；
 3. 你的回答首行必须严格为以下二者之一：
-   [PASS] - 方案在你的专业领域可行、无致命硬伤，同意通过
-   [BLOCKER: 致命缺陷简述] - 发现不可接受的严重技术缺陷
-4. 随后用 100 字左右客观阐述技术依据与改进建议。"""
+   [PASS] - 方案整体可行、无严重漏洞，同意通过
+   [BLOCKER: 问题简述] - 发现不可接受的严重问题
+4. 随后用 100 字左右客观阐述理由与改进建议。"""
 
             session["current_speaker"] = reviewer_emp["name"]
             save_session(session)
@@ -434,6 +434,7 @@ class MeetingEngine:
             is_error = "【CLI 执行报错" in reply or "【执行异常" in reply
 
             if is_timeout or is_error:
+                # 关键修复：绝对不将未回复者加入 passed！而是暂停并提醒群主
                 verdict = "TIMEOUT" if is_timeout else "ERROR"
                 session["messages"].append({
                     "id": f"msg_{int(time.time())}_{len(session['messages'])}",
@@ -448,44 +449,28 @@ class MeetingEngine:
                     "raw_response": reply
                 })
 
+                session["status"] = "paused"
                 now = int(time.time())
                 session["messages"].append({
-                    "id": f"msg_mod_review_fallback_{now}",
+                    "id": f"msg_mod_pause_{now}",
                     "sender": moderator["id"],
                     "sender_name": f"{moderator['name']} (主持人)",
-                    "content": f"⚠️ 参会专家 [{reviewer_emp['name']}] {'审查超时' if is_timeout else '执行报错'}。主持人已介入记录，暂时跳过该专家的本轮质询，会议继续推进。",
+                    "content": f"⚠️ 参会人 [{reviewer_emp['name']}] {'审阅超时未回复' if is_timeout else '执行报错'}。会议已自动挂起，等待群主决策（可点击右上角恢复重试，或直接输入指令纠偏）。",
                     "phase": 2,
-                    "verdict": "FALLBACK",
+                    "verdict": "PAUSE",
                     "elapsed_time": 0,
                     "created_at": now,
                     "sent_prompt": "",
                     "raw_response": ""
                 })
-                passed.add(reviewer_id)
-                session["passed_employees"] = list(passed)
-
-                if len(session["passed_employees"]) == len(workers):
-                    session["status"] = "concluded"
-                    session["messages"].append({
-                        "id": f"msg_{int(time.time())}_{len(session['messages'])}",
-                        "sender": moderator["id"],
-                        "sender_name": f"{moderator['name']} (主持人)",
-                        "content": "🎉 全体参会专家均已审查完毕！最终方案已定稿，会议圆满闭幕！",
-                        "phase": 2,
-                        "verdict": "CONCLUDED",
-                        "elapsed_time": 0,
-                        "created_at": int(time.time()),
-                        "sent_prompt": "",
-                        "raw_response": ""
-                    })
-
                 save_session(session)
-                return True, f"[{reviewer_emp['name']}] 审查超时，主持人已接管继续"
+                return True, f"[{reviewer_emp['name']}] 审阅超时，流程已暂停"
 
+            # 正常回复的判断
             first_line = reply.strip().split("\n")[0]
             if "[BLOCKER" in first_line or "BLOCKER:" in reply[:30]:
                 match = re.search(r"\[?BLOCKER:?\s*([^\]\n]+)\]?", reply)
-                issue_desc = match.group(1).strip() if match else "发现严重架构/性能隐患"
+                issue_desc = match.group(1).strip() if match else "发现严重方案隐患"
                 session["blocker_under_review"] = {
                     "raised_by": reviewer_id,
                     "issue": issue_desc,
@@ -512,12 +497,12 @@ class MeetingEngine:
             })
 
             if verdict == "PASS" and len(session["passed_employees"]) == len(workers):
-                session["status"] = "concluded"
+                session["status"] = "idle"
                 session["messages"].append({
                     "id": f"msg_{int(time.time())}_{len(session['messages'])}",
                     "sender": moderator["id"],
                     "sender_name": f"{moderator['name']} (主持人)",
-                    "content": "🎉 全体参会专家均已审核通过（PASS），无任何重大阻断缺陷！最终方案已定稿，会议圆满闭幕！",
+                    "content": "📋 本轮讨论方案全员已审阅完成，最新共识已整理在右侧面板。群主如有新想法或要调整方向，可随时输入新消息继续讨论。",
                     "phase": 2,
                     "verdict": "CONCLUDED",
                     "elapsed_time": 0,
@@ -527,6 +512,6 @@ class MeetingEngine:
                 })
 
             save_session(session)
-            return True, f"[{reviewer_emp['name']}] 完成审查，结论: {verdict}"
+            return True, f"[{reviewer_emp['name']}] 完成审阅，结论: {verdict}"
 
         return False, "无动作"

@@ -20,13 +20,13 @@ createApp({
       settings: {
         moderator: {
           id: "moderator",
-          name: "Antigravity (首席主持)",
-          title: "会议主持人兼总架构师",
+          name: "会议主持人",
+          title: "会议主持人",
           avatar: "👑",
           avatar_color: "#d97706",
           type: "cli",
           cli_cmd: 'agy -p "{prompt}"',
-          system_prompt: "你是会议主持人兼全局首席架构师。负责综合立论生成草案、协调分歧并在结案时输出定稿。",
+          system_prompt: "你是会议主持人。负责主持会议进程、客观梳理各方意见、汇总生成方案草案，并在全员达成共识时出具终稿文档。",
           timeout: 180
         },
         employees: []
@@ -37,9 +37,20 @@ createApp({
       selectedWorkspaceFile: null,
       selectedFileContent: "",
 
+      showMemberDropdown: false,
+
       // 新建议题弹窗
       showNewSessionModal: false,
       newSessionForm: {
+        title: "",
+        workspace_dir: "",
+        employee_ids: []
+      },
+
+      // 编辑当前会议弹窗 (改名、改目录、增减参会人员)
+      showEditSessionModal: false,
+      editingSessionForm: {
+        id: "",
         title: "",
         workspace_dir: "",
         employee_ids: []
@@ -99,11 +110,20 @@ createApp({
   mounted() {
     this.init();
     this.pollInterval = setInterval(this.pollActiveSession, 1500);
+    // 全局点击关闭参会人下拉框
+    document.addEventListener("click", this.handleGlobalClick);
   },
   beforeUnmount() {
     if (this.pollInterval) clearInterval(this.pollInterval);
+    document.removeEventListener("click", this.handleGlobalClick);
   },
   methods: {
+    handleGlobalClick(e) {
+      if (!e.target.closest(".relative")) {
+        this.showMemberDropdown = false;
+      }
+    },
+
     async init() {
       await this.loadSettings();
       await this.loadSessions();
@@ -138,6 +158,7 @@ createApp({
       this.currentSessionId = id;
       this.selectedWorkspaceFile = null;
       this.selectedFileContent = "";
+      this.showMemberDropdown = false;
       try {
         const res = await fetch(`/api/sessions/${id}`);
         if (res.ok) {
@@ -152,7 +173,7 @@ createApp({
 
     // ----------------- 新建议题 Modal -----------------
     openNewSessionModal() {
-      const defaultDir = this.currentSession?.workspace_dir || "/Users/lc/Code/ai-meeting";
+      const defaultDir = this.currentSession?.workspace_dir || "/Users/lc/Documents/social skill";
       this.newSessionForm = {
         title: "",
         workspace_dir: defaultDir,
@@ -162,7 +183,7 @@ createApp({
     },
 
     async confirmCreateSession() {
-      const title = this.newSessionForm.title.trim() || "新架构评审会议";
+      const title = this.newSessionForm.title.trim() || "新方案研讨";
       try {
         const res = await fetch("/api/sessions", {
           method: "POST",
@@ -182,7 +203,46 @@ createApp({
       }
     },
 
-    // ----------------- 收藏与重命名 -----------------
+    // ----------------- 编辑会议信息 Modal (标题/目录/参会人) -----------------
+    openEditSessionModal(session) {
+      if (!session) return;
+      this.editingSessionForm = {
+        id: session.id,
+        title: session.title,
+        workspace_dir: session.workspace_dir || "/Users/lc/Documents/social skill",
+        employee_ids: [...(session.employee_ids || [])]
+      };
+      this.showEditSessionModal = true;
+    },
+
+    async saveEditedSession() {
+      const sid = this.editingSessionForm.id;
+      if (!sid) return;
+      try {
+        const res = await fetch(`/api/sessions/${sid}`, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            title: this.editingSessionForm.title.trim(),
+            workspace_dir: this.editingSessionForm.workspace_dir.trim(),
+            employee_ids: this.editingSessionForm.employee_ids
+          })
+        });
+        if (res.ok) {
+          const updated = await res.json();
+          this.showEditSessionModal = false;
+          await this.loadSessions();
+          if (this.currentSessionId === sid) {
+            this.currentSession = updated;
+            this.loadWorkspaceFiles();
+          }
+        }
+      } catch (e) {
+        alert("保存会议配置失败: " + e);
+      }
+    },
+
+    // ----------------- 收藏与删除 -----------------
     async toggleFavorite(session) {
       try {
         await fetch(`/api/sessions/${session.id}`, {
@@ -196,25 +256,6 @@ createApp({
         }
       } catch (e) {
         console.error("收藏操作失败:", e);
-      }
-    },
-
-    async promptRename(session) {
-      const newTitle = prompt("修改会议标题:", session.title);
-      if (newTitle && newTitle.trim()) {
-        try {
-          await fetch(`/api/sessions/${session.id}`, {
-            method: "PUT",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ title: newTitle.trim() })
-          });
-          await this.loadSessions();
-          if (this.currentSessionId === session.id) {
-            this.currentSession.title = newTitle.trim();
-          }
-        } catch (e) {
-          console.error("重命名失败:", e);
-        }
       }
     },
 
@@ -235,7 +276,6 @@ createApp({
       }
     },
 
-    // ----------------- 拉起和踢掉参会员工 (基于唯一 id) -----------------
     async saveSessionEmployees() {
       if (!this.currentSessionId) return;
       try {
@@ -249,7 +289,37 @@ createApp({
       }
     },
 
-    // ----------------- 消息发送与暂停 -----------------
+    // ----------------- 消息输入与 Backspace 整删 @ 标签 -----------------
+    onInputKeydown(e) {
+      if (e.key === "Backspace") {
+        const textarea = this.$refs.chatInput;
+        if (!textarea) return;
+        const start = textarea.selectionStart;
+        const end = textarea.selectionEnd;
+        
+        // 当光标未做选中且光标位置大于 0 时，检查光标前面是否紧挨着 @... 标签
+        if (start === end && start > 0) {
+          const textBefore = textarea.value.substring(0, start);
+          // 匹配光标前最近的一个 @标签 (例如 "@所有人 " 或 "@DeepSeek-V4 (DS4) ")
+          const match = textBefore.match(/@([^\s@]+)\s?$/);
+          if (match) {
+            e.preventDefault();
+            const tagLength = match[0].length;
+            const newText = textarea.value.substring(0, start - tagLength) + textarea.value.substring(start);
+            this.inputContent = newText;
+            this.$nextTick(() => {
+              textarea.selectionStart = textarea.selectionEnd = start - tagLength;
+            });
+            return;
+          }
+        }
+      }
+      if (e.key === "Enter" && !e.shiftKey) {
+        e.preventDefault();
+        this.sendMessage();
+      }
+    },
+
     async sendMessage() {
       const text = this.inputContent.trim();
       if (!text || !this.currentSessionId) return;
@@ -318,6 +388,10 @@ createApp({
 
     insertMention(name) {
       this.inputContent = (this.inputContent ? this.inputContent + " " : "") + `@${name} `;
+      this.$nextTick(() => {
+        const textarea = this.$refs.chatInput;
+        if (textarea) textarea.focus();
+      });
     },
 
     isModerator(senderId) {
@@ -409,7 +483,6 @@ createApp({
       }
     },
 
-    // 打开编辑主持人弹窗
     openEditModeratorModal() {
       this.isEditingModerator = true;
       this.isEditingEmployee = false;
@@ -420,14 +493,12 @@ createApp({
       this.showEmpEditModal = true;
     },
 
-    // 打开添加员工角色弹窗 (自动生成系统全局唯一唯一 ID)
     openAddEmployeeModal() {
       this.isEditingModerator = false;
       this.isEditingEmployee = false;
       this.editingEmpIdx = -1;
       this.selectedModelId = "";
       
-      // 生成具有高区分度且唯一的前缀 ID: emp_时间戳_随机串
       const uniqueId = "emp_" + Date.now().toString(36) + "_" + Math.random().toString(36).substring(2, 6);
       
       this.editingEmp = {
@@ -445,7 +516,6 @@ createApp({
       this.showEmpEditModal = true;
     },
 
-    // 打开编辑员工角色弹窗 (保留原本不可变的唯一 ID)
     openEditEmployeeModal(emp, idx) {
       this.isEditingModerator = false;
       this.isEditingEmployee = true;
@@ -483,10 +553,8 @@ createApp({
       }
 
       if (this.isEditingModerator) {
-        // 保存主持人配置
         this.settings.moderator = JSON.parse(JSON.stringify(this.editingEmp));
       } else {
-        // 保存员工配置 (通过稳定唯一 ID 索引)
         if (this.isEditingEmployee && this.editingEmpIdx >= 0) {
           this.settings.employees[this.editingEmpIdx] = JSON.parse(JSON.stringify(this.editingEmp));
         } else {
@@ -499,9 +567,8 @@ createApp({
 
     deleteEmployee(idx) {
       const targetEmp = this.settings.employees[idx];
-      if (confirm(`确定要删除员工角色 [${targetEmp.name}] 吗？`)) {
+      if (confirm(`确定要删除角色 [${targetEmp.name}] 吗？`)) {
         this.settings.employees.splice(idx, 1);
-        // 如果当前会话里有该 ID，自动清理
         if (this.currentSession?.employee_ids) {
           this.currentSession.employee_ids = this.currentSession.employee_ids.filter(id => id !== targetEmp.id);
           this.saveSessionEmployees();

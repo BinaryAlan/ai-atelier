@@ -48,8 +48,8 @@ def scan_local_models(force_refresh: bool = False) -> List[Dict[str, Any]]:
             "model_id": "default",
             "display_name": "Google Antigravity (Gemini)",
             "cli_cmd": 'agy -p "{prompt}"',
-            "default_title": "全局首席架构师",
-            "default_prompt": "你是 Google Antigravity，技术评审专家。注重工程规范、模块解耦、长远扩展性与高可用性，以客观理性的态度提供方案。"
+            "default_title": "综合规划顾问",
+            "default_prompt": "注重全局规划、系统化思考与规范性，以客观理性的态度提供综合建议。"
         })
 
     # 2. CodeBuddy CLI
@@ -61,18 +61,18 @@ def scan_local_models(force_refresh: bool = False) -> List[Dict[str, Any]]:
                 raw_models = [m.strip() for m in match.group(1).split(",")]
                 for mid in raw_models:
                     display = MODEL_ALIASES.get(mid, f"CodeBuddy ({mid})")
-                    title = "AI 技术顾问"
-                    prompt = f"你是基于 {mid} 模型的资深技术顾问，具备扎实的工程实现与逻辑推演能力，客观务实地提供技术建议。"
+                    title = "专业顾问"
+                    prompt = f"基于 {mid} 模型，具备扎实的逻辑推演与分析能力，客观务实地提供建议。"
 
                     if "deepseek" in mid.lower():
-                        title = "系统架构与性能专家"
-                        prompt = "你是技术评审团的底层系统与性能架构专家。关注算法复杂度、并发安全与高可用防护，以严谨专业的态度提出建设性意见。"
+                        title = "深度逻辑与风控顾问"
+                        prompt = "擅长深度逻辑推演、推演潜在隐患与方案边界风险，以客观严谨的态度提出建设性意见。"
                     elif "hy4" in mid.lower() or "hy3" in mid.lower():
-                        title = "业务落地与工程效能专家"
-                        prompt = "你是技术评审团的工程效能与落地顾问。注重开发周期、团队维护成本与业务适配度，提供务实平稳的技术路径。"
+                        title = "落地执行与效能顾问"
+                        prompt = "注重实际落地执行可行性、周期效率与实操适配度，提供稳健务实的路径建议。"
                     elif "kimi" in mid.lower():
-                        title = "复杂上下文分析顾问"
-                        prompt = "你是复杂文档与规范分析顾问，善于梳理复杂架构规范与详细边界条件。"
+                        title = "长文档与资料分析顾问"
+                        prompt = "擅长长篇资料梳理、文本规范提炼与详细条款分析。"
 
                     models.append({
                         "cli": "codebuddy",

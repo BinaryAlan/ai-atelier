@@ -31,13 +31,12 @@
 
     <!-- 1. 左侧边栏：会话管理与设置 -->
     <div class="w-64 bg-white border-r border-gray-200 flex flex-col shrink-0">
-      <!-- 头部 -->
       <div class="p-4 border-b border-gray-100 flex items-center justify-between">
         <div class="flex items-center gap-2">
           <span class="text-2xl">🏛️</span>
           <div>
             <h1 class="font-bold text-gray-900 leading-tight">AI-Meeting</h1>
-            <p class="text-xs text-gray-500">架构评审与协作中枢</p>
+            <p class="text-xs text-gray-500">多 AI 协同圆桌讨论中枢</p>
           </div>
         </div>
         <button @click="openSettingsModal" class="p-1.5 text-gray-500 hover:text-gray-800 hover:bg-gray-100 rounded-lg transition" title="员工与模型设置">
@@ -84,7 +83,7 @@
             <button @click.stop="toggleFavorite(s)" class="text-xs hover:scale-110" :title="s.is_favorite ? '取消收藏' : '收藏'">
               {{ s.is_favorite ? '★' : '☆' }}
             </button>
-            <button @click.stop="promptRename(s)" class="text-xs hover:scale-110" title="重命名">✏️</button>
+            <button @click.stop="openEditSessionModal(s)" class="text-xs hover:scale-110" title="编辑会议（改名/目录/参会人）">✏️</button>
             <button @click.stop="deleteSessionItem(s.id)" class="text-xs hover:scale-110 text-red-500" title="删除">🗑️</button>
           </div>
         </div>
@@ -96,28 +95,68 @@
 
     <!-- 2. 中间区：会议室群聊面板 -->
     <div class="flex-1 flex flex-col bg-white border-r border-gray-200 min-w-0">
-      <!-- 房间顶部信息栏 -->
-      <div class="px-5 py-3 border-b border-gray-100 flex items-center justify-between bg-white shrink-0">
+      <!-- 房间顶部信息栏 (整合参会人员抽屉与会议设置) -->
+      <div class="px-5 py-3 border-b border-gray-100 flex items-center justify-between bg-white shrink-0 relative">
         <div class="flex items-center gap-3 truncate">
           <h2 class="font-bold text-gray-900 text-base truncate">{{ currentSession?.title || '未选择会议' }}</h2>
-          <span v-if="currentSession?.status === 'concluded'" class="px-2 py-0.5 text-xs font-semibold rounded-full bg-green-100 text-green-800 shrink-0">
-            ✅ 结案定稿
-          </span>
-          <span v-else-if="currentSession?.phase === 1" class="px-2 py-0.5 text-xs font-semibold rounded-full bg-blue-100 text-blue-800 shrink-0">
-            阶段一: 自由立论
+          <button @click="openEditSessionModal(currentSession)" class="text-xs text-gray-400 hover:text-blue-600 transition" title="编辑会议配置">✏️</button>
+
+          <!-- 阶段标识 -->
+          <span v-if="currentSession?.phase === 1" class="px-2 py-0.5 text-xs font-semibold rounded-full bg-blue-100 text-blue-800 shrink-0">
+            阶段一: 自由发言
           </span>
           <span v-else-if="currentSession?.phase === 2" class="px-2 py-0.5 text-xs font-semibold rounded-full bg-purple-100 text-purple-800 shrink-0">
-            阶段二: 严格审查
+            阶段二: 审阅与隐患质询
           </span>
         </div>
 
-        <!-- 右上角会议控制: 暂停 / 继续 -->
-        <div class="flex items-center gap-2 shrink-0">
+        <div class="flex items-center gap-3 shrink-0">
+          <!-- 优雅的参会成员下拉选择器 (即使有20个员工也不挤爆顶部) -->
+          <div class="relative">
+            <button 
+              @click="showMemberDropdown = !showMemberDropdown"
+              class="px-2.5 py-1 text-xs rounded-lg border border-gray-200 bg-gray-50 hover:bg-gray-100 text-gray-700 flex items-center gap-1.5 transition"
+            >
+              <span>👥</span>
+              <span>参会成员 ({{ currentSession?.employee_ids?.length || 0 }}/{{ availableEmployees.length }})</span>
+              <span class="text-[10px] text-gray-400">▾</span>
+            </button>
+
+            <!-- 参会人员下拉选择浮层 -->
+            <div 
+              v-if="showMemberDropdown" 
+              class="absolute right-0 top-full mt-1.5 w-60 bg-white border border-gray-200 rounded-xl shadow-lg z-30 p-2.5 space-y-1 text-xs"
+            >
+              <div class="font-semibold text-gray-500 pb-1 border-b border-gray-100 flex items-center justify-between">
+                <span>参会员工选择</span>
+                <button @click="showMemberDropdown = false" class="text-gray-400 hover:text-gray-600">✕</button>
+              </div>
+              <div class="max-h-48 overflow-y-auto space-y-1 pt-1">
+                <label 
+                  v-for="emp in availableEmployees" 
+                  :key="emp.id"
+                  class="flex items-center gap-2 p-1.5 rounded hover:bg-gray-50 cursor-pointer"
+                >
+                  <input 
+                    type="checkbox" 
+                    :value="emp.id" 
+                    v-model="currentSession.employee_ids" 
+                    @change="saveSessionEmployees"
+                    class="rounded text-blue-600 h-3.5 w-3.5"
+                  >
+                  <span>{{ emp.avatar || '🤖' }}</span>
+                  <span class="truncate font-medium text-gray-700">{{ emp.name }}</span>
+                </label>
+              </div>
+            </div>
+          </div>
+
+          <!-- 暂停 / 恢复 控制按钮 -->
           <button 
             v-if="currentSession?.status === 'running'"
             @click="pauseMeeting" 
             class="px-3 py-1.5 text-xs font-medium rounded-lg bg-red-50 text-red-700 hover:bg-red-100 border border-red-200 transition flex items-center gap-1.5 shadow-sm"
-            title="立即强制掐死当前所有正在跑的 AI 任务"
+            title="立即终止当前正在执行的 AI 任务"
           >
             <span>🛑</span> 暂停会议
           </button>
@@ -131,41 +170,15 @@
         </div>
       </div>
 
-      <!-- 参会模型勾选条 -->
-      <div class="px-5 py-2 bg-gray-50/70 border-b border-gray-100 flex items-center justify-between text-xs text-gray-600 shrink-0">
-        <div class="flex items-center gap-3 truncate">
-          <span class="font-medium text-gray-500 shrink-0">参会成员:</span>
-          <div class="flex items-center gap-3 flex-wrap">
-            <label 
-              v-for="emp in availableEmployees" 
-              :key="emp.id" 
-              class="flex items-center gap-1.5 cursor-pointer hover:text-gray-900 select-none"
-            >
-              <input 
-                type="checkbox" 
-                :value="emp.id" 
-                v-model="currentSession.employee_ids" 
-                @change="saveSessionEmployees"
-                class="rounded text-blue-600 focus:ring-blue-500 h-3.5 w-3.5"
-              >
-              <span>{{ emp.name }}</span>
-            </label>
-          </div>
-        </div>
-        <div class="text-[11px] text-gray-400 shrink-0 truncate ml-2">
-          📁 {{ currentSession?.workspace_dir ? currentSession.workspace_dir.split('/').slice(-2).join('/') : '默认工作区' }}
-        </div>
-      </div>
-
-      <!-- 聊天消息流 (已移除顶部警告条) -->
+      <!-- 聊天消息流 -->
       <div ref="chatContainer" class="flex-1 overflow-y-auto p-5 space-y-4">
         <div v-if="!currentSession?.messages?.length" class="text-center py-16 text-gray-400">
           <span class="text-4xl">💡</span>
-          <p class="mt-3 text-sm font-medium text-gray-600">在此发起指令或讨论</p>
-          <p class="text-xs text-gray-400 mt-1">支持 @特定AI 单挑答复、@所有人 进行协同立论与方案审查</p>
+          <p class="mt-3 text-sm font-medium text-gray-600">在此发起议题、提问或展开多方讨论</p>
+          <p class="text-xs text-gray-400 mt-1">支持 @特定AI 单独咨询、@所有人 进行协同方案构思与审阅</p>
         </div>
 
-        <!-- 消息卡片 -->
+        <!-- 消息气泡卡片 -->
         <div 
           v-for="msg in currentSession?.messages || []" 
           :key="msg.id"
@@ -180,7 +193,7 @@
             {{ getEmployeeAvatar(msg.sender) }}
           </div>
 
-          <!-- 消息气泡 -->
+          <!-- 气泡主体 -->
           <div 
             :class="[
               'max-w-[85%] rounded-2xl px-4 py-3 shadow-sm text-sm leading-relaxed border',
@@ -194,22 +207,20 @@
             <div v-if="msg.sender !== 'system'" class="flex items-center justify-between gap-3 mb-1 text-xs opacity-80">
               <div class="flex items-center gap-1.5">
                 <span class="font-semibold">{{ msg.sender_name }}</span>
-                <!-- 主持人专属金色标志 -->
+                <!-- 主持人专属标识 -->
                 <span v-if="isModerator(msg.sender)" class="px-1.5 py-0.2 rounded bg-amber-200 text-amber-900 font-bold text-[10px] flex items-center gap-0.5">
                   👑 主持人
                 </span>
               </div>
               <div class="flex items-center gap-2">
-                <!-- 状态徽章 -->
                 <span v-if="msg.verdict === 'PASS'" class="px-1.5 py-0.2 rounded bg-green-100 text-green-700 font-bold text-[10px]">PASS 通过</span>
                 <span v-else-if="msg.verdict === 'BLOCKER'" class="px-1.5 py-0.2 rounded bg-red-100 text-red-700 font-bold text-[10px]">⚠️ BLOCKER 阻断</span>
                 <span v-else-if="msg.verdict === 'TIMEOUT'" class="px-1.5 py-0.2 rounded bg-orange-100 text-orange-700 font-bold text-[10px]">⚠️ 响应超时</span>
                 <span v-else-if="msg.verdict === 'ERROR'" class="px-1.5 py-0.2 rounded bg-red-100 text-red-700 font-bold text-[10px]">❌ 执行报错</span>
-                <span v-else-if="msg.verdict === 'FALLBACK'" class="px-1.5 py-0.2 rounded bg-amber-100 text-amber-800 font-bold text-[10px]">🛡️ 主持人接管</span>
                 <span v-else-if="msg.verdict === 'ACCEPT'" class="px-1.5 py-0.2 rounded bg-emerald-100 text-emerald-700 font-bold text-[10px]">ACCEPT 验收</span>
                 <span v-if="msg.elapsed_time > 0" class="text-[11px] opacity-75">⏱️ {{ msg.elapsed_time }}s</span>
 
-                <!-- ℹ️ 审查图标：查看该条消息发送的 Prompt 与原始输出 -->
+                <!-- ℹ️ 审查按钮：查看 Prompt 与原始回复 -->
                 <button 
                   v-if="msg.sender !== 'user'" 
                   @click.stop="openInspectModal(msg)" 
@@ -226,7 +237,7 @@
           </div>
         </div>
 
-        <!-- 正在思考/审查动画 -->
+        <!-- 等待思考动画 -->
         <div v-if="currentSession?.current_speaker" class="flex items-center gap-2 text-xs text-blue-600 bg-blue-50 p-2.5 rounded-lg border border-blue-100 animate-pulse">
           <span class="animate-spin">⏳</span>
           <span>正在等待 <strong>[{{ currentSession.current_speaker }}]</strong> 响应中...</span>
@@ -235,7 +246,7 @@
 
       <!-- 底部输入栏 -->
       <div class="p-4 border-t border-gray-200 bg-white shrink-0">
-        <!-- 快捷 @ 菜单 -->
+        <!-- 快捷 @ 菜单 (水平滚动条，不挤爆垂直空间) -->
         <div class="flex items-center gap-1.5 mb-2 overflow-x-auto pb-1">
           <span class="text-xs text-gray-400 shrink-0">快捷@:</span>
           <button 
@@ -261,11 +272,12 @@
           </button>
         </div>
 
-        <!-- 文本输入框 -->
+        <!-- 文本输入框 (支持 Backspace 一键整删 @ 标签) -->
         <div class="flex gap-2">
           <textarea 
+            ref="chatInput"
             v-model="inputContent" 
-            @keydown.enter.exact.prevent="sendMessage"
+            @keydown="onInputKeydown"
             rows="2"
             placeholder="输入议题、补充要求或指令... (Enter 发送)" 
             class="flex-1 border border-gray-300 rounded-lg p-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 resize-none"
@@ -280,14 +292,14 @@
       </div>
     </div>
 
-    <!-- 3. 右侧栏：两个 Tab (会议记录 vs 工作目录) -->
+    <!-- 3. 右侧栏：两个 Tab (会议方案/纪要 vs 工作目录) -->
     <div class="w-[440px] bg-gray-50 flex flex-col shrink-0 border-l border-gray-200">
       <div class="flex border-b border-gray-200 bg-white text-xs font-semibold text-gray-600 shrink-0">
         <button 
           @click="rightTab = 'doc'" 
           :class="['flex-1 py-3 text-center transition border-b-2 flex items-center justify-center gap-1.5', rightTab === 'doc' ? 'text-blue-600 border-blue-600 bg-blue-50/20' : 'border-transparent hover:text-gray-900']"
         >
-          <span>📄</span> 会议方案草案
+          <span>📄</span> 会议方案 / 纪要
         </button>
         <button 
           @click="rightTab = 'workspace'" 
@@ -297,7 +309,7 @@
         </button>
       </div>
 
-      <!-- Tab 1: 会议方案草案 -->
+      <!-- Tab 1: 会议方案纪要 -->
       <div v-show="rightTab === 'doc'" class="flex-1 overflow-y-auto p-4">
         <div 
           v-html="renderedDoc" 
@@ -361,17 +373,17 @@
             <input 
               type="text" 
               v-model="newSessionForm.title" 
-              placeholder="例如: 订单系统防重设计与高并发演进"
+              placeholder="例如: 亲子教育内容编写大纲 / 业务运营方案评估"
               class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
             >
           </div>
 
           <div>
-            <label class="block text-xs font-semibold text-gray-600 mb-1">本地工作目录 (读取资料与交付物所在路径):</label>
+            <label class="block text-xs font-semibold text-gray-600 mb-1">本地工作目录 (读取资料与交付物路径):</label>
             <input 
               type="text" 
               v-model="newSessionForm.workspace_dir" 
-              placeholder="/Users/lc/Code/my-project"
+              placeholder="/Users/lc/Documents/my-project"
               class="w-full border border-gray-300 rounded-lg px-3 py-2 text-xs font-mono focus:outline-none focus:ring-2 focus:ring-blue-500"
             >
           </div>
@@ -383,18 +395,18 @@
               <div>
                 <div class="font-bold text-xs text-amber-950 flex items-center gap-1">
                   <span>{{ settings.moderator?.name }}</span>
-                  <span class="px-1.5 py-0.2 bg-amber-200 text-amber-900 text-[10px] rounded font-bold">总架构师</span>
+                  <span class="px-1.5 py-0.2 bg-amber-200 text-amber-900 text-[10px] rounded font-bold">主持人</span>
                 </div>
                 <div class="text-[11px] text-amber-800/80">{{ settings.moderator?.title }}</div>
               </div>
             </div>
-            <span class="text-xs text-amber-700 font-medium">负责综合立论与结案定稿</span>
+            <span class="text-xs text-amber-700 font-medium">主持讨论并整理终稿</span>
           </div>
 
           <!-- 参会打工仔选择 -->
           <div>
-            <label class="block text-xs font-semibold text-gray-600 mb-1.5">勾选参会员工角色:</label>
-            <div class="grid grid-cols-2 gap-2">
+            <label class="block text-xs font-semibold text-gray-600 mb-1.5">勾选参会人员角色:</label>
+            <div class="grid grid-cols-2 gap-2 max-h-48 overflow-y-auto">
               <label 
                 v-for="emp in availableEmployees" 
                 :key="emp.id"
@@ -423,7 +435,67 @@
       </div>
     </div>
 
-    <!-- 5. 员工设置模态弹窗 (单独主持人配置 + 员工角色列表) -->
+    <!-- 5. 编辑会议信息 Modal (支持修改标题、工作目录、参会人) -->
+    <div v-if="showEditSessionModal" class="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
+      <div class="bg-white rounded-2xl shadow-xl w-full max-w-lg overflow-hidden flex flex-col">
+        <div class="p-4 border-b border-gray-100 flex items-center justify-between">
+          <h3 class="font-bold text-gray-900 text-base flex items-center gap-2">
+            <span>✏️</span> 编辑会议配置
+          </h3>
+          <button @click="showEditSessionModal = false" class="text-gray-400 hover:text-gray-600 text-xl font-bold">×</button>
+        </div>
+
+        <div class="p-5 space-y-4 text-sm">
+          <div>
+            <label class="block text-xs font-semibold text-gray-600 mb-1">会议议题名称:</label>
+            <input 
+              type="text" 
+              v-model="editingSessionForm.title" 
+              class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+            >
+          </div>
+
+          <div>
+            <label class="block text-xs font-semibold text-gray-600 mb-1">本地工作目录 (读取资料与交付物路径):</label>
+            <input 
+              type="text" 
+              v-model="editingSessionForm.workspace_dir" 
+              class="w-full border border-gray-300 rounded-lg px-3 py-2 text-xs font-mono focus:outline-none focus:ring-2 focus:ring-blue-500"
+            >
+          </div>
+
+          <div>
+            <label class="block text-xs font-semibold text-gray-600 mb-1.5">参会人员名单 (勾选或踢掉):</label>
+            <div class="grid grid-cols-2 gap-2 max-h-48 overflow-y-auto">
+              <label 
+                v-for="emp in availableEmployees" 
+                :key="emp.id"
+                class="flex items-center gap-2 p-2 rounded-lg border border-gray-200 cursor-pointer hover:bg-gray-50 text-xs"
+              >
+                <input 
+                  type="checkbox" 
+                  :value="emp.id" 
+                  v-model="editingSessionForm.employee_ids"
+                  class="rounded text-blue-600 h-4 w-4"
+                >
+                <span class="text-base">{{ emp.avatar || '🤖' }}</span>
+                <div class="truncate">
+                  <div class="font-medium text-gray-800 truncate">{{ emp.name }}</div>
+                  <div class="text-[10px] text-gray-400 truncate">{{ emp.title }}</div>
+                </div>
+              </label>
+            </div>
+          </div>
+        </div>
+
+        <div class="p-4 border-t border-gray-100 bg-gray-50 flex justify-end gap-2">
+          <button @click="showEditSessionModal = false" class="px-4 py-2 text-sm text-gray-600 hover:bg-gray-200 rounded-lg">取消</button>
+          <button @click="saveEditedSession" class="px-4 py-2 text-sm bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-medium shadow-sm">保存修改</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 6. 员工与主持人配置设置 Modal -->
     <div v-if="showSettingsModal" class="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
       <div class="bg-white rounded-2xl shadow-xl w-full max-w-xl max-h-[90vh] flex flex-col overflow-hidden">
         <div class="p-4 border-b border-gray-100 flex items-center justify-between">
@@ -442,7 +514,7 @@
                 <span class="font-bold text-sm text-gray-900">会议主持人专属配置</span>
               </div>
               <button @click="openEditModeratorModal" class="text-xs text-blue-600 hover:underline flex items-center gap-0.5">
-                <span>✏️</span> 修改主持人模型与人设
+                <span>✏️</span> 修改主持人
               </button>
             </div>
             
@@ -460,12 +532,12 @@
             </div>
           </div>
 
-          <!-- 区块 2: 参会员工角色列表 (一个模型可设多个角色) -->
+          <!-- 区块 2: 参会员工角色列表 -->
           <div>
             <div class="flex items-center justify-between mb-1.5">
               <div>
                 <div class="font-bold text-sm text-gray-900">参会员工角色列表</div>
-                <div class="text-[11px] text-gray-400">支持同一底层模型创建多个不同职责人设的员工</div>
+                <div class="text-[11px] text-gray-400">同一底层模型可创建多个不同职责人设的角色</div>
               </div>
               <button @click="openAddEmployeeModal" class="px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white text-xs font-medium rounded-lg flex items-center gap-1 shadow-sm">
                 <span>➕</span> 添加员工角色
@@ -484,7 +556,7 @@
                   </div>
                   <div class="truncate">
                     <div class="font-bold text-sm text-gray-900 truncate">{{ emp.name }}</div>
-                    <div class="text-xs text-gray-500 truncate">{{ emp.title || 'AI 工程师' }}</div>
+                    <div class="text-xs text-gray-500 truncate">{{ emp.title || '参会专家' }}</div>
                   </div>
                 </div>
 
@@ -509,7 +581,7 @@
       </div>
     </div>
 
-    <!-- 6. 添加/编辑 员工或主持人 子弹窗 Modal -->
+    <!-- 7. 添加/编辑 员工或主持人 子弹窗 Modal -->
     <div v-if="showEmpEditModal" class="fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4">
       <div class="bg-white rounded-2xl shadow-2xl w-full max-w-lg overflow-hidden flex flex-col">
         <div class="p-4 border-b border-gray-100 flex items-center justify-between">
@@ -546,7 +618,7 @@
             </div>
             <div>
               <label class="block font-semibold text-gray-600 mb-1">职能头衔:</label>
-              <input type="text" v-model="editingEmp.title" placeholder="例如: 业务落地专家" class="w-full border border-gray-300 rounded-lg px-2.5 py-1.5 text-xs">
+              <input type="text" v-model="editingEmp.title" placeholder="例如: 落地效能顾问" class="w-full border border-gray-300 rounded-lg px-2.5 py-1.5 text-xs">
             </div>
           </div>
 
@@ -570,7 +642,7 @@
             <textarea 
               v-model="editingEmp.system_prompt" 
               rows="3" 
-              placeholder="选填。留空则为通用 AI 模型；填写则扮演具有特定专长的专家..."
+              placeholder="选填。留空则为通用 AI 模型；填写则具备特定专业偏好..."
               class="w-full border border-gray-300 rounded-lg p-2 text-xs"
             ></textarea>
           </div>
@@ -588,7 +660,7 @@
       </div>
     </div>
 
-    <!-- 7. 消息审查与 Prompt 详情弹窗 (ℹ️ 点击打开) -->
+    <!-- 8. 消息审查与 Prompt 详情弹窗 (ℹ️ 点击打开) -->
     <div v-if="showInspectModal" class="fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4">
       <div class="bg-white rounded-2xl shadow-2xl w-full max-w-2xl max-h-[85vh] flex flex-col overflow-hidden">
         <div class="p-4 border-b border-gray-100 flex items-center justify-between">
@@ -618,10 +690,10 @@
 
         <div class="flex-1 overflow-y-auto p-4 bg-gray-50/50">
           <div v-if="inspectTab === 'prompt'" class="relative">
-            <button @click="copyText(inspectingMsg?.sent_prompt)" class="absolute right-2 top-2 px-2 py-1 text-[11px] bg-white border border-gray-300 rounded shadow-sm hover:bg-gray-50 transition">
+            <button v-if="inspectingMsg?.sent_prompt" @click="copyText(inspectingMsg?.sent_prompt)" class="absolute right-2 top-2 px-2 py-1 text-[11px] bg-white border border-gray-300 rounded shadow-sm hover:bg-gray-50 transition">
               📋 复制 Prompt
             </button>
-            <pre class="text-xs font-mono bg-white p-4 border border-gray-200 rounded-xl whitespace-pre-wrap select-text leading-relaxed text-gray-800">{{ inspectingMsg?.sent_prompt || '(无 Prompt 记录)' }}</pre>
+            <pre class="text-xs font-mono bg-white p-4 border border-gray-200 rounded-xl whitespace-pre-wrap select-text leading-relaxed text-gray-800">{{ inspectingMsg?.sent_prompt || '该条记录生成于 Prompt 持久化功能上线前，未留存独立 Prompt。' }}</pre>
           </div>
 
           <div v-else class="relative">
