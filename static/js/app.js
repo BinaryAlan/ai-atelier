@@ -687,7 +687,7 @@ createApp({
         next.employees.push(JSON.parse(JSON.stringify(this.editingEmp)));
       }
 
-      const saved = await this.saveSettingsToServer(next);
+      const saved = await this.saveSettingsToServer(next, false);
       if (saved) {
         this.showEmpEditModal = false;
       }
@@ -697,7 +697,7 @@ createApp({
       const targetEmp = this.settings.employees[idx];
       if (confirm(`确定要删除角色 [${targetEmp.name}] 吗？`)) {
         this.settings.employees.splice(idx, 1);
-        const saved = await this.saveSettingsToServer();
+        const saved = await this.saveSettingsToServer(null, false);
         if (saved && this.currentSession?.employee_ids) {
           this.currentSession.employee_ids = this.currentSession.employee_ids.filter(id => id !== targetEmp.id);
           await this.saveSessionEmployees();
@@ -705,7 +705,7 @@ createApp({
       }
     },
 
-    async saveSettingsToServer(nextSettings) {
+    async saveSettingsToServer(nextSettings, closeMainModal = true) {
       try {
         const res = await fetch("/api/settings", {
           method: "POST",
@@ -720,8 +720,10 @@ createApp({
         }
         this.settings = data.settings || this.settings;
         this.showEmpEditModal = false;
-        this.showSettingsModal = false;
-        alert("配置已成功保存！");
+        if (closeMainModal) {
+          this.showSettingsModal = false;
+          alert("配置已成功保存！");
+        }
         return true;
       } catch (e) {
         alert("保存配置失败: " + e);

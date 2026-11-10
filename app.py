@@ -428,6 +428,9 @@ def api_update_session(session_id):
                 session["document"] = document
                 bump_document_revision(session)
                 session["passed_employees"] = []
+                session["blocker_under_review"] = None
+                session["blocker_retry_count"] = 0
+                session["review_comment_retries"] = {}
                 session.setdefault("messages", []).append({
                     "id": generate_msg_id(),
                     "sender": "system",

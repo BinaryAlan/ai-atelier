@@ -95,6 +95,7 @@ def _strip_verdict_marker(text: str) -> str:
     if not m:
         return text
     rest = text[m.end():].lstrip()
+    rest = re.sub(r"^[\s\-:：–—]+", "", rest).strip()
     return rest or text
 
 
@@ -111,19 +112,29 @@ def format_round_feedback(
     只能各自从零复读文档，容易重复提问、也谈不上“圆桌讨论”。
     """
     rev = int(session.get("doc_revision") or 0)
-    lines = []
+    # 历史未打版本号的会话或尚未成稿前，不匹配旧历史，避免把过往多轮所有消息全部拉入
+    if rev <= 0:
+        return ""
 
+    settings = load_settings()
+    mod_id = settings.get("moderator", {}).get("id", "moderator")
+
+    # 按成员归集本轮最新一条意见（防止单人重试/追问产生多条重复记录）
+    latest_by_sender: Dict[str, Dict[str, Any]] = {}
     for m in session.get("messages") or []:
         if not isinstance(m, dict) or m.get("phase") != phase:
             continue
         sender = m.get("sender")
-        if not sender or sender in ("user", "system", "moderator"):
+        if not sender or sender in ("user", "system", "moderator", mod_id):
             continue
         if exclude_id and sender == exclude_id:
             continue
         if int(m.get("doc_revision") or 0) != rev:
             continue
+        latest_by_sender[sender] = m
 
+    lines = []
+    for sender, m in latest_by_sender.items():
         label = _FEEDBACK_LABELS.get((m.get("verdict") or "").upper())
         content = str(m.get("content") or "").strip()
         if not label or not content:
@@ -135,10 +146,12 @@ def format_round_feedback(
     return "\n".join(lines)
 
 
-def _feedback_block(session: Dict[str, Any], exclude_id: Optional[str] = None) -> str:
+def _feedback_block(session: Dict[str, Any], exclude_id: Optional[str] = None, is_review: bool = True) -> str:
     """渲染成可直接嵌入 prompt 的区块；本轮没人发过言时给出明确交代。"""
     text = format_round_feedback(session, exclude_id=exclude_id)
     if not text:
+        if not is_review:
+            return ""
         return (
             "\n【本轮其他参会成员已给出的意见】:\n"
             "（本轮尚无其他成员发表意见，你是第一位审阅人）\n"
@@ -582,7 +595,7 @@ class MeetingEngine:
                 fix_prompt = f"""【方案修订任务】
 当前方案草案如下：
 {session['document']}
-{_feedback_block(session, exclude_id=raiser_id)}{owner_block}
+{_feedback_block(session, exclude_id=raiser_id, is_review=False)}{owner_block}
 参会人【{raiser_emp['name']}】指出了以下重大问题：
 "{issue_text}"
 
