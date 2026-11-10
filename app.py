@@ -15,7 +15,7 @@ from core.storage import (
 from core.engine import (
     MeetingEngine, generate_msg_id, bump_document_revision, run_with_retry,
     request_skip_current, clear_skip_current,
-    build_direct_prompt, latest_user_message,
+    build_direct_prompt, latest_user_message, find_quote_by_question,
 )
 from core.executor import Executor, validate_cli_template
 from core.scanner import scan_local_models
@@ -577,11 +577,33 @@ def api_send_message(session_id):
     if len(content) > 20000:
         return jsonify({"error": "发言内容过长（上限 20000 字符）"}), 400
 
+    # 「💬 回复」某条发言：前端只传被引用消息的 id，引用对象与定向目标一律以服务端
+    # 存档为准（不信任客户端传来的发言人/正文），避免伪造引用去骗某个模型。
+    reply_to = data.get("reply_to")
+    reply_id = ""
+    if isinstance(reply_to, dict):
+        reply_id = str(reply_to.get("id") or "").strip()
+    elif isinstance(reply_to, str):
+        reply_id = reply_to.strip()
+
     with session_lock(session_id):
         session = get_session(session_id)
         if not session:
             return jsonify({"error": "会话不存在"}), 404
-        MeetingEngine.user_inject(session, content)
+
+        if reply_id:
+            quoted = _find_message(session, reply_id)
+            if not quoted:
+                return jsonify({"error": "被回复的消息不存在，可能已被删除"}), 404
+            sender = quoted.get("sender")
+            if sender in ("user", "system"):
+                return jsonify({"error": "只能回复成员或主持人的发言"}), 400
+            allowed = set(session.get("employee_ids") or [])
+            allowed.add(MeetingEngine.get_moderator(load_settings()).get("id"))
+            if sender not in allowed:
+                return jsonify({"error": "该成员已不在本场会议中，无法直接回复"}), 400
+
+        MeetingEngine.user_inject(session, content, reply_to=reply_id or None)
 
     start_background_runner(session_id)
 
@@ -876,11 +898,17 @@ def api_retry_message(session_id, msg_id):
                 # 没带聊天上下文与方案纪要，模型等于在真空里作答。
                 # 重试时按当前会话状态重建，并把重建后的完整 prompt 写回记录，
                 # 群主点开「查看 Prompt」看到的就是真正发出去的那一份。
+                question = _direct_question(session, msg)
+                quoted = msg.get("quoted") if isinstance(msg.get("quoted"), dict) else None
+                if not quoted:
+                    # 旧记录没存引用快照：按提问原文反查群主当时回复的是哪条
+                    quoted = find_quote_by_question(session, question)
                 prompt = build_direct_prompt(
-                    session, emp, _direct_question(session, msg),
+                    session, emp, question,
                     workspace_dir=workspace_dir,
                     exclude_msg_id=msg_id,
                     is_retry=True,
+                    quoted=quoted,
                 )
                 msg["sent_prompt"] = prompt
                 msg["prompt_rebuilt_at"] = int(time.time())

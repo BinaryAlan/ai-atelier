@@ -88,6 +88,58 @@ def latest_user_message(session: Dict[str, Any]) -> str:
     return ""
 
 
+def latest_user_message_obj(session: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """最近一条群主消息本身（不只是文本）——引用回复的信息挂在它身上。"""
+    for m in reversed(session.get("messages") or []):
+        if isinstance(m, dict) and m.get("sender") == "user":
+            return m
+    return None
+
+
+def find_message(session: Dict[str, Any], msg_id: Optional[str]) -> Optional[Dict[str, Any]]:
+    if not msg_id:
+        return None
+    for m in session.get("messages") or []:
+        if isinstance(m, dict) and m.get("id") == msg_id:
+            return m
+    return None
+
+
+def resolve_quote(session: Dict[str, Any], user_msg: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """
+    把群主消息上的引用（quote）还原成「谁说的 + 原话」。
+
+    只信任会话里的真实消息正文：引用被剪成摘要只用于界面展示，
+    交给模型时重新按 id 取原文，避免摘要丢关键细节或被前端篡改。
+    """
+    quote = (user_msg or {}).get("quote")
+    if not isinstance(quote, dict):
+        return None
+    target = find_message(session, str(quote.get("id") or ""))
+    content = str((target or {}).get("content") or quote.get("excerpt") or "").strip()
+    if not content:
+        return None
+    return {
+        "id": (target or {}).get("id") or quote.get("id"),
+        "sender": (target or {}).get("sender") or quote.get("sender"),
+        "sender_name": (target or {}).get("sender_name") or quote.get("sender_name") or "成员",
+        "content": content,
+    }
+
+
+def find_quote_by_question(session: Dict[str, Any], question: str) -> Optional[Dict[str, Any]]:
+    """重试老消息时没有「当前用户消息」可读，就按提问原文反查当时引用了哪一条。"""
+    target = str(question or "").strip()
+    for m in reversed(session.get("messages") or []):
+        if not isinstance(m, dict) or m.get("sender") != "user":
+            continue
+        if str(m.get("content") or "").strip() == target:
+            resolved = resolve_quote(session, m)
+            if resolved:
+                return resolved
+    return None
+
+
 # 写进「其他成员意见」区块的结论标签：让后来者一眼分清哪些是阻断、哪些只是建议
 _FEEDBACK_LABELS = {
     "PASS": "通过",
@@ -509,12 +561,15 @@ def build_direct_prompt(
     workspace_dir: str = "",
     exclude_msg_id: Optional[str] = None,
     is_retry: bool = False,
+    quoted: Optional[Dict[str, Any]] = None,
 ) -> str:
     """
     群主 @ 某位成员时的完整 prompt：会议背景 + 聊天上下文 + 方案纪要 + 本条提问。
 
     exclude_msg_id：把「这次要重答的那条失败消息」排除掉，避免模型把自己的
     报错/超时占位当成同事发言来读。
+    quoted：群主通过「💬 回复」引用某条发言时，把被引用的原话单独摆出来，
+            让它明确「现在是在哪一段话的基础上追问」。
     """
     settings = load_settings()
     moderator = MeetingEngine.get_moderator(settings)
@@ -553,6 +608,16 @@ def build_direct_prompt(
         "请从头完整作答，不要提及重试本身。）"
         if is_retry else ""
     )
+    quote_block = ""
+    if quoted and quoted.get("content"):
+        quote_author = quoted.get("sender_name") or "成员"
+        quote_body = _clip_text(str(quoted.get("content")), 3000)
+        quote_block = (
+            "\n【群主正在回复的这条消息（引用）】\n"
+            f"[{quote_author}] 的原话：\n"
+            f"「{quote_body}」\n"
+            "（群主是在上面这条发言的基础上追问，请紧扣它作答；如果不认同其中的说法，直接指出并说明理由。）\n"
+        )
 
     return f"""【本场会议背景】
 - 会议议题: {session_topic(session)}
@@ -571,7 +636,7 @@ def build_direct_prompt(
 【当前会议方案纪要（右侧面板最新正文）】
 {doc_block}
 （以上是本场会议已经确认的正式内容。回答里涉及方案结构、编号、结论时，一律以它为准，不要另立一套。）
-
+{quote_block}
 【群主这一次的具体提问】
 {question}
 （群主用 "@{emp_name}" 点名，这只是叫你，不必在回答里复述称呼。）{retry_note}
@@ -650,9 +715,29 @@ class MeetingEngine:
         return False, None
 
     @staticmethod
-    def user_inject(session: Dict[str, Any], content: str):
+    def user_inject(session: Dict[str, Any], content: str, reply_to: Optional[str] = None):
+        """
+        记录群主发言，并决定这条消息该由谁应答。
+
+        reply_to：群主点了某条发言的「💬 回复」。它等价于 @ 那个人 ——
+        被引用的原话会以 quote 形式挂在消息上（界面显示引用条，prompt 里单独给出原文），
+        且**优先于文本里的 @**：既然点了回复谁，就是想让谁答。
+        """
         now = int(time.time())
         settings = load_settings()
+        moderator = MeetingEngine.get_moderator(settings)
+
+        # 只认会话里真实存在、且确实由成员/主持人发出的消息；
+        # 不允许引用自己或系统广播（那没有可回答的对象）。
+        quote = None
+        quoted_msg = find_message(session, str(reply_to or "").strip() or None)
+        if quoted_msg and quoted_msg.get("sender") not in (None, "", "user", "system"):
+            quote = {
+                "id": quoted_msg.get("id"),
+                "sender": quoted_msg.get("sender"),
+                "sender_name": quoted_msg.get("sender_name") or quoted_msg.get("sender"),
+                "excerpt": _clip_text(str(quoted_msg.get("content") or ""), 200),
+            }
 
         msg = {
             "id": generate_msg_id(),
@@ -666,9 +751,15 @@ class MeetingEngine:
             "sent_prompt": content,
             "raw_response": content
         }
+        if quote:
+            msg["quote"] = quote
         session["messages"].append(msg)
 
         is_all, specific_emp_id = MeetingEngine.detect_mention(content, settings)
+        if quote:
+            # 引用回复 = 指定了应答人，文本里没有 @ 也照样定向
+            specific_emp_id = quote["sender"]
+            is_all = False
 
         def _reset_to_phase_one():
             session["phase"] = 1
@@ -925,12 +1016,15 @@ class MeetingEngine:
         direct_target = session.get("target_direct_mention")
         if direct_target:
             target_emp = MeetingEngine.get_employee(settings, direct_target)
-            last_user_msg = latest_user_message(session)
+            last_user_obj = latest_user_message_obj(session)
+            last_user_msg = str((last_user_obj or {}).get("content") or "")
+            quoted = resolve_quote(session, last_user_obj)
 
             # 定向应答不能只给「问题 + 人设」：CLI 无状态，必须自带会议议题、
             # 聊天上下文与当前纪要，否则模型不知道群主在说什么、也不知道已有的结论。
             prompt = build_direct_prompt(
-                session, target_emp, last_user_msg, workspace_dir=workspace_dir
+                session, target_emp, last_user_msg, workspace_dir=workspace_dir,
+                quoted=quoted,
             )
 
             session["current_speaker"] = target_emp["name"]
@@ -980,6 +1074,15 @@ class MeetingEngine:
                 # 单独记下「群主问的是什么」：重试时据此重建 prompt，
                 # 不必从旧 prompt 里反解析，也不会被后来插入的新消息带偏。
                 "direct_question": last_user_msg,
+                # 引用回复的快照：重试时即使原用户消息被后续对话挤远，也能还原引用块
+                "quoted": (
+                    {
+                        "id": quoted.get("id"),
+                        "sender_name": quoted.get("sender_name"),
+                        "content": _clip_text(str(quoted.get("content") or ""), 3000),
+                    }
+                    if quoted else None
+                ),
                 "sent_prompt": prompt,
                 "raw_response": res.raw_output
             })

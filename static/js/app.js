@@ -32,6 +32,12 @@ createApp({
         employees: []
       },
       inputContent: "",
+      // 引用回复：{ id, sender, sender_name, content }，发送时把 id 交给后端定向
+      replyTarget: null,
+      // 长消息展开状态（按消息 id 记，轮询刷新不会把用户展开的又收回去）
+      expandedMsgs: {},
+      // 哪些消息真的被限高截断了（渲染后实测，决定是否给「展开全文」按钮）
+      overflowMsgs: {},
       rightTab: "doc", // 'doc' | 'workspace'
       workspaceItems: [],
       selectedWorkspaceFile: null,
@@ -162,7 +168,7 @@ createApp({
     // 拖拽调宽 / Esc 退出全屏
     window.addEventListener("mousemove", this.onDragMove);
     window.addEventListener("mouseup", this.onDragEnd);
-    window.addEventListener("resize", this.clampPanels);
+    window.addEventListener("resize", this.onWindowResize);
     window.addEventListener("keydown", this.onWindowKeydown);
   },
   beforeUnmount() {
@@ -170,10 +176,16 @@ createApp({
     document.removeEventListener("click", this.handleGlobalClick);
     window.removeEventListener("mousemove", this.onDragMove);
     window.removeEventListener("mouseup", this.onDragEnd);
-    window.removeEventListener("resize", this.clampPanels);
+    window.removeEventListener("resize", this.onWindowResize);
     window.removeEventListener("keydown", this.onWindowKeydown);
   },
   methods: {
+    // 窗口尺寸变化：既要把面板宽度钳回可用范围，也要重算哪些消息该折叠
+    onWindowResize() {
+      this.clampPanels();
+      this.measureMsgOverflow();
+    },
+
     handleGlobalClick(e) {
       if (!e.target.closest(".relative")) {
         this.showMemberDropdown = false;
@@ -332,12 +344,16 @@ createApp({
       this.selectedWorkspaceFile = null;
       this.selectedFileContent = "";
       this.showMemberDropdown = false;
+      // 引用与展开状态都属于具体会话的某条消息，切会话就清掉，避免引用到别的会议的发言
+      this.replyTarget = null;
+      this.expandedMsgs = {};
       try {
         const res = await fetch(`/api/sessions/${id}`);
         if (token !== this.switchToken) return;
         if (res.ok) {
           this.currentSession = await res.json();
           this.$nextTick(this.scrollToBottom);
+          this.measureMsgOverflow();
           this.loadWorkspaceFiles();
         }
       } catch (e) {
@@ -514,6 +530,13 @@ createApp({
 
     // ----------------- 消息输入与 Backspace 整删 @ 标签 -----------------
     onInputKeydown(e) {
+      // Esc 撤掉引用回复条（不打断已打的字）
+      if (e.key === "Escape" && this.replyTarget) {
+        e.preventDefault();
+        this.cancelReply();
+        return;
+      }
+
       if (e.key === "Backspace") {
         const textarea = this.$refs.chatInput;
         if (!textarea) return;
@@ -552,21 +575,95 @@ createApp({
       const text = this.inputContent.trim();
       if (!text || !this.currentSessionId) return;
 
-      this.inputContent = "";
+      const reply = this.replyTarget;
       try {
         const res = await fetch(`/api/sessions/${this.currentSessionId}/message`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ content: text })
+          body: JSON.stringify({
+            content: text,
+            // 只传 id：引用对象与定向目标由服务端按存档解析，前端伪造不了
+            reply_to: reply ? { id: reply.id } : null
+          })
         });
-        if (res.ok) {
-          this.currentSession = await res.json();
-          this.$nextTick(this.scrollToBottom);
-          await this.loadSessions();
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          // 失败时保留输入内容与引用条，别让用户白打一遍
+          alert(data.error || `发送失败（HTTP ${res.status}）`);
+          return;
         }
+        this.inputContent = "";
+        this.replyTarget = null;
+        this.currentSession = data;
+        this.$nextTick(this.scrollToBottom);
+        this.measureMsgOverflow();
+        await this.loadSessions();
       } catch (e) {
         console.error("发送消息失败:", e);
+        alert("发送失败：" + e);
       }
+    },
+
+    // ----------------- 长消息折叠 -----------------
+    // 判断依据是「真实渲染高度是否被限高截断」，而不是字数拍脑袋：
+    // 窗口小、气泡窄时会自动更早折叠，正好对应「超过三十行或聊天窗口高度」。
+    msgIsCollapsed(msg) {
+      return !!(msg && msg.id) && !this.expandedMsgs[msg.id];
+    },
+    toggleMsgExpand(msg) {
+      const id = msg && msg.id;
+      if (!id) return;
+      // 整体替换对象，确保 Vue 3 的响应式一定被触发
+      this.expandedMsgs = { ...this.expandedMsgs, [id]: !this.expandedMsgs[id] };
+      this.$nextTick(this.measureMsgOverflow);
+    },
+    measureMsgOverflow() {
+      this.$nextTick(() => {
+        const root = this.$refs.chatContainer;
+        if (!root) return;
+        const next = { ...this.overflowMsgs };
+        let changed = false;
+        root.querySelectorAll("[data-msg-id]").forEach(el => {
+          const id = el.getAttribute("data-msg-id");
+          if (!id || this.expandedMsgs[id]) return;   // 展开态没有限高，不参与测量
+          const over = el.scrollHeight - el.clientHeight > 4;
+          if (!!next[id] !== over) {
+            next[id] = over;
+            changed = true;
+          }
+        });
+        if (changed) this.overflowMsgs = next;
+      });
+    },
+
+    // ----------------- 引用回复（微信式） -----------------
+    canReplyMsg(msg) {
+      if (!msg || !msg.id) return false;
+      if (msg.sender === "user" || msg.sender === "system") return false;
+      // 报错/超时/跳过的占位没有可引用的内容
+      if (["TIMEOUT", "ERROR", "SKIPPED"].includes(msg.verdict)) return false;
+      if (!String(msg.content || "").trim()) return false;
+      if (this.isModerator(msg.sender)) return true;
+      // 已移出本场会议的成员不再提供回复入口（后端也会拒绝）
+      return this.activeSessionEmployees.some(e => e.id === msg.sender);
+    },
+    startReply(msg) {
+      this.replyTarget = {
+        id: msg.id,
+        sender: msg.sender,
+        sender_name: msg.sender_name || msg.sender,
+        content: msg.content || ""
+      };
+      this.$nextTick(() => {
+        if (this.$refs.chatInput) this.$refs.chatInput.focus();
+      });
+    },
+    cancelReply() {
+      this.replyTarget = null;
+    },
+    quoteExcerpt(text) {
+      const t = String(text || "").replace(/\s+/g, " ").trim();
+      return t.length > 120 ? t.slice(0, 120) + "…" : t;
     },
 
     async pauseMeeting() {
@@ -879,6 +976,7 @@ createApp({
             if (hadFewerMsgs) {
               this.$nextTick(this.scrollToBottom);
             }
+            this.measureMsgOverflow();
           }
         } catch (e) {
           // 静默容错

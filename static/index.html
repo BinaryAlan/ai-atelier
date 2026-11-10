@@ -33,6 +33,18 @@
     .markdown-body th, .markdown-body td { border: 1px solid #e5e7eb; padding: 0.3rem 0.6rem; text-align: left; }
     .markdown-body th { background: #f9fafb; font-weight: 600; }
     .markdown-body img { max-width: 100%; height: auto; }
+
+    /* 长消息折叠：一条长回答不再霸占整屏（超过约 30 行 / 窗口高度就先收起） */
+    .msg-clamped { max-height: min(64vh, 42rem); overflow: hidden; }
+    .msg-clamped-wrap { position: relative; }
+    .msg-clamped-wrap::after {
+      content: ""; position: absolute; left: 0; right: 0; bottom: 0; height: 2.5rem;
+      background: linear-gradient(to bottom, rgba(255,255,255,0), rgba(255,255,255,0.92));
+      pointer-events: none;
+    }
+    .msg-clamped-wrap.on-user::after {
+      background: linear-gradient(to bottom, rgba(37,99,235,0), rgba(37,99,235,0.92));
+    }
   </style>
 </head>
 <body class="bg-gray-50 text-gray-800 antialiased h-screen overflow-hidden">
@@ -342,6 +354,14 @@
                 <span v-else-if="msg.verdict === 'SKIPPED'" class="px-1.5 py-0.2 rounded bg-gray-200 text-gray-600 font-bold text-[10px]">⏭ 已跳过</span>
                 <span v-if="msg.elapsed_time > 0" class="text-[11px] opacity-75">⏱️ {{ msg.elapsed_time }}s</span>
 
+                <!-- 引用回复：点一下就把这条发言带进输入框，发出去等于 @ 它本人 -->
+                <button
+                  v-if="canReplyMsg(msg)"
+                  @click.stop="startReply(msg)"
+                  class="text-[10px] px-1.5 py-0.5 rounded bg-gray-50 text-gray-600 border border-gray-200 hover:bg-gray-100 transition shrink-0"
+                  title="引用这条发言回复（发送后由它本人作答）"
+                >💬 回复</button>
+
                 <!-- 单人故障恢复：只重跑这一条 / 把这个人踢出本轮，避免为一次报错重开整场会议 -->
                 <button
                   v-if="canRetryMsg(msg)"
@@ -367,8 +387,38 @@
               </div>
             </div>
 
-            <!-- 正文内容 -->
-            <div class="whitespace-pre-wrap select-text">{{ msg.content }}</div>
+            <!-- 引用块：群主「💬 回复」某条发言时，气泡里显示引用的原话（类似微信引用） -->
+            <div
+              v-if="msg.quote"
+              :class="[
+                'mb-2 rounded-md px-2 py-1 text-[11px] border-l-2',
+                msg.sender === 'user'
+                  ? 'bg-blue-700/40 border-blue-200 text-blue-50'
+                  : 'bg-gray-100 border-gray-300 text-gray-600'
+              ]"
+            >
+              <div class="opacity-80 font-medium">{{ msg.quote.sender_name }}</div>
+              <div class="truncate opacity-90">{{ msg.quote.excerpt }}</div>
+            </div>
+
+            <!-- 正文内容：渲染后实测高度，超过一屏（约 30 行）就先折叠，给展开/收起按钮 -->
+            <div :class="[msgIsCollapsed(msg) && overflowMsgs[msg.id] ? 'msg-clamped-wrap' : '', msg.sender === 'user' ? 'on-user' : '']">
+              <div
+                :data-msg-id="msg.id"
+                :class="['whitespace-pre-wrap select-text', msgIsCollapsed(msg) ? 'msg-clamped' : '']"
+              >{{ msg.content }}</div>
+            </div>
+            <div v-if="overflowMsgs[msg.id]" class="mt-1.5">
+              <button
+                @click.stop="toggleMsgExpand(msg)"
+                :class="[
+                  'text-[11px] px-2 py-0.5 rounded transition border',
+                  msg.sender === 'user'
+                    ? 'bg-blue-700/40 border-blue-300 text-blue-50 hover:bg-blue-700/60'
+                    : 'bg-gray-50 border-gray-200 text-gray-600 hover:bg-gray-100'
+                ]"
+              >{{ msgIsCollapsed(msg) ? '展开全文' : '收起' }}</button>
+            </div>
 
             <!-- 系统提示「服务被打断 / 已复位」时，把「怎么恢复」直接做成按钮。
                  否则用户只能盯着「等待群主人工恢复」这句话猜操作入口。 -->
@@ -429,6 +479,25 @@
             <span>{{ emp.avatar || '🤖' }}</span>
             <span>@{{ emp.name }}</span>
           </button>
+        </div>
+
+        <!-- 引用回复条：显示被引用的发言，发送后由该成员本人作答（等同 @ 它） -->
+        <div
+          v-if="replyTarget"
+          class="mb-2 flex items-start gap-2 rounded-lg border border-blue-200 bg-blue-50 px-2.5 py-1.5"
+        >
+          <div class="flex-1 min-w-0">
+            <div class="text-[11px] text-blue-700 font-medium">
+              回复 {{ replyTarget.sender_name }}
+              <span class="font-normal opacity-70">· 发送后由它本人作答</span>
+            </div>
+            <div class="text-[11px] text-gray-600 truncate">{{ quoteExcerpt(replyTarget.content) }}</div>
+          </div>
+          <button
+            @click="cancelReply"
+            class="text-gray-400 hover:text-gray-600 text-xs px-1 shrink-0"
+            title="取消引用（Esc）"
+          >✕</button>
         </div>
 
         <!-- 文本输入框 (Backspace 整删 @ 标签，防输入法回车误触发送) -->
