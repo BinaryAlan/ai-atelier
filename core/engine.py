@@ -146,7 +146,12 @@ def _strip_verdict_marker(text: str) -> str:
 # 否则模型会去“调用工具”，然后只吐一句「我先读取…」或一堆 <tool_calls> 标记就交卷。
 # ---------------------------------------------------------------------------
 _TOOLS_FLAG_PAT = re.compile(r"--tools\s+(\"[^\"]*\"|'[^']*'|\S+)")
-_MAX_ANSWER_CHARS = 500        # 单轮回答的字数上限（放宽后的要求）
+# 字数不设限：早期用「300~500 字」硬约束，反而让模型为了凑字说空话、或为了卡上限
+# 把关键论证砍掉。改成「按议题复杂度自行决定篇幅」，由模型自己把握精准度。
+_LENGTH_POLICY = (
+    "篇幅不设上下限：由你按议题复杂度自行决定——需要展开的就展开写透，"
+    "一句话能讲清的就别铺陈。每一句都要有信息量，禁止空话、复述与自我重复。"
+)
 _RETRY_HINT = (
     "\n\n【上一次回答没有给出实质内容】你可能只描述了计划、或输出了工具调用标记。\n"
     "请立刻直接输出完整正文：不要描述你打算做什么，不要输出任何 <tool_calls> / <invoke> 标记，"
@@ -614,7 +619,8 @@ class MeetingEngine:
 人设背景: {target_emp.get('system_prompt', '')}
 当前工作目录: {workspace_dir}
 
-请直接回应群主的上述要求。请保持客观、专业、务实，直奔核心。"""
+请直接回应群主的上述要求。请保持客观、专业、务实，直奔核心。
+{_LENGTH_POLICY}"""
 
             session["current_speaker"] = target_emp["name"]
             save_session(session, merge=True)
@@ -710,7 +716,7 @@ class MeetingEngine:
 【你的任务】:
 请基于你的专业视角，直接给出你对该议题的核心见解、关键思路与落地建议。
 要求：
-1. 务实客观，正文控制在 300~500 字（上限 500 字），宁可有信息密度也不要空话；
+1. 务实客观，{_LENGTH_POLICY}
 2. 提出有建设性的方案要点，不讲客套话；
 3. 信息不足时直接说明你的假设，不要反问、也不要把问题抛回来。
 {capability}"""
@@ -799,6 +805,7 @@ class MeetingEngine:
 {capability_block(moderator)}
 要求：
 - 结构清晰、条理规整，涵盖核心结论、执行要点与待办细节；
+- 篇幅按方案本身的复杂度自行决定，宁可写全也不要为了凑长度注水；
 - 只转述上面**确实出现过**的发言，不得替任何成员编造主张；
 - 你自己的推理或补充，必须显式标注为「主持人补充」，不要混进他人名下；
 - 输出纯 Markdown 格式。"""
@@ -938,7 +945,7 @@ class MeetingEngine:
 回答第一行必须严格为以下两者之一：
 [ACCEPT] - 核心问题已解决，接受修改
 [REJECT: 仍有问题简述] - 仍存在严重漏洞
-随后用 100~300 字阐述依据（上限 500 字）。严禁发散引入不相关的新议题！"""
+随后阐述依据：{_LENGTH_POLICY}严禁发散引入不相关的新议题！"""
 
                 session["current_speaker"] = f"{raiser_emp['name']} (正在验收方案修改)"
                 save_session(session, merge=True)
@@ -1070,7 +1077,7 @@ class MeetingEngine:
 3. 你的回答首行必须严格为以下二者之一，不得省略方括号标记：
    [PASS] - 方案整体可行、无严重漏洞，同意通过
    [BLOCKER: 问题简述] - 发现不可接受的严重问题
-4. 随后用 200~500 字客观阐述理由与改进建议（上限 500 字）。"""
+4. 随后客观阐述理由与改进建议：{_LENGTH_POLICY}"""
 
             session["current_speaker"] = reviewer_emp["name"]
             save_session(session, merge=True)

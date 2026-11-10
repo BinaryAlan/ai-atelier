@@ -100,7 +100,16 @@ createApp({
       serviceBusy: false,
       serviceDown: false,
       resumeBusy: false,  // 恢复请求在途：按钮保持「恢复中…」，避免连点变成暂停
-      toastText: ""       // 顶部轻提示（恢复结果/自动暂缓等）
+      toastText: "",      // 顶部轻提示（恢复结果/自动暂缓等）
+
+      // 布局：左栏可收起、左右两栏宽度可拖拽、纪要可全屏
+      sidebarWidth: 256,
+      rightWidth: 440,
+      sidebarCollapsed: false,
+      docFullscreen: false,
+      dragTarget: null,   // 'sidebar' | 'right'
+      dragStartX: 0,
+      dragStartW: 0
     };
   },
   computed: {
@@ -144,14 +153,24 @@ createApp({
     }
   },
   mounted() {
+    this.restoreLayout();
     this.init();
     this.pollInterval = setInterval(this.pollActiveSession, 1500);
     // 全局点击关闭参会人下拉框
     document.addEventListener("click", this.handleGlobalClick);
+    // 拖拽调宽 / Esc 退出全屏
+    window.addEventListener("mousemove", this.onDragMove);
+    window.addEventListener("mouseup", this.onDragEnd);
+    window.addEventListener("resize", this.clampPanels);
+    window.addEventListener("keydown", this.onWindowKeydown);
   },
   beforeUnmount() {
     if (this.pollInterval) clearInterval(this.pollInterval);
     document.removeEventListener("click", this.handleGlobalClick);
+    window.removeEventListener("mousemove", this.onDragMove);
+    window.removeEventListener("mouseup", this.onDragEnd);
+    window.removeEventListener("resize", this.clampPanels);
+    window.removeEventListener("keydown", this.onWindowKeydown);
   },
   methods: {
     handleGlobalClick(e) {
@@ -160,6 +179,93 @@ createApp({
       }
       if (!e.target.closest("#service-menu-wrap")) {
         this.showServiceMenu = false;
+      }
+    },
+
+    // ------------------- 布局：收起 / 拖拽 / 全屏 -------------------
+    restoreLayout() {
+      try {
+        const saved = JSON.parse(localStorage.getItem("aim.layout") || "{}");
+        if (Number.isFinite(saved.sidebarWidth)) this.sidebarWidth = saved.sidebarWidth;
+        if (Number.isFinite(saved.rightWidth)) this.rightWidth = saved.rightWidth;
+        if (typeof saved.sidebarCollapsed === "boolean") this.sidebarCollapsed = saved.sidebarCollapsed;
+      } catch (e) { /* 忽略损坏的本地配置 */ }
+      this.clampPanels();
+    },
+    persistLayout() {
+      try {
+        localStorage.setItem("aim.layout", JSON.stringify({
+          sidebarWidth: this.sidebarWidth,
+          rightWidth: this.rightWidth,
+          sidebarCollapsed: this.sidebarCollapsed
+        }));
+      } catch (e) { /* 隐私模式下写不了，忽略 */ }
+    },
+    // 两边都留出中间聊天区的最低宽度（320px），否则拖到极端会把对话挤没
+    clampPanels() {
+      const total = window.innerWidth || 1440;
+      const minChat = 320;
+      const maxSidebar = Math.max(180, Math.min(520, total - minChat - 260));
+      this.sidebarWidth = Math.round(Math.min(Math.max(this.sidebarWidth, 180), maxSidebar));
+      const maxRight = Math.max(300, total - (this.sidebarCollapsed ? 0 : this.sidebarWidth) - minChat - 4);
+      this.rightWidth = Math.round(Math.min(Math.max(this.rightWidth, 300), maxRight));
+    },
+    startResize(target, e) {
+      if (target === "right" && this.docFullscreen) return;
+      this.dragTarget = target;
+      this.dragStartX = e.clientX;
+      this.dragStartW = target === "sidebar" ? this.sidebarWidth : this.rightWidth;
+      document.body.style.cursor = "col-resize";
+      document.body.style.userSelect = "none";
+    },
+    onDragMove(e) {
+      if (!this.dragTarget) return;
+      e.preventDefault();
+      const dx = e.clientX - this.dragStartX;
+      if (this.dragTarget === "sidebar") {
+        // 侧栏向右拖变宽；拖到 120px 以下视为「收起」
+        const next = this.dragStartW + dx;
+        if (next < 120) {
+          if (!this.sidebarCollapsed) {
+            this.sidebarCollapsed = true;
+            // 重设锚点：收起后继续往右拖可以直接展开，不用先拖回 136px
+            this.dragStartW = 0;
+            this.dragStartX = e.clientX;
+          }
+          return;
+        }
+        if (this.sidebarCollapsed) {
+          this.sidebarCollapsed = false;
+          this.dragStartW = 0;
+          this.dragStartX = e.clientX;
+        }
+        this.sidebarWidth = Math.round(next);
+      } else {
+        // 右侧面板向左拖变宽（方向相反）
+        this.rightWidth = Math.round(this.dragStartW - dx);
+      }
+      this.clampPanels();
+    },
+    onDragEnd() {
+      if (!this.dragTarget) return;
+      this.dragTarget = null;
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+      this.clampPanels();
+      this.persistLayout();
+    },
+    toggleSidebar() {
+      this.sidebarCollapsed = !this.sidebarCollapsed;
+      this.clampPanels();
+      this.persistLayout();
+    },
+    toggleDocFullscreen() {
+      this.docFullscreen = !this.docFullscreen;
+      if (this.docFullscreen) this.rightTab = "doc";
+    },
+    onWindowKeydown(e) {
+      if (e.key === "Escape" && this.docFullscreen) {
+        this.docFullscreen = false;
       }
     },
 
