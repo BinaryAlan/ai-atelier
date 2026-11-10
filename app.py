@@ -640,7 +640,7 @@ def _active_session_ids() -> List[str]:
         return sorted(_ACTIVE_SESSIONS)
 
 
-def _prepare_shutdown() -> int:
+def _prepare_shutdown(action: str = "shutdown") -> int:
     """退出前收尾：终止所有在跑的 CLI 子进程，并把 running 的会议落盘为 paused。"""
     killed = 0
     try:
@@ -648,6 +648,9 @@ def _prepare_shutdown() -> int:
     except Exception as e:
         print("[Service] 终止 CLI 子进程失败:", e)
 
+    notice = ("🔄 服务已重启，本次发言被打断，会议转为暂停。点「恢复讨论」可继续。"
+              if action == "restart" else
+              "⏻ 服务已停止，本次发言被打断。重新启动服务后点「恢复讨论」可继续。")
     try:
         for item in list_sessions():
             sid = item.get("id")
@@ -658,6 +661,18 @@ def _prepare_shutdown() -> int:
                 if s and s.get("status") == "running":
                     s["status"] = "paused"
                     s["current_speaker"] = None
+                    s.setdefault("messages", []).append({
+                        "id": generate_msg_id(),
+                        "sender": "system",
+                        "sender_name": "系统广播",
+                        "content": notice,
+                        "phase": s.get("phase", 1),
+                        "verdict": "RECOVER",
+                        "elapsed_time": 0,
+                        "created_at": int(time.time()),
+                        "sent_prompt": "",
+                        "raw_response": ""
+                    })
                     save_session(s)
     except Exception as e:
         print("[Service] 会话状态复位失败:", e)
@@ -701,7 +716,7 @@ def _schedule_exit(action: str, delay: float = 0.4) -> None:
     """先让 HTTP 响应完整返回，再在后台真正退出/重启。"""
     def _run():
         time.sleep(delay)
-        _prepare_shutdown()
+        _prepare_shutdown(action)
         try:
             sys.stdout.flush()
             sys.stderr.flush()

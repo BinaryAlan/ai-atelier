@@ -45,7 +45,7 @@
           <button @click="toggleServiceMenu" class="p-1.5 rounded-lg transition hover:bg-gray-100" :class="systemStatus?.hot_reload ? 'text-emerald-600' : 'text-gray-500 hover:text-gray-800'" title="服务状态 · 重启 · 停止">
             ⏻
           </button>
-          <button @click="openSettingsModal" class="p-1.5 text-gray-500 hover:text-gray-800 hover:bg-gray-100 rounded-lg transition" title="员工与模型设置">
+          <button @click="showServiceMenu = false; openSettingsModal()" class="p-1.5 text-gray-500 hover:text-gray-800 hover:bg-gray-100 rounded-lg transition" title="员工与模型设置">
             ⚙️
           </button>
 
