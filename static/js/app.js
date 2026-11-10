@@ -94,6 +94,9 @@ createApp({
       showInspectModal: false,
       inspectTab: "prompt",
       inspectingMsg: null,
+      // Prompt 分段折叠状态（key → 是否展开）。只记用户手动点过的段，
+      // 没点过的走 promptSections 里的 defaultOpen，所以每次打开弹窗都是默认视图。
+      promptOpen: {},
 
       isComposing: false, // 正在使用输入法组词或英文回车确认
       defaultWorkspaceDir: "",
@@ -120,6 +123,42 @@ createApp({
     };
   },
   computed: {
+    // Prompt 按【区块标题】切段：大段材料（聊天上下文、方案纪要/草案）默认折叠，
+    // 只留标题和体量提示，避免一屏全是历史正文、真正要看的要求被挤到很下面。
+    promptSections() {
+      const raw = String((this.inspectingMsg && this.inspectingMsg.sent_prompt) || "");
+      if (!raw.trim()) return [];
+
+      const COLLAPSED_BY_DEFAULT = ["上下文", "纪要", "草案", "正文", "回复的这条消息"];
+      const headerRe = /^[ \t]*【([^】\n]{1,60})】[ \t]*$/;
+      const buckets = [];
+      let cur = { title: "", body: [] };
+      for (const line of raw.split("\n")) {
+        const m = headerRe.exec(line);
+        if (m) {
+          buckets.push(cur);
+          cur = { title: m[1], body: [] };
+        } else {
+          cur.body.push(line);
+        }
+      }
+      buckets.push(cur);
+
+      return buckets
+        .map((b, i) => {
+          const body = b.body.join("\n").replace(/^\n+/, "").replace(/\n+$/, "");
+          return {
+            key: "sec" + i,
+            title: b.title,
+            body,
+            chars: body.length,
+            lineCount: body ? body.split("\n").length : 0,
+            defaultOpen: !COLLAPSED_BY_DEFAULT.some(k => b.title.includes(k)),
+          };
+        })
+        .filter(s => s.title || s.body);
+    },
+
     // 实际参加本场会议的员工列表（未勾选/未选择的不在此列表中）
     activeSessionEmployees() {
       if (!this.currentSession || !Array.isArray(this.currentSession.employee_ids)) return [];
@@ -1056,7 +1095,26 @@ createApp({
     openInspectModal(msg) {
       this.inspectingMsg = msg;
       this.inspectTab = "prompt";
+      this.promptOpen = {};   // 每次打开都回到默认视图（大块材料折叠）
       this.showInspectModal = true;
+    },
+
+    promptSectionOpen(sec) {
+      const v = this.promptOpen[sec.key];
+      return v === undefined ? sec.defaultOpen : v;
+    },
+    togglePromptSection(sec) {
+      this.promptOpen = { ...this.promptOpen, [sec.key]: !this.promptSectionOpen(sec) };
+    },
+    promptAllExpanded() {
+      return this.promptSections.length > 0 && this.promptSections.every(s => this.promptSectionOpen(s));
+    },
+    toggleAllPromptSections() {
+      // 只要还有折叠着的段，这个按钮就是「展开全部」；全展开时才变成「收起全部」
+      const expand = !this.promptAllExpanded();
+      const next = {};
+      for (const s of this.promptSections) next[s.key] = expand;
+      this.promptOpen = next;
     },
 
     async copyText(text) {

@@ -229,11 +229,10 @@
                 <button @click="showMemberDropdown = false" class="text-gray-400 hover:text-gray-600">✕</button>
               </div>
 
-              <!-- 主持人 (始终在席，不可踢) -->
+              <!-- 主持人 (始终在席，不可踢；👑 与琥珀底色已足够标识) -->
               <div class="flex items-center gap-2 p-1.5 rounded bg-amber-50/80 border border-amber-200/70 mb-1 cursor-default">
                 <span class="text-xs text-amber-600 font-bold">👑</span>
                 <span class="font-bold text-amber-950 truncate">{{ settings.moderator?.name }}</span>
-                <span class="text-[10px] bg-amber-200 text-amber-900 px-1 rounded font-bold ml-auto shrink-0">主持人 · 必选</span>
               </div>
 
               <!-- 参会员工列表 (仅展示本会议已选定参会的员工，未选择的不出现、不计数) -->
@@ -662,7 +661,6 @@
                 <input type="checkbox" checked disabled class="rounded text-amber-600 h-4 w-4 opacity-60">
                 <span class="text-base">{{ settings.moderator?.avatar || '👑' }}</span>
                 <span class="font-bold text-amber-950">{{ settings.moderator?.name }}</span>
-                <span class="text-[10px] bg-amber-200 text-amber-900 px-1 rounded font-bold ml-auto">主持人 · 必选</span>
               </div>
 
               <!-- 员工角色 (可多选) -->
@@ -739,7 +737,6 @@
                 <input type="checkbox" checked disabled class="rounded text-amber-600 h-4 w-4 opacity-60">
                 <span class="text-base">{{ settings.moderator?.avatar || '👑' }}</span>
                 <span class="font-bold text-amber-950">{{ settings.moderator?.name }}</span>
-                <span class="text-[10px] bg-amber-200 text-amber-900 px-1 rounded font-bold ml-auto">主持人 · 必选</span>
               </div>
 
               <!-- 其他员工 -->
@@ -1009,7 +1006,7 @@
 
     <!-- 9. 消息审查与 Prompt 详情弹窗 (ℹ️ 点击打开) -->
     <div v-if="showInspectModal" class="fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4">
-      <div class="bg-white rounded-2xl shadow-2xl w-full max-w-2xl max-h-[85vh] flex flex-col overflow-hidden">
+      <div class="bg-white rounded-2xl shadow-2xl w-full max-w-3xl max-h-[88vh] flex flex-col overflow-hidden">
         <div class="p-4 border-b border-gray-100 flex items-center justify-between">
           <div class="flex items-center gap-2">
             <span class="text-base">ℹ️</span>
@@ -1036,11 +1033,49 @@
         </div>
 
         <div class="flex-1 overflow-y-auto p-4 bg-gray-50/50">
-          <div v-if="inspectTab === 'prompt'" class="relative">
-            <button v-if="inspectingMsg?.sent_prompt" @click="copyText(inspectingMsg?.sent_prompt)" class="absolute right-2 top-2 px-2 py-1 text-[11px] bg-white border border-gray-300 rounded shadow-sm hover:bg-gray-50 transition">
-              📋 复制 Prompt
-            </button>
-            <pre class="text-xs font-mono bg-white p-4 border border-gray-200 rounded-xl whitespace-pre-wrap select-text leading-relaxed text-gray-800">{{ inspectingMsg?.sent_prompt || '该条记录生成于 Prompt 持久化功能上线前，未留存独立 Prompt。' }}</pre>
+          <div v-if="inspectTab === 'prompt'">
+            <template v-if="inspectingMsg?.sent_prompt">
+              <div class="flex items-center gap-2 mb-2">
+                <span class="text-[11px] text-gray-500 shrink-0">
+                  {{ promptSections.length }} 段 · {{ (inspectingMsg?.sent_prompt || '').length }} 字符
+                </span>
+                <button
+                  @click="toggleAllPromptSections()"
+                  class="ml-auto px-2 py-1 text-[11px] bg-white border border-gray-300 rounded shadow-sm hover:bg-gray-50 transition shrink-0"
+                >{{ promptAllExpanded() ? "⤴ 收起全部" : "⤵ 展开全部" }}</button>
+                <button
+                  @click="copyText(inspectingMsg?.sent_prompt)"
+                  class="px-2 py-1 text-[11px] bg-white border border-gray-300 rounded shadow-sm hover:bg-gray-50 transition shrink-0"
+                >📋 复制 Prompt</button>
+              </div>
+
+              <!-- 按【区块】分段：聊天上下文 / 方案纪要这类大块材料默认折叠，只留标题与体量 -->
+              <div class="space-y-2">
+                <div
+                  v-for="sec in promptSections"
+                  :key="sec.key"
+                  class="bg-white border border-gray-200 rounded-xl overflow-hidden"
+                >
+                  <button
+                    @click="togglePromptSection(sec)"
+                    class="w-full flex items-center gap-2 px-3 py-2 text-left hover:bg-gray-50 transition"
+                  >
+                    <span class="text-[10px] text-gray-400 w-3 shrink-0">{{ promptSectionOpen(sec) ? "▾" : "▸" }}</span>
+                    <span class="text-xs font-bold text-gray-800 truncate">{{ sec.title || "(开头无标题部分)" }}</span>
+                    <span class="ml-auto text-[10px] text-gray-400 shrink-0">
+                      {{ sec.chars }} 字<template v-if="sec.lineCount > 1"> · {{ sec.lineCount }} 行</template>
+                    </span>
+                  </button>
+                  <pre
+                    v-if="promptSectionOpen(sec)"
+                    class="text-xs font-mono px-4 pb-4 pt-2 border-t border-gray-100 whitespace-pre-wrap select-text leading-relaxed text-gray-800"
+                  >{{ sec.body }}</pre>
+                  <div v-else class="px-4 pb-2 text-[10px] text-gray-400">已折叠 · 点标题展开</div>
+                </div>
+              </div>
+            </template>
+
+            <pre v-else class="text-xs font-mono bg-white p-4 border border-gray-200 rounded-xl whitespace-pre-wrap select-text leading-relaxed text-gray-800">{{ '该条记录生成于 Prompt 持久化功能上线前，未留存独立 Prompt。' }}</pre>
           </div>
 
           <div v-else class="relative">
