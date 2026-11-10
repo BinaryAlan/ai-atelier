@@ -12,7 +12,10 @@ from core.storage import (
     list_sessions, get_session, create_session, save_session, delete_session,
     is_valid_session_id, session_lock, SessionDeletedError
 )
-from core.engine import MeetingEngine, generate_msg_id, bump_document_revision, run_with_retry
+from core.engine import (
+    MeetingEngine, generate_msg_id, bump_document_revision, run_with_retry,
+    request_skip_current, clear_skip_current,
+)
 from core.executor import Executor, validate_cli_template
 from core.scanner import scan_local_models
 
@@ -288,10 +291,11 @@ def _sanitize_agent(raw, label: str, default_id: str) -> "tuple":
         return None, f"{label} 的 id 不合法（仅允许字母、数字、下划线、短横线）"
 
     try:
-        timeout = int(float(raw.get("timeout", 180)))
+        timeout = int(float(raw.get("timeout", 0)))
     except (TypeError, ValueError):
-        timeout = 180
-    timeout = max(10, min(3600, timeout))
+        timeout = 0
+    # 0 = 不限制（默认）：模型可以跑到自己结束，需要打断时用「⏭ 跳过当前发言」
+    timeout = max(0, min(86400, timeout))
 
     return {
         "id": agent_id,
@@ -614,6 +618,46 @@ def api_pause(session_id):
 
     return jsonify({"success": True, "killed": killed, "status": "paused"})
 
+
+@app.route("/api/sessions/<session_id>/interrupt", methods=["POST"])
+def api_interrupt_current(session_id):
+    """
+    中断当前正在作答的成员，并把它移出发言位，让余下成员接着走。
+
+    和「暂停」的区别：暂停会把整场会议停下来等人；这里只换人，会议继续跑。
+    实现上先登记跳过请求再杀进程——引擎线程拿到 interrupted 结果时靠这个登记
+    判断「这是要跳过，不是要暂停」，否则会被当成暂停处理。
+    """
+    if not is_valid_session_id(session_id):
+        return jsonify({"error": "非法 session_id"}), 400
+    if not _require_action_header():
+        return jsonify({"error": "缺少操作确认头"}), 400
+
+    speaker = None
+    with session_lock(session_id):
+        session = get_session(session_id)
+        if not session:
+            return jsonify({"error": "会话不存在"}), 404
+        if session.get("status") != "running":
+            return jsonify({"error": "会议当前不在推进中，没有可以中断的发言"}), 409
+        speaker = session.get("current_speaker")
+        if not speaker:
+            # 状态是 running 但还没点名（线程刚起步）：稍等一下再点
+            return jsonify({"error": "还没开始下一位发言，请稍后再点"}), 409
+
+    request_skip_current(session_id)
+    killed = Executor.kill_session_process(session_id)
+    if not killed:
+        # 没杀到进程：撤销登记，避免这条请求串到下一次发言上
+        clear_skip_current(session_id)
+        return jsonify({
+            "error": "没找到正在运行的进程（可能刚好答完了）。刷新一下页面再试，"
+                     "若确实还在跑，请用「⏸️ 暂停会议」"
+        }), 409
+
+    return jsonify({"success": True, "interrupted": speaker, "session": get_session(session_id) or {}}), 202
+
+
 @app.route("/api/sessions/<session_id>/resume", methods=["POST"])
 def api_resume(session_id):
     if not is_valid_session_id(session_id):
@@ -783,13 +827,17 @@ def api_retry_message(session_id, msg_id):
                 return jsonify({"error": "找不到这条发言"}), 404
             if msg.get("verdict") not in ("ERROR", "TIMEOUT"):
                 return jsonify({"error": "只有报错/超时的发言才需要重试"}), 400
-            if msg.get("phase") != 1:
-                return jsonify({
-                    "error": "阶段二的异常可以直接「恢复讨论」重问同一位成员；"
-                             "若不想再等它，点「跳过此人」即可"
-                }), 400
-            if session.get("phase", 1) != 1:
-                return jsonify({"error": "会议已进入阶段二，补一条阶段一的立论已经没有意义"}), 400
+            # 被 @ 的定向应答失败时只能同一个人重问（换人没意义），
+            # 它不属于任何阶段的轮次，所以不受「阶段一才可重试」的限制。
+            is_direct = bool(msg.get("direct_mention"))
+            if not is_direct:
+                if msg.get("phase") != 1:
+                    return jsonify({
+                        "error": "阶段二的异常可以直接「恢复讨论」重问同一位成员；"
+                                 "若不想再等它，点「跳过此人」即可"
+                    }), 400
+                if session.get("phase", 1) != 1:
+                    return jsonify({"error": "会议已进入阶段二，补一条阶段一的立论已经没有意义"}), 400
             prompt = str(msg.get("sent_prompt") or "").strip()
             if not prompt:
                 return jsonify({"error": "这条记录没有留存 Prompt（早于该功能上线），无法原样重试"}), 400
@@ -799,6 +847,7 @@ def api_retry_message(session_id, msg_id):
 
             workspace_dir = session.get("workspace_dir", "")
             emp_name = emp.get("name") or emp.get("id")
+            prev_status = session.get("status", "idle")
             session["current_speaker"] = f"{emp_name} (重新发言中)"
             save_session(session)
 
@@ -823,26 +872,45 @@ def api_retry_message(session_id, msg_id):
                 curr["current_speaker"] = None
 
                 if res.status == "success":
-                    target["verdict"] = "OPINION"
-                    curr["status"] = "running"
-                    _append_system_message(
-                        curr,
-                        f"🔄 已单独重试 [{emp_name}]，这一条发言用新结果替换（其他人不受影响）。会议继续。"
-                    )
-                    resume = True
-                elif res.status == "stopped":
+                    target["verdict"] = "DIRECT" if is_direct else "OPINION"
+                    if is_direct:
+                        # 只是一次点名问答，不该把整场会议重新推起来
+                        curr["status"] = prev_status if prev_status in ("running", "paused") else "idle"
+                        resume = curr["status"] == "running"
+                        _append_system_message(
+                            curr,
+                            f"🔄 已重新应答 [{emp_name}]，新结果已替换这一条。会议状态保持原样。"
+                        )
+                    else:
+                        curr["status"] = "running"
+                        _append_system_message(
+                            curr,
+                            f"🔄 已单独重试 [{emp_name}]，这一条发言用新结果替换（其他人不受影响）。会议继续。"
+                        )
+                        resume = True
+                elif res.status in ("stopped", "interrupted"):
                     target["verdict"] = "TIMEOUT" if msg.get("verdict") == "TIMEOUT" else "ERROR"
-                    curr["status"] = "paused"
+                    curr["status"] = (prev_status if prev_status in ("running", "paused") else "idle") \
+                        if is_direct else "paused"
                     _append_system_message(curr, f"⏸️ 单独重试 [{emp_name}] 已被用户手动暂停中断。")
                 else:
                     target["verdict"] = "TIMEOUT" if res.status == "timeout" else "ERROR"
-                    curr["status"] = "paused"
-                    _append_system_message(
-                        curr,
-                        f"⚠️ [{emp_name}] 重试仍然失败（{res.status}）。"
-                        "可以点该条发言旁的「跳过此人」继续推进，或先修好它的 CLI"
-                        "（例如 --tools 参数）再重试。"
-                    )
+                    curr["status"] = (prev_status if prev_status in ("running", "paused") else "idle") \
+                        if is_direct else "paused"
+                    if is_direct:
+                        _append_system_message(
+                            curr,
+                            f"⚠️ [{emp_name}] 这次点名应答仍然失败（{res.status}）。"
+                            "它不是会议流程的一部分，会议状态没有改变；"
+                            "可以再点一次「🔄 重试」，或先修好它的 CLI 参数。"
+                        )
+                    else:
+                        _append_system_message(
+                            curr,
+                            f"⚠️ [{emp_name}] 重试仍然失败（{res.status}）。"
+                            "可以点该条发言旁的「跳过此人」继续推进，或先修好它的 CLI"
+                            "（例如 --tools 参数）再重试。"
+                        )
                 save_session(curr)
         except Exception as ex:
             print("[Retry] 单独重试失败:", ex)
@@ -890,6 +958,9 @@ def api_skip_message(session_id, msg_id):
             return jsonify({"error": "找不到这条发言"}), 404
         if msg.get("verdict") not in ("ERROR", "TIMEOUT"):
             return jsonify({"error": "只有报错/超时的发言才能跳过"}), 400
+        if msg.get("direct_mention"):
+            # 群主点名要的答案：跳过这个人等于让这次提问没有下文，应该重试
+            return jsonify({"error": "这是群主 @ 指定成员的应答，不能跳过；请点「🔄 重试」重新问它"}), 400
 
         emp = _resolve_turn_employee(msg, require_cli=False)
         if not emp:

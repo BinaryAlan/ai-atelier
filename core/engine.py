@@ -1,4 +1,5 @@
 import re
+import threading
 import time
 import uuid
 from typing import Dict, Any, Optional, Tuple, List
@@ -117,6 +118,40 @@ def clear_stuck(session: Dict[str, Any]) -> None:
     """流程真的往前走了，之前的卡点与恢复计数一并作废。"""
     session.pop("stuck", None)
     session.pop("stuck_resume_attempts", None)
+
+
+# ---------------------------------------------------------------------------
+# 「跳过当前发言」请求
+#
+# 群主在某人正在作答时点跳过：HTTP 线程负责杀掉 CLI 进程，引擎线程在拿到
+# interrupted 结果后必须知道「这不是暂停，而是要跳过这个人」。
+# 用进程内登记表而不是会话字段：引擎线程手里是会话快照，写磁盘会被它的
+# save_session(merge=True) 覆盖回去，反而不可靠；同一进程内内存表最准。
+# ---------------------------------------------------------------------------
+_SKIP_REQUESTS: Dict[str, float] = {}
+_SKIP_REQUESTS_LOCK = threading.Lock()
+_SKIP_REQUEST_TTL = 120  # 秒：防止「点了但没进程可杀」的请求残留到下一轮被误用
+
+
+def request_skip_current(session_id: str) -> None:
+    """登记一次「跳过当前发言」请求（由 HTTP 接口在杀进程前调用）。"""
+    with _SKIP_REQUESTS_LOCK:
+        _SKIP_REQUESTS[session_id] = time.time()
+
+
+def clear_skip_current(session_id: str) -> None:
+    """撤销登记（没杀到进程 / 接口校验失败时调用）。"""
+    with _SKIP_REQUESTS_LOCK:
+        _SKIP_REQUESTS.pop(session_id, None)
+
+
+def consume_skip_current(session_id: str) -> bool:
+    """引擎线程消费一次跳过请求；过期的登记视为无效，避免串到下一轮。"""
+    with _SKIP_REQUESTS_LOCK:
+        at = _SKIP_REQUESTS.pop(session_id, None)
+    if at is None:
+        return False
+    return (time.time() - at) <= _SKIP_REQUEST_TTL
 
 
 def bump_document_revision(session: Dict[str, Any]) -> int:
@@ -509,10 +544,96 @@ class MeetingEngine:
         }
 
     @staticmethod
-    def _stop_if_interrupted(session: Dict[str, Any], session_id: str, res_status: str) -> Optional[Tuple[bool, str]]:
-        """统一处理「用户暂停」：返回 None 表示可以继续，否则返回统一的终止结果。"""
+    def _stop_if_interrupted(session: Dict[str, Any], session_id: str, res_status: str,
+                             speaker_id: Optional[str] = None,
+                             speaker_name: Optional[str] = None) -> Optional[Tuple[bool, str]]:
+        """
+        统一处理「用户打断当前发言」：返回 None 表示可以继续，否则返回统一的终止结果。
+
+        两种打断必须区分开，否则「跳过」会被当成「暂停」把会议停住：
+        * 暂停（🛑 按钮）→ 会话状态已被置为 paused，这里只收尾；
+        * 跳过（⏭ 按钮）→ 会话仍是 running，只是登记的跳过请求要求把人移出发言位。
+        """
         latest = get_session(session_id) or {}
         latest_status = latest.get("status")
+
+        # 先看这次是不是「跳过当前发言」：它不影响会议状态，只换人继续
+        if res_status == "interrupted" and consume_skip_current(session_id):
+            session["current_speaker"] = None
+
+            # A. 被 @ 的点名应答：只是不想等这句话了，人仍然留在会上
+            if session.get("target_direct_mention"):
+                session["target_direct_mention"] = None
+                prev_status = session.pop("pre_mention_status", "idle")
+                session["status"] = prev_status if prev_status in ("running", "paused") else "idle"
+                session["messages"].append({
+                    "id": generate_msg_id(),
+                    "sender": "system",
+                    "sender_name": "系统广播",
+                    "content": (
+                        f"⏭ 群主中断了 [{speaker_name or '被点名的成员'}] 的点名回答。"
+                        "它没有被移出发言位，会议状态保持不变；需要答案可以再 @ 它一次。"
+                    ),
+                    "phase": session.get("phase", 1),
+                    "verdict": "RECOVER",
+                    "elapsed_time": 0,
+                    "created_at": int(time.time()),
+                    "sent_prompt": "",
+                    "raw_response": ""
+                })
+                save_session(session, merge=True)
+                return True, "点名回答已被群主中断"
+
+            # B. 主持人在整理 / 修订：没法「跳过主持人」，只能停在这儿等人
+            if not speaker_id:
+                mod = MeetingEngine.get_moderator(load_settings())
+                session["status"] = "paused"
+                session["messages"].append(
+                    MeetingEngine._create_pause_message(
+                        mod["id"], mod["name"],
+                        session.get("phase", 1),
+                        "⏸️ 群主中断了主持人正在进行的整理工作，会议转为暂停。"
+                        "点「▶️ 恢复讨论」会重新安排这一步；草案正文未被覆盖。"
+                    )
+                )
+                save_session(session, merge=True)
+                return False, "主持人整理过程被群主中断"
+
+            # C. 正常轮次里的成员：移出发言位，换下一位
+            emp_name = speaker_name or str(speaker_id)
+            skipped = [e for e in (session.get("skipped_employees") or []) if isinstance(e, str)]
+            if speaker_id not in skipped:
+                skipped.append(speaker_id)
+            session["skipped_employees"] = skipped
+
+            # 它正在提的阻断没人验收了，视为撤回（否则会永远等一个不会回来的 [ACCEPT]）
+            blocker = session.get("blocker_under_review")
+            withdrawn = bool(blocker and blocker.get("raised_by") == speaker_id)
+            if withdrawn:
+                session["blocker_under_review"] = None
+                session["blocker_retry_count"] = 0
+
+            session["status"] = "running"
+            session["messages"].append({
+                "id": generate_msg_id(),
+                "sender": "system",
+                "sender_name": "系统广播",
+                "content": (
+                    f"⏭ 群主中断了 [{emp_name}] 正在进行的回答，并把它移出发言位，"
+                    "会议直接交由余下成员继续。"
+                    + ("\n（它正在提出的阻断问题视为撤回，问题原文仍留在上方可人工判断。）" if withdrawn else "")
+                    + "\n需要它的意见时，在「👥 参会成员」面板点「↩️ 恢复」即可拉回来。"
+                ),
+                "phase": session.get("phase", 1),
+                "verdict": "RECOVER",
+                "elapsed_time": 0,
+                "created_at": int(time.time()),
+                "sent_prompt": "",
+                "raw_response": ""
+            })
+            save_session(session, merge=True)
+            return True, f"[{emp_name}] 的发言已被群主中断并跳过"
+
         if res_status != "interrupted" and latest_status != "paused":
             return None
 
@@ -632,8 +753,11 @@ class MeetingEngine:
                 workspace_dir=workspace_dir
             )
 
-            # 检查执行过程中是否被用户手动暂停
-            stop = MeetingEngine._stop_if_interrupted(session, session_id, res.status)
+            # 检查执行过程中是否被用户手动暂停 / 跳过
+            stop = MeetingEngine._stop_if_interrupted(
+                session, session_id, res.status,
+                speaker_id=target_emp["id"], speaker_name=target_emp["name"]
+            )
             if stop:
                 return stop
 
@@ -660,6 +784,9 @@ class MeetingEngine:
                 "verdict": verdict,
                 "elapsed_time": res.elapsed,
                 "created_at": int(time.time()),
+                # 定向应答的失败要能「重试」而不是「跳过此人」：
+                # 它是群主点名要的答案，换人没有意义，只能同一个人重问。
+                "direct_mention": True,
                 "sent_prompt": prompt,
                 "raw_response": res.raw_output
             })
@@ -726,8 +853,11 @@ class MeetingEngine:
 
                 res = run_with_retry(emp, prompt, session_id, workspace_dir)
 
-                # 检查暂停中断
-                stop = MeetingEngine._stop_if_interrupted(session, session_id, res.status)
+                # 检查暂停 / 跳过
+                stop = MeetingEngine._stop_if_interrupted(
+                    session, session_id, res.status,
+                    speaker_id=emp["id"], speaker_name=emp["name"]
+                )
                 if stop:
                     return stop
 
@@ -952,7 +1082,10 @@ class MeetingEngine:
 
                 res_verify = run_with_retry(raiser_emp, verify_prompt, session_id, workspace_dir)
 
-                stop = MeetingEngine._stop_if_interrupted(session, session_id, res_verify.status)
+                stop = MeetingEngine._stop_if_interrupted(
+                    session, session_id, res_verify.status,
+                    speaker_id=raiser_emp["id"], speaker_name=raiser_emp["name"]
+                )
                 if stop:
                     return stop
 
@@ -1084,7 +1217,10 @@ class MeetingEngine:
 
             res = run_with_retry(reviewer_emp, review_prompt, session_id, workspace_dir)
 
-            stop = MeetingEngine._stop_if_interrupted(session, session_id, res.status)
+            stop = MeetingEngine._stop_if_interrupted(
+                session, session_id, res.status,
+                speaker_id=reviewer_emp["id"], speaker_name=reviewer_emp["name"]
+            )
             if stop:
                 return stop
 

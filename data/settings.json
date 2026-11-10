@@ -8,7 +8,7 @@
       "id": "emp_agy",
       "name": "agy",
       "system_prompt": "",
-      "timeout": 180,
+      "timeout": 0,
       "type": "cli"
     },
     {
@@ -19,7 +19,7 @@
       "id": "codebuddy-ds4",
       "name": "DeepSeek-V4 (DS4)",
       "system_prompt": "擅长深度逻辑推演、推演潜在隐患与方案边界风险，以客观严谨的态度提出建设性意见。",
-      "timeout": 180,
+      "timeout": 0,
       "type": "cli"
     },
     {
@@ -30,7 +30,7 @@
       "id": "codebuddy-hy4",
       "name": "混元-4 (HY4)",
       "system_prompt": "注重实际落地执行可行性、周期效率与实操适配度，提供稳健务实的路径建议。",
-      "timeout": 120,
+      "timeout": 0,
       "type": "cli"
     }
   ],
@@ -41,7 +41,7 @@
     "id": "moderator",
     "name": "主持人",
     "system_prompt": "你是会议主持人。负责中立客观地主持会议进程、梳理记录各方发言要点、综合整理方案纪要，并在全员达成共识时出具定稿报告。",
-    "timeout": 180,
+    "timeout": 0,
     "type": "cli"
   }
 }

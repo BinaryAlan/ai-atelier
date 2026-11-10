@@ -27,7 +27,7 @@ createApp({
           type: "cli",
           cli_cmd: 'agy -p "{prompt}"',
           system_prompt: "你是会议主持人。负责主持会议进程、客观梳理各方意见、汇总生成方案草案，并在全员达成共识时出具终稿文档。",
-          timeout: 180
+          timeout: 0
         },
         employees: []
       },
@@ -80,7 +80,7 @@ createApp({
         cli_cmd: "",
         system_prompt: "",
         enabled: true,
-        timeout: 180
+        timeout: 0
       },
       presetAvatars: ["🤖", "🧠", "⚡", "🦉", "🛡️", "🚀", "💻", "🔬", "🎯", "🎨", "👑", "🕵️", "🔧", "💡", "⚖️", "📊"],
 
@@ -100,6 +100,7 @@ createApp({
       serviceBusy: false,
       serviceDown: false,
       resumeBusy: false,  // 恢复请求在途：按钮保持「恢复中…」，避免连点变成暂停
+      interruptBusy: false, // 中断当前发言在途，避免连点重复杀进程
       toastText: "",      // 顶部轻提示（恢复结果/自动暂缓等）
 
       // 布局：左栏可收起、左右两栏宽度可拖拽、纪要可全屏
@@ -638,22 +639,51 @@ createApp({
         && this.currentSession.skipped_employees.includes(empId);
     },
 
-    // 只有「阶段一里某个成员自己没答好」才值得原地重跑：
-    // 阶段二的异常靠「恢复讨论」本来就会重问同一个人，重跑固定一条反而会打乱阻断闭环。
+    // 被 @ 的定向应答不属于任何轮次，失败了只能同一个人重问（换人没意义）。
+    // 阶段一的立论异常也支持原地重跑；阶段二的审阅异常靠「恢复讨论」重问同一人。
     canRetryMsg(msg) {
       if (!msg) return false;
       if (msg.verdict !== "ERROR" && msg.verdict !== "TIMEOUT") return false;
+      if (!msg.sent_prompt) return false;
+      if (this.isModerator(msg.sender) || msg.sender === "user" || msg.sender === "system") return false;
+      if (msg.direct_mention) return true;
       if (msg.phase !== 1) return false;
       // 会议已经走到阶段二了，再回头补一条立论没有意义
       if ((this.currentSession?.phase || 1) !== 1) return false;
-      if (!msg.sent_prompt) return false;
-      return !this.isModerator(msg.sender) && msg.sender !== "user" && msg.sender !== "system";
+      return true;
     },
 
     canSkipMsg(msg) {
       if (!msg) return false;
       if (msg.verdict !== "ERROR" && msg.verdict !== "TIMEOUT") return false;
+      // 群主点名要的答案，跳过这个人等于让这次提问没有下文 —— 只给「重试」
+      if (msg.direct_mention) return false;
       return !this.isModerator(msg.sender) && msg.sender !== "user" && msg.sender !== "system";
+    },
+
+    async interruptCurrentSpeaker() {
+      if (!this.currentSessionId || this.interruptBusy) return;
+      this.interruptBusy = true;
+      try {
+        const res = await fetch(`/api/sessions/${this.currentSessionId}/interrupt`, {
+          method: "POST",
+          headers: { "X-Meeting-Action": "1" }
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          alert(data.error || `中断失败: HTTP ${res.status}`);
+        } else {
+          this.toastText = `已中断 [${data.interrupted || "当前发言"}]，会议交由余下成员继续。`;
+          setTimeout(() => { this.toastText = ""; }, 6000);
+          // 立刻拉一次最新状态，避免等下一轮轮询才有反馈
+          const latest = await fetch(`/api/sessions/${this.currentSessionId}`).then(r => r.ok ? r.json() : null);
+          if (latest && latest.id === this.currentSessionId) this.currentSession = latest;
+        }
+      } catch (e) {
+        alert("中断请求失败: " + e);
+      } finally {
+        this.interruptBusy = false;
+      }
     },
 
     async retryMessage(msg) {
@@ -997,7 +1027,7 @@ createApp({
         cli_cmd: "",
         system_prompt: "",
         enabled: true,
-        timeout: 180
+        timeout: 0
       };
       this.showEmpEditModal = true;
     },

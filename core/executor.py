@@ -15,8 +15,8 @@ ALLOWED_BINARIES = {"agy", "codebuddy"}
 
 # 单条 prompt 的长度上限：prompt 通过 argv 传递，超长会触发 E2BIG 并让 CLI 直接失败
 MAX_PROMPT_CHARS = 100_000
-MIN_TIMEOUT = 10
-MAX_TIMEOUT = 3600
+MAX_TIMEOUT = 86400    # 有上限时最多 24 小时，防止配置写错变成天文数字
+# 超时语义：0 或空 = 不限制（详见 _coerce_timeout）
 
 # 模型把「工具调用」或思考链当正文吐出来时的产物（CodeBuddy 在 --tools "" 下尤其明显，
 # 或 DeepSeek 等推理模型外溢的 think 块）。这些不是发言内容，必须剥掉，避免干扰结论解析。
@@ -96,12 +96,23 @@ def validate_cli_template(cmd_template: str) -> Tuple[bool, str]:
     return True, "验证通过"
 
 
-def _coerce_timeout(value: Any, fallback: int = 180) -> int:
+def _coerce_timeout(value: Any, fallback: Optional[int] = None) -> Optional[int]:
+    """
+    把配置里的超时值规范成「秒数」或「None（不限制）」。
+
+    - 缺省/空值 → 用 fallback（调用方传的默认值，也是 None 表示不限制）
+    - 0 或负数 → None，即不设超时：模型想跑多久就跑多久，
+      由群主在界面上点「⏭ 跳过」主动打断（这是可选行为，不再被 180 秒硬切）。
+    """
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return fallback
     try:
         timeout = int(float(value))
     except (TypeError, ValueError):
-        timeout = fallback
-    return max(MIN_TIMEOUT, min(MAX_TIMEOUT, timeout))
+        return fallback
+    if timeout <= 0:
+        return None
+    return min(MAX_TIMEOUT, max(1, timeout))
 
 
 class Executor:
@@ -165,7 +176,7 @@ class Executor:
         prompt: str,
         session_id: str = "default",
         workspace_dir: Optional[str] = None,
-        timeout: int = 180
+        timeout: Optional[int] = None
     ) -> ExecutionResult:
         """
         调用参会员工/模型，返回结构化 ExecutionResult。
@@ -222,7 +233,7 @@ class Executor:
         prompt: str,
         session_id: str = "default",
         workspace_dir: Optional[str] = None,
-        timeout: int = 180
+        timeout: Optional[int] = None
     ) -> ExecutionResult:
         """
         智能解析 CLI 命令模板，并在指定工作目录中独立进程组运行。

@@ -52,7 +52,8 @@ DEFAULT_SETTINGS = {
         "type": "cli",
         "cli_cmd": 'agy -p "{prompt}"',
         "system_prompt": "你是会议主持人。负责中立客观地主持会议进程、梳理记录各方发言要点、综合整理方案纪要，并在全员达成共识时出具定稿报告。",
-        "timeout": 180
+        # 0 = 不设超时：需要打断时由群主点「⏭ 跳过当前发言」主动结束
+        "timeout": 0
     },
     "employees": [
         {
@@ -64,7 +65,7 @@ DEFAULT_SETTINGS = {
             "cli_cmd": 'agy -p "{prompt}"',
             "system_prompt": "",
             "enabled": True,
-            "timeout": 180
+            "timeout": 0
         },
         {
             "id": "codebuddy-ds4",
@@ -75,7 +76,7 @@ DEFAULT_SETTINGS = {
             "cli_cmd": 'codebuddy --model deepseek-v4-pro --tools "" -p "{prompt}"',
             "system_prompt": "擅长深度逻辑推演、推演潜在隐患与方案边界风险，以客观严谨的态度提出建设性意见。",
             "enabled": True,
-            "timeout": 180
+            "timeout": 0
         },
         {
             "id": "codebuddy-hy4",
@@ -86,7 +87,7 @@ DEFAULT_SETTINGS = {
             "cli_cmd": 'codebuddy --model hy4std --tools "" -p "{prompt}"',
             "system_prompt": "注重实际落地执行可行性、周期效率与实操适配度，提供稳健务实的路径建议。",
             "enabled": True,
-            "timeout": 120
+            "timeout": 0
         }
     ]
 }

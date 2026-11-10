@@ -387,9 +387,17 @@
         </div>
 
         <!-- 等待思考动画 -->
-        <div v-if="currentSession?.current_speaker" class="flex items-center gap-2 text-xs text-blue-600 bg-blue-50 p-2.5 rounded-lg border border-blue-100 animate-pulse">
+        <div v-if="currentSession?.current_speaker" class="flex items-center gap-2 text-xs text-blue-600 bg-blue-50 p-2.5 rounded-lg border border-blue-100">
           <span class="animate-spin">⏳</span>
-          <span>正在等待 <strong>[{{ currentSession.current_speaker }}]</strong> 响应中...</span>
+          <span class="flex-1">正在等待 <strong>[{{ currentSession.current_speaker }}]</strong> 响应中...</span>
+          <!-- 不设超时了，所以「什么时候不等了」由群主决定 -->
+          <span class="text-[11px] text-blue-400 hidden sm:inline">不设时限，需要打断就点右侧</span>
+          <button
+            @click.stop="interruptCurrentSpeaker"
+            :disabled="interruptBusy"
+            class="text-[11px] px-2.5 py-1 rounded-lg bg-white border border-amber-300 text-amber-700 hover:bg-amber-50 transition shrink-0 disabled:opacity-60 disabled:cursor-wait"
+            title="中断这位成员的本次回答，把它移出发言位，让下一位接着发言"
+          >{{ interruptBusy ? '⏳ 中断中…' : '⏭ 跳过' }}</button>
         </div>
       </div>
 
@@ -903,6 +911,23 @@
           <div>
             <label class="block font-semibold text-gray-500 mb-1">CLI 执行模板 (自动生成，保留 {prompt}):</label>
             <input type="text" v-model="editingEmp.cli_cmd" class="w-full border border-gray-200 bg-gray-50 rounded px-2 py-1 text-[11px] font-mono text-gray-600">
+          </div>
+
+          <!-- 单次回答超时：0 = 不限制 -->
+          <div>
+            <label class="block font-semibold text-gray-500 mb-1">单次回答超时（秒，0 = 不限制）:</label>
+            <div class="flex items-center gap-2">
+              <input
+                type="number" min="0" max="86400" step="30"
+                v-model.number="editingEmp.timeout"
+                class="w-28 border border-gray-300 rounded-lg px-2 py-1 text-xs"
+                placeholder="0"
+              />
+              <span class="text-[11px] text-gray-400 leading-snug">
+                留 0 表示不设时限：模型可以一直跑到自己认为答完，
+                需要打断时点聊天区的「⏭ 跳过」即可
+              </span>
+            </div>
           </div>
         </div>
 
