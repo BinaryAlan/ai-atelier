@@ -246,7 +246,35 @@ def api_update_session(session_id):
     if "is_favorite" in data:
         session["is_favorite"] = bool(data["is_favorite"])
     if "employee_ids" in data and isinstance(data["employee_ids"], list):
-        session["employee_ids"] = data["employee_ids"]
+        old_ids = session.get("employee_ids", [])
+        new_ids = data["employee_ids"]
+        if set(old_ids) != set(new_ids):
+            added_ids = [x for x in new_ids if x not in old_ids]
+            removed_ids = [x for x in old_ids if x not in new_ids]
+            settings = load_settings()
+            parts = []
+            if added_ids:
+                added_names = [MeetingEngine.get_employee(settings, eid)["name"] for eid in added_ids]
+                parts.append(f"加入了 [{', '.join(added_names)}]")
+            if removed_ids:
+                removed_names = [MeetingEngine.get_employee(settings, eid)["name"] for eid in removed_ids]
+                parts.append(f"移出了 [{', '.join(removed_names)}]")
+            
+            notice_text = f"📢 参会人员变动：{'；'.join(parts)}"
+            now = int(time.time())
+            session["messages"].append({
+                "id": generate_msg_id(),
+                "sender": "system",
+                "sender_name": "系统广播",
+                "content": notice_text,
+                "phase": session.get("phase", 1),
+                "verdict": "MEMBER_CHANGE",
+                "elapsed_time": 0,
+                "created_at": now,
+                "sent_prompt": "",
+                "raw_response": ""
+            })
+            session["employee_ids"] = new_ids
     if "workspace_dir" in data:
         raw_dir = str(data["workspace_dir"]).strip()
         if is_path_safe(raw_dir) and os.path.exists(raw_dir):

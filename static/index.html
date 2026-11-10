@@ -286,24 +286,28 @@
           >
             👑 @{{ settings.moderator.name }}
           </button>
+          <!-- 参会员工快捷@ (同步仅展示当前在席参会的员工，被移出后自动消失) -->
           <button 
-            v-for="emp in availableEmployees" 
+            v-for="emp in activeSessionEmployees" 
             :key="emp.id"
             @click="insertMention(emp.name)"
-            class="text-xs px-2 py-0.5 rounded bg-gray-100 hover:bg-gray-200 text-gray-700 transition shrink-0"
+            class="text-xs px-2 py-0.5 rounded bg-gray-100 hover:bg-gray-200 text-gray-700 transition shrink-0 flex items-center gap-1"
           >
-            @{{ emp.name }}
+            <span>{{ emp.avatar || '🤖' }}</span>
+            <span>@{{ emp.name }}</span>
           </button>
         </div>
 
-        <!-- 文本输入框 (Backspace 整删 @ 标签) -->
+        <!-- 文本输入框 (Backspace 整删 @ 标签，防输入法回车误触发送) -->
         <div class="flex gap-2">
           <textarea 
             ref="chatInput"
             v-model="inputContent" 
             @keydown="onInputKeydown"
+            @compositionstart="isComposing = true"
+            @compositionend="onCompositionEnd"
             rows="2"
-            placeholder="输入议题、提问、补充要求或指令... (Enter 发送)" 
+            placeholder="输入议题、提问、补充要求或指令... (Enter 发送，Shift+Enter 换行)" 
             class="flex-1 border border-gray-300 rounded-lg p-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 resize-none"
           ></textarea>
           <button 

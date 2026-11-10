@@ -89,6 +89,7 @@ createApp({
       inspectTab: "prompt",
       inspectingMsg: null,
 
+      isComposing: false, // 正在使用输入法组词或英文回车确认
       defaultWorkspaceDir: "",
       pollInterval: null
     };
@@ -377,14 +378,29 @@ createApp({
     async saveSessionEmployees() {
       if (!this.currentSessionId) return;
       try {
-        await fetch(`/api/sessions/${this.currentSessionId}`, {
+        const res = await fetch(`/api/sessions/${this.currentSessionId}`, {
           method: "PUT",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ employee_ids: this.currentSession.employee_ids })
         });
+        if (res.ok) {
+          const updated = await res.json();
+          this.currentSession = updated;
+          this.$nextTick(this.scrollToBottom);
+          await this.loadSessions();
+        }
       } catch (e) {
         console.error("更新参会成员失败:", e);
       }
+    },
+
+    // ----------------- 输入法状态与回车防误触 -----------------
+    onCompositionEnd() {
+      // 保持短暂标志位，抵消浏览器在 compositionend 与 keydown(Enter) 之间的瞬态事件
+      this.isComposing = true;
+      setTimeout(() => {
+        this.isComposing = false;
+      }, 120);
     },
 
     // ----------------- 消息输入与 Backspace 整删 @ 标签 -----------------
@@ -412,7 +428,12 @@ createApp({
           }
         }
       }
+
       if (e.key === "Enter" && !e.shiftKey) {
+        // 关键修复：输入法拼音/英文字符确认时按回车，绝不能误触发发送消息！
+        if (e.isComposing || this.isComposing || e.keyCode === 229) {
+          return;
+        }
         e.preventDefault();
         this.sendMessage();
       }
