@@ -414,6 +414,10 @@ def api_update_session(session_id):
                     "raw_response": ""
                 })
                 session["employee_ids"] = new_ids
+                # 被移出的人不该继续挂在「跳过名单」里，否则重新拉回来时要多点一次恢复
+                session["skipped_employees"] = [
+                    e for e in (session.get("skipped_employees") or []) if e in new_ids
+                ]
 
         if "workspace_dir" in data:
             raw_dir = str(data.get("workspace_dir") or "").strip()
