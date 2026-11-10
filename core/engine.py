@@ -180,6 +180,9 @@ def split_valid_opinions(messages) -> Tuple[List[Dict[str, Any]], List[str]]:
     for m in messages or []:
         if not isinstance(m, dict):
             continue
+        sender = m.get("sender")
+        if not sender or sender in ("user", "system", "moderator"):
+            continue
         if is_valid_speech(m):
             valid.append(m)
         else:
@@ -592,7 +595,7 @@ class MeetingEngine:
                 user_topic = session["messages"][last_user_idx]["content"] if last_user_idx != -1 else "方案研讨"
 
                 prior_valid, prior_silent = split_valid_opinions(
-                    [m for m in relevant_msgs if m.get("phase") == 1]
+                    [m for m in relevant_msgs if m.get("phase") == 1 and m.get("sender") in workers]
                 )
                 p1_context = [f"[{m['sender_name']}]: {m['content']}" for m in prior_valid]
                 context_str = "\n".join(p1_context) if p1_context else "(你是第一个发言人)"
