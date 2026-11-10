@@ -91,6 +91,7 @@ createApp({
 
       isComposing: false, // 正在使用输入法组词或英文回车确认
       defaultWorkspaceDir: "",
+      switchToken: 0,     // 会话切换请求序号，用于丢弃过期的在途响应
       pollInterval: null
     };
   },
@@ -121,14 +122,11 @@ createApp({
     },
     renderedDoc() {
       const doc = this.currentSession?.document || "*(暂无方案文档)*";
-      if (window.marked) {
-        const rawHtml = marked.parse(doc);
-        if (window.DOMPurify) {
-          return DOMPurify.sanitize(rawHtml);
-        }
-        return this.sanitizeHtml(rawHtml);
+      // 任一依赖 CDN 不可用时，绝不把原始 Markdown/HTML 直接交给 v-html（会执行脚本）
+      if (!window.marked || !window.DOMPurify) {
+        return `<pre style="white-space:pre-wrap">${this.escapeHtml(doc)}</pre>`;
       }
-      return doc;
+      return DOMPurify.sanitize(marked.parse(doc));
     }
   },
   mounted() {
@@ -171,28 +169,10 @@ createApp({
       }
     },
 
-    sanitizeHtml(html) {
-      if (!html) return "";
-      const temp = document.createElement("div");
-      temp.innerHTML = html;
-      const dangerousTags = ["script", "iframe", "object", "embed", "link", "style", "form", "input", "button"];
-      dangerousTags.forEach(tag => {
-        const elements = temp.getElementsByTagName(tag);
-        for (let i = elements.length - 1; i >= 0; i--) {
-          elements[i].parentNode?.removeChild(elements[i]);
-        }
-      });
-      const all = temp.querySelectorAll("*");
-      for (const el of all) {
-        for (const attr of Array.from(el.attributes)) {
-          const attrName = attr.name.toLowerCase();
-          const attrVal = attr.value.toLowerCase();
-          if (attrName.startsWith("on") || attrVal.includes("javascript:") || attrVal.includes("data:text/html")) {
-            el.removeAttribute(attr.name);
-          }
-        }
-      }
-      return temp.innerHTML;
+    escapeHtml(text) {
+      return String(text == null ? "" : text).replace(/[&<>"']/g, ch => ({
+        "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+      }[ch]));
     },
 
     async quickRemoveMember(empId) {
@@ -221,11 +201,15 @@ createApp({
 
     async switchSession(id) {
       this.currentSessionId = id;
+      // 请求序号：快速连切会话时，丢弃已过期的在途响应，避免界面显示 A、操作发往 B
+      const token = this.switchToken + 1;
+      this.switchToken = token;
       this.selectedWorkspaceFile = null;
       this.selectedFileContent = "";
       this.showMemberDropdown = false;
       try {
         const res = await fetch(`/api/sessions/${id}`);
+        if (token !== this.switchToken) return;
         if (res.ok) {
           this.currentSession = await res.json();
           this.$nextTick(this.scrollToBottom);
@@ -618,13 +602,17 @@ createApp({
       }
     },
 
+    modelKey(m) {
+      return m.key || `${m.cli}:${m.model_id}`;
+    },
+
     openEditModeratorModal() {
       this.isEditingModerator = true;
       this.isEditingEmployee = false;
       this.editingEmpIdx = -1;
       this.editingEmp = JSON.parse(JSON.stringify(this.settings.moderator || {}));
       const match = this.scannedModels.find(m => m.cli_cmd === this.editingEmp.cli_cmd);
-      this.selectedModelId = match ? match.model_id : "";
+      this.selectedModelId = match ? this.modelKey(match) : "";
       this.showEmpEditModal = true;
     },
 
@@ -656,12 +644,12 @@ createApp({
       this.editingEmpIdx = idx;
       this.editingEmp = JSON.parse(JSON.stringify(emp));
       const match = this.scannedModels.find(m => m.cli_cmd === emp.cli_cmd);
-      this.selectedModelId = match ? match.model_id : "";
+      this.selectedModelId = match ? this.modelKey(match) : "";
       this.showEmpEditModal = true;
     },
 
     onModelSelectChanged() {
-      const match = this.scannedModels.find(m => m.model_id === this.selectedModelId);
+      const match = this.scannedModels.find(m => this.modelKey(m) === this.selectedModelId);
       if (match) {
         this.editingEmp.cli_cmd = match.cli_cmd;
         if (!this.editingEmp.name) {
@@ -684,45 +672,60 @@ createApp({
         return;
       }
 
+      // 先在副本上修改，保存成功后再落到 this.settings，避免失败时本地已被改脏
+      const next = {
+        ...this.settings,
+        moderator: JSON.parse(JSON.stringify(this.settings.moderator || {})),
+        employees: JSON.parse(JSON.stringify(this.settings.employees || []))
+      };
+
       if (this.isEditingModerator) {
-        this.settings.moderator = JSON.parse(JSON.stringify(this.editingEmp));
+        next.moderator = JSON.parse(JSON.stringify(this.editingEmp));
+      } else if (this.isEditingEmployee && this.editingEmpIdx >= 0) {
+        next.employees[this.editingEmpIdx] = JSON.parse(JSON.stringify(this.editingEmp));
       } else {
-        if (this.isEditingEmployee && this.editingEmpIdx >= 0) {
-          this.settings.employees[this.editingEmpIdx] = JSON.parse(JSON.stringify(this.editingEmp));
-        } else {
-          this.settings.employees.push(JSON.parse(JSON.stringify(this.editingEmp)));
-        }
+        next.employees.push(JSON.parse(JSON.stringify(this.editingEmp)));
       }
 
-      this.showEmpEditModal = false;
-      await this.saveSettingsToServer();
+      const saved = await this.saveSettingsToServer(next);
+      if (saved) {
+        this.showEmpEditModal = false;
+      }
     },
 
     async deleteEmployee(idx) {
       const targetEmp = this.settings.employees[idx];
       if (confirm(`确定要删除角色 [${targetEmp.name}] 吗？`)) {
         this.settings.employees.splice(idx, 1);
-        await this.saveSettingsToServer();
-        if (this.currentSession?.employee_ids) {
+        const saved = await this.saveSettingsToServer();
+        if (saved && this.currentSession?.employee_ids) {
           this.currentSession.employee_ids = this.currentSession.employee_ids.filter(id => id !== targetEmp.id);
-          this.saveSessionEmployees();
+          await this.saveSessionEmployees();
         }
       }
     },
 
-    async saveSettingsToServer() {
+    async saveSettingsToServer(nextSettings) {
       try {
         const res = await fetch("/api/settings", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(this.settings)
+          body: JSON.stringify(nextSettings || this.settings)
         });
-        if (res.ok) {
-          this.showSettingsModal = false;
-          alert("配置已成功保存！");
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          // 后端的 schema / 白名单校验失败原因必须回显，否则用户只会看到「什么都没发生」
+          alert("保存配置失败: " + (data.error || `HTTP ${res.status}`));
+          return false;
         }
+        this.settings = data.settings || this.settings;
+        this.showEmpEditModal = false;
+        this.showSettingsModal = false;
+        alert("配置已成功保存！");
+        return true;
       } catch (e) {
-        console.error("保存配置失败:", e);
+        alert("保存配置失败: " + e);
+        return false;
       }
     },
 

@@ -21,13 +21,17 @@ app = Flask(__name__, static_folder=STATIC_DIR)
 
 # 仅接受本机 Host 访问：抵御 DNS rebinding（恶意网页把自有域名解析到 127.0.0.1 后
 # 即可绕过同源策略读取本地文件/改写配置）
-_ALLOWED_HOSTNAMES = {"127.0.0.1", "localhost", "::1", "[::1]"}
+_ALLOWED_HOSTNAMES = {"127.0.0.1", "localhost", "::1"}
 
 
 @app.before_request
 def _guard_host():
-    host = (request.host or "").rsplit(":", 1)[0].strip("[]").lower()
-    if host and host not in {h.strip("[]") for h in _ALLOWED_HOSTNAMES}:
+    host = (request.host or "").strip().lower()
+    if host.startswith("["):
+        hostname = host.split("]")[0].strip("[")
+    else:
+        hostname = host.rsplit(":", 1)[0]
+    if hostname and hostname not in _ALLOWED_HOSTNAMES:
         return jsonify({"error": "forbidden host"}), 403
     return None
 
@@ -42,11 +46,13 @@ def _clean_employee_ids(raw) -> Optional[List[str]]:
     """校验并规范化参会成员 id 列表（只保留字符串、去重、剔除未知角色）。"""
     if not isinstance(raw, list):
         return None
+    if any(not isinstance(item, str) for item in raw):
+        return None
     settings = load_settings()
     known = {e.get("id") for e in settings.get("employees", []) if isinstance(e, dict)}
     result: List[str] = []
     for item in raw:
-        if isinstance(item, str) and item in known and item not in result:
+        if item in known and item not in result:
             result.append(item)
     return result
 
@@ -483,11 +489,17 @@ def api_workspace_files():
                 continue
             if not is_path_safe(entry.path):
                 continue
+            try:
+                is_dir = entry.is_dir()
+                size = entry.stat().st_size if entry.is_file() else 0
+            except OSError:
+                # 断链的软链接 / 无权限项直接跳过，不能让整个列表接口 500
+                continue
             items.append({
                 "name": entry.name,
                 "path": entry.path,
-                "is_dir": entry.is_dir(),
-                "size": entry.stat().st_size if entry.is_file() else 0
+                "is_dir": is_dir,
+                "size": size
             })
         items.sort(key=lambda x: (not x["is_dir"], x["name"].lower()))
         return jsonify({"path": path, "items": items})

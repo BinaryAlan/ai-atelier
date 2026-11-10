@@ -710,7 +710,7 @@
               class="w-full border border-gray-300 rounded-lg px-2.5 py-2 text-xs bg-white focus:outline-none focus:ring-2 focus:ring-blue-500 font-mono"
             >
               <option value="">-- 请选择绑定模型 --</option>
-              <option v-for="m in scannedModels" :key="m.model_id" :value="m.model_id">
+              <option v-for="m in scannedModels" :key="modelKey(m)" :value="modelKey(m)">
                 [{{ m.cli }}] {{ m.display_name }}
               </option>
             </select>
