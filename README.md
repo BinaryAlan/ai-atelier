@@ -89,11 +89,13 @@ When a local model CLI times out or errors, the meeting pauses gracefully withou
 ### 👑 Human-in-the-Loop Authority
 - **Instant Pause / Resume**: Click `⏸️ Pause` at any moment to immediately send `SIGTERM` to the underlying process group, preventing orphan processes and wasted tokens;
 - **In-Flight Directives**: Messages sent by the human user are injected into subsequent prompts as the highest-priority "User Directive";
-- **Direct Mention (@) Controls**: `@all` resets the council back to Phase 1 under your updated direction; `@member` triggers an isolated direct inquiry without derailing the main session state machine.
+- **Direct Mention (@) Controls**: `@all` resets the council back to Phase 1 under your updated direction; `@member` triggers an isolated direct inquiry without derailing the main session state machine;
+- **💬 Quote Reply (WeChat-style)**: every member/moderator bubble has a `Reply` action. Sending quotes that message and routes the question to its author (equivalent to `@` them). The quoted text is resolved from the server-side record — the client only sends a message id — and is fed into the prompt as its own block; a failed reply can be retried with the quote restored.
 
 ### 🖥️ Responsive Three-Column Workspace
 - **Left Column (Sessions)**: Search, rename, favorite, and drag to resize or collapse;
 - **Center Column (Interactive Stream)**: Visual waterfall clearly distinguishing initial opinions, blockers, verification verdicts, and system broadcasts;
+- **Collapsible Long Answers**: messages taller than the chat viewport (~30 lines) fold automatically with an `Expand / Collapse` toggle, and re-measure on window resize so short messages are never mis-folded;
 - **Right Column (Living Document)**: Real-time Markdown rendering, version history tracking, and distraction-free full-screen reading mode.
 
 ---
