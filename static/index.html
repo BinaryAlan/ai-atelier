@@ -1,0 +1,399 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AI-Meeting · AI 圆桌会议室</title>
+  <!-- Tailwind CSS -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- Vue 3 -->
+  <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+  <!-- Marked.js for Markdown -->
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <style>
+    /* 滚动条美化 */
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: rgba(156, 163, 175, 0.4); border-radius: 3px; }
+    ::-webkit-scrollbar-thumb:hover { background: rgba(156, 163, 175, 0.6); }
+    /* Markdown 预览样式 */
+    .markdown-body h1 { font-size: 1.5rem; font-weight: 700; margin-bottom: 0.75rem; border-bottom: 1px solid #e5e7eb; padding-bottom: 0.25rem; }
+    .markdown-body h2 { font-size: 1.25rem; font-weight: 600; margin-top: 1rem; margin-bottom: 0.5rem; }
+    .markdown-body h3 { font-size: 1.1rem; font-weight: 600; margin-top: 0.75rem; margin-bottom: 0.25rem; }
+    .markdown-body p { margin-bottom: 0.5rem; line-height: 1.6; }
+    .markdown-body ul, .markdown-body ol { padding-left: 1.25rem; margin-bottom: 0.5rem; list-style-type: disc; }
+    .markdown-body code { background: #f3f4f6; padding: 0.15rem 0.35rem; border-radius: 0.25rem; font-size: 0.875em; }
+    .markdown-body pre { background: #1f2937; color: #f9fafb; padding: 0.75rem; border-radius: 0.375rem; overflow-x: auto; margin-bottom: 0.75rem; }
+    .markdown-body pre code { background: transparent; color: inherit; padding: 0; }
+  </style>
+</head>
+<body class="bg-gray-50 text-gray-800 antialiased h-screen overflow-hidden">
+  <div id="app" class="flex h-full w-full">
+
+    <!-- 1. 左侧边栏：会话管理与设置 -->
+    <div class="w-72 bg-white border-r border-gray-200 flex flex-col shrink-0">
+      <!-- 头部 -->
+      <div class="p-4 border-b border-gray-100 flex items-center justify-between">
+        <div class="flex items-center gap-2">
+          <span class="text-2xl">🏛️</span>
+          <div>
+            <h1 class="font-bold text-gray-900 leading-tight">AI-Meeting</h1>
+            <p class="text-xs text-gray-500">架构评审与协作中枢</p>
+          </div>
+        </div>
+        <button @click="openSettingsModal" class="p-1.5 text-gray-500 hover:text-gray-800 hover:bg-gray-100 rounded-lg transition" title="员工与模型配置">
+          ⚙️
+        </button>
+      </div>
+
+      <!-- 发起新会议按钮 -->
+      <div class="p-3">
+        <button @click="createNewSession" class="w-full bg-blue-600 hover:bg-blue-700 text-white font-medium py-2 px-3 rounded-lg flex items-center justify-center gap-2 transition shadow-sm text-sm">
+          <span>➕</span> 发起新议题
+        </button>
+      </div>
+
+      <!-- 会话列表 -->
+      <div class="flex-1 overflow-y-auto px-2 space-y-4">
+        <!-- 收藏的会议 -->
+        <div v-if="favoriteSessions.length > 0">
+          <div class="px-2 py-1 text-xs font-semibold text-gray-400 tracking-wider">⭐ 收藏议题</div>
+          <div class="space-y-1 mt-1">
+            <div 
+              v-for="s in favoriteSessions" 
+              :key="s.id"
+              @click="switchSession(s.id)"
+              :class="['group flex items-center justify-between p-2 rounded-lg cursor-pointer text-sm transition', currentSessionId === s.id ? 'bg-blue-50 text-blue-700 font-medium' : 'hover:bg-gray-100 text-gray-700']"
+            >
+              <div class="truncate flex-1 pr-2 flex items-center gap-1.5">
+                <span class="text-xs">📌</span>
+                <span class="truncate">{{ s.title }}</span>
+              </div>
+              <div class="flex items-center gap-1 shrink-0 opacity-0 group-hover:opacity-100 transition">
+                <button @click.stop="toggleFavorite(s)" class="text-xs hover:scale-110">⭐</button>
+                <button @click.stop="promptRename(s)" class="text-xs hover:scale-110">✏️</button>
+                <button @click.stop="deleteSessionItem(s.id)" class="text-xs hover:scale-110 text-red-500">🗑️</button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 历史会议 -->
+        <div>
+          <div class="px-2 py-1 text-xs font-semibold text-gray-400 tracking-wider">🕒 历史会议</div>
+          <div class="space-y-1 mt-1">
+            <div 
+              v-for="s in normalSessions" 
+              :key="s.id"
+              @click="switchSession(s.id)"
+              :class="['group flex items-center justify-between p-2 rounded-lg cursor-pointer text-sm transition', currentSessionId === s.id ? 'bg-blue-50 text-blue-700 font-medium' : 'hover:bg-gray-100 text-gray-700']"
+            >
+              <div class="truncate flex-1 pr-2 flex items-center gap-1.5">
+                <span class="text-xs text-gray-400">📝</span>
+                <span class="truncate">{{ s.title }}</span>
+              </div>
+              <div class="flex items-center gap-1 shrink-0 opacity-0 group-hover:opacity-100 transition">
+                <button @click.stop="toggleFavorite(s)" class="text-xs hover:scale-110 text-gray-400">☆</button>
+                <button @click.stop="promptRename(s)" class="text-xs hover:scale-110">✏️</button>
+                <button @click.stop="deleteSessionItem(s.id)" class="text-xs hover:scale-110 text-red-500">🗑️</button>
+              </div>
+            </div>
+            <div v-if="sessions.length === 0" class="text-xs text-gray-400 text-center py-4">暂无会议，点击上方新建</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 底部员工在席概览 -->
+      <div class="p-3 border-t border-gray-100 bg-gray-50 text-xs text-gray-500">
+        <div class="font-medium text-gray-700 mb-1 flex items-center justify-between">
+          <span>参会可用员工 ({{ availableEmployees.length }})</span>
+          <span class="text-[10px] bg-green-100 text-green-700 px-1.5 py-0.5 rounded">CLI就绪</span>
+        </div>
+        <div class="flex flex-wrap gap-1 mt-1">
+          <span 
+            v-for="emp in availableEmployees" 
+            :key="emp.id" 
+            class="px-1.5 py-0.5 rounded text-[11px] bg-white border border-gray-200 text-gray-600"
+          >
+            {{ emp.name }}
+          </span>
+        </div>
+      </div>
+    </div>
+
+    <!-- 2. 中间区：会议室群聊面板 -->
+    <div class="flex-1 flex flex-col bg-white border-r border-gray-200 min-w-0">
+      <!-- 房间顶部信息栏 -->
+      <div class="px-6 py-3.5 border-b border-gray-100 flex items-center justify-between bg-white shrink-0">
+        <div class="flex items-center gap-3 truncate">
+          <h2 class="font-bold text-gray-900 text-base truncate">{{ currentSession?.title || '未选择会议' }}</h2>
+          <!-- 阶段标识徽章 -->
+          <span v-if="currentSession?.status === 'concluded'" class="px-2 py-0.5 text-xs font-semibold rounded-full bg-green-100 text-green-800 shrink-0">
+            ✅ 已结案定稿
+          </span>
+          <span v-else-if="currentSession?.phase === 1" class="px-2 py-0.5 text-xs font-semibold rounded-full bg-blue-100 text-blue-800 shrink-0">
+            阶段一: 自由立论
+          </span>
+          <span v-else-if="currentSession?.phase === 2" class="px-2 py-0.5 text-xs font-semibold rounded-full bg-purple-100 text-purple-800 shrink-0">
+            阶段二: 严格审查
+          </span>
+        </div>
+
+        <!-- 会议控制按钮组 -->
+        <div class="flex items-center gap-2 shrink-0">
+          <!-- 暂停 / 继续 -->
+          <button 
+            v-if="currentSession?.status === 'running'"
+            @click="pauseMeeting" 
+            class="px-2.5 py-1 text-xs font-medium rounded-md bg-amber-50 text-amber-700 hover:bg-amber-100 border border-amber-200 transition flex items-center gap-1"
+          >
+            <span>⏸️</span> 暂停讨论
+          </button>
+          <button 
+            v-else-if="currentSession?.status === 'paused'"
+            @click="resumeMeeting" 
+            class="px-2.5 py-1 text-xs font-medium rounded-md bg-emerald-50 text-emerald-700 hover:bg-emerald-100 border border-emerald-200 transition flex items-center gap-1"
+          >
+            <span>▶️</span> 继续讨论
+          </button>
+          <!-- 单步推进 (调试/手动) -->
+          <button 
+            v-if="currentSession?.status !== 'concluded'"
+            @click="stepMeeting" 
+            class="px-2.5 py-1 text-xs font-medium rounded-md bg-gray-100 hover:bg-gray-200 text-gray-700 transition"
+            title="手动推动下一个专家发言或审查一步"
+          >
+            ⏭️ 单步推演
+          </button>
+        </div>
+      </div>
+
+      <!-- 参会模型勾选条 -->
+      <div class="px-6 py-2 bg-gray-50/70 border-b border-gray-100 flex items-center gap-4 text-xs text-gray-600 shrink-0">
+        <span class="font-medium text-gray-500">参会成员:</span>
+        <div class="flex items-center gap-3">
+          <label 
+            v-for="emp in availableEmployees" 
+            :key="emp.id" 
+            class="flex items-center gap-1.5 cursor-pointer hover:text-gray-900 select-none"
+          >
+            <input 
+              type="checkbox" 
+              :value="emp.id" 
+              v-model="currentSession.employee_ids" 
+              @change="saveSessionEmployees"
+              class="rounded text-blue-600 focus:ring-blue-500 h-3.5 w-3.5"
+            >
+            <span>{{ emp.name }}</span>
+          </label>
+        </div>
+      </div>
+
+      <!-- 聊天消息流 -->
+      <div ref="chatContainer" class="flex-1 overflow-y-auto p-6 space-y-4">
+        <!-- 会议无消息时的占位引导 -->
+        <div v-if="!currentSession?.messages?.length" class="text-center py-16 text-gray-400">
+          <span class="text-4xl">💡</span>
+          <p class="mt-3 text-sm font-medium text-gray-600">在下方输入你想评审的架构议题或需求</p>
+          <p class="text-xs text-gray-400 mt-1">例如：“微服务拆分应该选 gRPC 还是 RESTful API？请从性能和维护成本评估。”</p>
+        </div>
+
+        <!-- 消息卡片 -->
+        <div 
+          v-for="msg in currentSession?.messages || []" 
+          :key="msg.id"
+          :class="['flex gap-3', msg.sender === 'user' ? 'justify-end' : 'justify-start']"
+        >
+          <!-- 非用户头像 -->
+          <div 
+            v-if="msg.sender !== 'user'" 
+            :style="{ backgroundColor: getEmployeeColor(msg.sender) }" 
+            class="w-8 h-8 rounded-full text-white text-xs font-bold flex items-center justify-center shrink-0 shadow-sm"
+          >
+            {{ msg.sender_name.slice(0, 1) }}
+          </div>
+
+          <!-- 消息气泡 -->
+          <div 
+            :class="[
+              'max-w-[85%] rounded-2xl px-4 py-3 shadow-sm text-sm leading-relaxed border',
+              msg.sender === 'user' ? 'bg-blue-600 text-white border-blue-600 rounded-tr-none' : 
+              msg.sender === 'system' ? 'bg-amber-50 text-amber-900 border-amber-200 w-full text-center' :
+              'bg-white border-gray-200 text-gray-800 rounded-tl-none'
+            ]"
+          >
+            <!-- 气泡头部 -->
+            <div v-if="msg.sender !== 'system'" class="flex items-center justify-between gap-3 mb-1 text-xs opacity-75">
+              <span class="font-semibold">{{ msg.sender_name }}</span>
+              <div class="flex items-center gap-2">
+                <!-- 审查结论徽章 -->
+                <span v-if="msg.verdict === 'PASS'" class="px-1.5 py-0.2 rounded bg-green-100 text-green-700 font-bold text-[10px]">PASS 通过</span>
+                <span v-else-if="msg.verdict === 'BLOCKER'" class="px-1.5 py-0.2 rounded bg-red-100 text-red-700 font-bold text-[10px]">⚠️ BLOCKER 阻断</span>
+                <span v-else-if="msg.verdict === 'ACCEPT'" class="px-1.5 py-0.2 rounded bg-emerald-100 text-emerald-700 font-bold text-[10px]">ACCEPT 验收</span>
+                <!-- 耗时 -->
+                <span v-if="msg.elapsed_time > 0" class="text-[11px]">⏱️ {{ msg.elapsed_time }}s</span>
+              </div>
+            </div>
+
+            <!-- 正文内容 (纯文本保留格式换行) -->
+            <div class="whitespace-pre-wrap select-text">{{ msg.content }}</div>
+          </div>
+        </div>
+
+        <!-- 正在思考/审查动画栏 -->
+        <div v-if="currentSession?.current_speaker" class="flex items-center gap-2 text-xs text-blue-600 bg-blue-50/70 p-2.5 rounded-lg border border-blue-100 animate-pulse">
+          <span class="animate-spin">⏳</span>
+          <span>正在等待 <strong>[{{ currentSession.current_speaker }}]</strong> 发言中...</span>
+        </div>
+      </div>
+
+      <!-- 底部输入栏 -->
+      <div class="p-4 border-t border-gray-200 bg-white shrink-0">
+        <!-- 快捷 @ 员工标签 -->
+        <div class="flex items-center gap-2 mb-2">
+          <span class="text-xs text-gray-400">快捷 @ :</span>
+          <button 
+            v-for="emp in availableEmployees" 
+            :key="emp.id"
+            @click="insertMention(emp.name)"
+            class="text-xs px-2 py-0.5 rounded bg-gray-100 hover:bg-gray-200 text-gray-600 transition"
+          >
+            @{{ emp.name }}
+          </button>
+        </div>
+
+        <!-- 文本输入框 -->
+        <div class="flex gap-2">
+          <textarea 
+            v-model="inputContent" 
+            @keydown.enter.exact.prevent="sendMessage"
+            rows="2"
+            placeholder="输入议题、补充要求或纠偏指令... (Enter 发送)" 
+            class="flex-1 border border-gray-300 rounded-lg p-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 resize-none"
+          ></textarea>
+          <div class="flex flex-col justify-between shrink-0">
+            <button 
+              @click="sendMessage" 
+              class="bg-blue-600 hover:bg-blue-700 text-white font-medium px-4 py-2 rounded-lg text-sm transition shadow-sm"
+            >
+              发送
+            </button>
+            <label class="flex items-center gap-1 text-[11px] text-gray-500 cursor-pointer mt-1" title="勾选后，这将被视为全新方向指令，全员重新进行阶段一立论">
+              <input type="checkbox" v-model="isNewDirection" class="rounded text-blue-600 h-3 w-3">
+              <span>新方向</span>
+            </label>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 3. 右侧栏：实时协同方案文件 -->
+    <div class="w-[420px] bg-gray-50 flex flex-col shrink-0 border-l border-gray-200">
+      <!-- 头部 -->
+      <div class="p-4 border-b border-gray-200 bg-white flex items-center justify-between shrink-0">
+        <div class="flex items-center gap-2">
+          <span class="text-lg">📄</span>
+          <div>
+            <h3 class="font-bold text-gray-900 text-sm">协同技术方案</h3>
+            <p class="text-[11px] text-gray-400">由调度器随讨论实时落盘生长</p>
+          </div>
+        </div>
+        <!-- 动作按钮 -->
+        <div class="flex items-center gap-1.5">
+          <button @click="copyDoc" class="text-xs px-2.5 py-1 bg-gray-100 hover:bg-gray-200 text-gray-700 rounded transition" title="复制 Markdown">
+            📋 复制
+          </button>
+          <button @click="exportDoc" class="text-xs px-2.5 py-1 bg-blue-50 hover:bg-blue-100 text-blue-700 rounded transition" title="下载 .md 文件">
+            📥 导出
+          </button>
+        </div>
+      </div>
+
+      <!-- 模式切换：渲染 vs 源码 -->
+      <div class="flex border-b border-gray-200 bg-white text-xs font-medium text-gray-500 shrink-0">
+        <button 
+          @click="docViewMode = 'preview'" 
+          :class="['flex-1 py-1.5 text-center transition', docViewMode === 'preview' ? 'text-blue-600 border-b-2 border-blue-600 font-semibold' : 'hover:text-gray-800']"
+        >
+          预览渲染
+        </button>
+        <button 
+          @click="docViewMode = 'raw'" 
+          :class="['flex-1 py-1.5 text-center transition', docViewMode === 'raw' ? 'text-blue-600 border-b-2 border-blue-600 font-semibold' : 'hover:text-gray-800']"
+        >
+          Markdown 源码
+        </button>
+      </div>
+
+      <!-- 文档主体 -->
+      <div class="flex-1 overflow-y-auto p-5">
+        <!-- 预览渲染 -->
+        <div 
+          v-if="docViewMode === 'preview'" 
+          v-html="renderedDoc" 
+          class="markdown-body text-sm text-gray-800 bg-white p-4 rounded-xl border border-gray-200 shadow-sm min-h-full"
+        ></div>
+        <!-- 源码 -->
+        <textarea 
+          v-else 
+          v-model="currentSession.document" 
+          @blur="saveDocManual"
+          class="w-full h-full bg-white p-3 border border-gray-200 rounded-xl text-xs font-mono resize-none focus:outline-none"
+        ></textarea>
+      </div>
+    </div>
+
+    <!-- 4. 设置模态弹窗 (员工配置管理) -->
+    <div v-if="showSettingsModal" class="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
+      <div class="bg-white rounded-2xl shadow-xl w-full max-w-2xl max-h-[90vh] flex flex-col overflow-hidden">
+        <div class="p-4 border-b border-gray-200 flex items-center justify-between">
+          <h3 class="font-bold text-gray-900 text-base flex items-center gap-2">
+            <span>⚙️</span> 员工与模型配置
+          </h3>
+          <button @click="showSettingsModal = false" class="text-gray-400 hover:text-gray-600 text-xl font-bold">×</button>
+        </div>
+
+        <div class="p-6 overflow-y-auto flex-1 space-y-4">
+          <div class="text-xs text-gray-500 mb-2">
+            你可以给每个模型设定名字、职位、人设 Prompt 及底层 CLI 指令，后续也可配置为 API 模式。
+          </div>
+
+          <div v-for="(emp, idx) in settings.employees" :key="emp.id" class="p-4 border border-gray-200 rounded-xl bg-gray-50 space-y-3">
+            <div class="flex items-center justify-between">
+              <div class="flex items-center gap-2">
+                <input type="color" v-model="emp.avatar_color" class="w-6 h-6 rounded cursor-pointer border-0">
+                <input type="text" v-model="emp.name" placeholder="员工姓名" class="font-bold text-sm bg-white px-2 py-1 border rounded w-36">
+                <input type="text" v-model="emp.title" placeholder="职能/头衔" class="text-xs bg-white px-2 py-1 border rounded w-44">
+              </div>
+              <label class="flex items-center gap-1 text-xs cursor-pointer text-gray-600">
+                <input type="checkbox" v-model="emp.enabled" class="rounded text-blue-600">
+                <span>启用</span>
+              </label>
+            </div>
+
+            <!-- CLI 命令配置 -->
+            <div>
+              <label class="text-[11px] font-semibold text-gray-500 uppercase">CLI 命令模板 (保留 {prompt}):</label>
+              <input type="text" v-model="emp.cli_cmd" class="w-full text-xs font-mono bg-white px-2 py-1.5 border rounded mt-0.5">
+            </div>
+
+            <!-- 人设 Prompt -->
+            <div>
+              <label class="text-[11px] font-semibold text-gray-500 uppercase">人设与专业定位 Prompt:</label>
+              <textarea v-model="emp.system_prompt" rows="2" class="w-full text-xs bg-white p-2 border rounded mt-0.5"></textarea>
+            </div>
+          </div>
+        </div>
+
+        <div class="p-4 border-t border-gray-200 bg-gray-50 flex justify-end gap-2">
+          <button @click="showSettingsModal = false" class="px-4 py-2 text-sm text-gray-600 hover:bg-gray-200 rounded-lg transition">取消</button>
+          <button @click="saveSettingsToServer" class="px-4 py-2 text-sm bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-medium transition shadow-sm">保存配置</button>
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <script src="/static/js/app.js"></script>
+</body>
+</html>
