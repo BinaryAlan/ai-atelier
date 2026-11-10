@@ -89,13 +89,22 @@ createApp({
       inspectTab: "prompt",
       inspectingMsg: null,
 
+      defaultWorkspaceDir: "",
       pollInterval: null
     };
   },
   computed: {
+    // 实际参加本场会议的员工列表（未勾选/未选择的不在此列表中）
+    activeSessionEmployees() {
+      if (!this.currentSession || !Array.isArray(this.currentSession.employee_ids)) return [];
+      const empMap = new Map((this.settings.employees || []).filter(e => e.enabled).map(e => [e.id, e]));
+      return this.currentSession.employee_ids
+        .map(id => empMap.get(id))
+        .filter(Boolean);
+    },
     totalParticipantsCount() {
-      // 主持人(1) + 勾选的参会员工数量
-      return 1 + (this.currentSession?.employee_ids?.length || 0);
+      // 仅统计：主持人 (1) + 本场实际参会员工数 (未选中的不被计数)
+      return 1 + this.activeSessionEmployees.length;
     },
     favoriteSessions() {
       return this.sessions.filter(s => s.is_favorite);
@@ -112,7 +121,11 @@ createApp({
     renderedDoc() {
       const doc = this.currentSession?.document || "*(暂无方案文档)*";
       if (window.marked) {
-        return marked.parse(doc);
+        const rawHtml = marked.parse(doc);
+        if (window.DOMPurify) {
+          return DOMPurify.sanitize(rawHtml);
+        }
+        return this.sanitizeHtml(rawHtml);
       }
       return doc;
     }
@@ -135,6 +148,7 @@ createApp({
     },
 
     async init() {
+      await this.loadDefaultWorkspace();
       await this.loadSettings();
       await this.loadSessions();
       await this.triggerScanModels(false);
@@ -144,6 +158,46 @@ createApp({
       } else {
         this.openNewSessionModal();
       }
+    },
+
+    async loadDefaultWorkspace() {
+      try {
+        const res = await fetch("/api/default_workspace");
+        const data = await res.json();
+        this.defaultWorkspaceDir = data.workspace_dir || "";
+      } catch (e) {
+        this.defaultWorkspaceDir = "";
+      }
+    },
+
+    sanitizeHtml(html) {
+      if (!html) return "";
+      const temp = document.createElement("div");
+      temp.innerHTML = html;
+      const dangerousTags = ["script", "iframe", "object", "embed", "link", "style", "form", "input", "button"];
+      dangerousTags.forEach(tag => {
+        const elements = temp.getElementsByTagName(tag);
+        for (let i = elements.length - 1; i >= 0; i--) {
+          elements[i].parentNode?.removeChild(elements[i]);
+        }
+      });
+      const all = temp.querySelectorAll("*");
+      for (const el of all) {
+        for (const attr of Array.from(el.attributes)) {
+          const attrName = attr.name.toLowerCase();
+          const attrVal = attr.value.toLowerCase();
+          if (attrName.startsWith("on") || attrVal.includes("javascript:") || attrVal.includes("data:text/html")) {
+            el.removeAttribute(attr.name);
+          }
+        }
+      }
+      return temp.innerHTML;
+    },
+
+    async quickRemoveMember(empId) {
+      if (!this.currentSession || !Array.isArray(this.currentSession.employee_ids)) return;
+      this.currentSession.employee_ids = this.currentSession.employee_ids.filter(id => id !== empId);
+      await this.saveSessionEmployees();
     },
 
     async loadSettings() {
@@ -183,7 +237,7 @@ createApp({
 
     // ----------------- 新建议题 Modal -----------------
     openNewSessionModal() {
-      const defaultDir = this.currentSession?.workspace_dir || "/Users/lc/Documents/social skill";
+      const defaultDir = this.currentSession?.workspace_dir || this.defaultWorkspaceDir;
       this.newSessionForm = {
         title: "",
         workspace_dir: defaultDir,
@@ -219,7 +273,7 @@ createApp({
       this.editingSessionForm = {
         id: session.id,
         title: session.title,
-        workspace_dir: session.workspace_dir || "/Users/lc/Documents/social skill",
+        workspace_dir: session.workspace_dir || this.defaultWorkspaceDir,
         employee_ids: [...(session.employee_ids || [])]
       };
       this.showEditSessionModal = true;
@@ -412,12 +466,15 @@ createApp({
     },
 
     async pollActiveSession() {
-      if (!this.currentSessionId) return;
+      const targetId = this.currentSessionId;
+      if (!targetId) return;
       if (this.currentSession && this.currentSession.status === "running") {
         try {
-          const res = await fetch(`/api/sessions/${this.currentSessionId}`);
+          const res = await fetch(`/api/sessions/${targetId}`);
           if (res.ok) {
             const latest = await res.json();
+            // 防止在途请求返回时用户已切换会话导致数据覆盖
+            if (latest.id !== this.currentSessionId) return;
             const hadFewerMsgs = (this.currentSession.messages?.length || 0) < (latest.messages?.length || 0);
             this.currentSession = latest;
             if (hadFewerMsgs) {
@@ -505,11 +562,24 @@ createApp({
       this.showInspectModal = true;
     },
 
-    copyText(text) {
+    async copyText(text) {
       if (!text) return;
-      navigator.clipboard.writeText(text).then(() => {
-        alert("已复制到剪贴板！");
-      });
+      try {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          await navigator.clipboard.writeText(text);
+          alert("已复制到剪贴板！");
+        } else {
+          const ta = document.createElement("textarea");
+          ta.value = text;
+          document.body.appendChild(ta);
+          ta.select();
+          document.execCommand("copy");
+          document.body.removeChild(ta);
+          alert("已复制到剪贴板！");
+        }
+      } catch (e) {
+        console.warn("复制失败:", e);
+      }
     },
 
     // ----------------- 员工与主持人配置设置 -----------------
@@ -583,7 +653,7 @@ createApp({
       }
     },
 
-    saveEmployeeItem() {
+    async saveEmployeeItem() {
       if (!this.editingEmp.name.trim()) {
         alert("请输入角色姓名！");
         return;
@@ -604,12 +674,14 @@ createApp({
       }
 
       this.showEmpEditModal = false;
+      await this.saveSettingsToServer();
     },
 
-    deleteEmployee(idx) {
+    async deleteEmployee(idx) {
       const targetEmp = this.settings.employees[idx];
       if (confirm(`确定要删除角色 [${targetEmp.name}] 吗？`)) {
         this.settings.employees.splice(idx, 1);
+        await this.saveSettingsToServer();
         if (this.currentSession?.employee_ids) {
           this.currentSession.employee_ids = this.currentSession.employee_ids.filter(id => id !== targetEmp.id);
           this.saveSessionEmployees();

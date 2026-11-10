@@ -10,6 +10,8 @@
   <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
   <!-- Marked.js for Markdown -->
   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <!-- DOMPurify for XSS sanitization -->
+  <script src="https://cdn.jsdelivr.net/npm/dompurify@3.0.6/dist/purify.min.js"></script>
   <style>
     ::-webkit-scrollbar { width: 5px; height: 5px; }
     ::-webkit-scrollbar-track { background: transparent; }
@@ -134,29 +136,43 @@
 
               <!-- 主持人 (始终在席，不可踢) -->
               <div class="flex items-center gap-2 p-1.5 rounded bg-amber-50/80 border border-amber-200/70 mb-1 cursor-default">
-                <input type="checkbox" checked disabled class="rounded text-amber-600 h-3.5 w-3.5 opacity-60">
-                <span class="text-sm">{{ settings.moderator?.avatar || '👑' }}</span>
+                <span class="text-xs text-amber-600 font-bold">👑</span>
                 <span class="font-bold text-amber-950 truncate">{{ settings.moderator?.name }}</span>
                 <span class="text-[10px] bg-amber-200 text-amber-900 px-1 rounded font-bold ml-auto shrink-0">主持人 · 必选</span>
               </div>
 
-              <!-- 其他员工 (可勾选/踢出) -->
-              <div class="max-h-48 overflow-y-auto space-y-1 pt-1">
-                <label 
-                  v-for="emp in availableEmployees" 
+              <!-- 参会员工列表 (仅展示本会议已选定参会的员工，未选择的不出现、不计数) -->
+              <div class="max-h-52 overflow-y-auto space-y-1 pt-1">
+                <div 
+                  v-for="emp in activeSessionEmployees" 
                   :key="emp.id"
-                  class="flex items-center gap-2 p-1.5 rounded hover:bg-gray-50 cursor-pointer"
+                  class="flex items-center justify-between p-1.5 rounded hover:bg-gray-50 group transition"
                 >
-                  <input 
-                    type="checkbox" 
-                    :value="emp.id" 
-                    v-model="currentSession.employee_ids" 
-                    @change="saveSessionEmployees"
-                    class="rounded text-blue-600 h-3.5 w-3.5"
+                  <div class="flex items-center gap-2 truncate">
+                    <span class="text-sm">{{ emp.avatar || '🤖' }}</span>
+                    <span class="truncate font-medium text-gray-700">{{ emp.name }}</span>
+                  </div>
+                  <button 
+                    @click.stop="quickRemoveMember(emp.id)" 
+                    class="text-[10px] text-gray-400 hover:text-red-600 px-1.5 py-0.5 rounded hover:bg-red-50 transition shrink-0"
+                    title="从当前会议移除"
                   >
-                  <span class="text-sm">{{ emp.avatar || '🤖' }}</span>
-                  <span class="truncate font-medium text-gray-700">{{ emp.name }}</span>
-                </label>
+                    ✕ 移出
+                  </button>
+                </div>
+                <div v-if="activeSessionEmployees.length === 0" class="text-[11px] text-gray-400 py-2.5 text-center">
+                  暂未添加其他参会员工
+                </div>
+              </div>
+
+              <!-- 底部操作：调整参会人员 -->
+              <div class="pt-2 border-t border-gray-100 flex justify-between items-center text-xs">
+                <button 
+                  @click="openEditSessionModal(currentSession); showMemberDropdown = false;" 
+                  class="w-full text-center py-1.5 bg-blue-50 hover:bg-blue-100 text-blue-600 font-medium rounded-lg transition"
+                >
+                  ✏️ 调整 / 增减参会人员
+                </button>
               </div>
             </div>
           </div>
@@ -393,7 +409,7 @@
               <input 
                 type="text" 
                 v-model="newSessionForm.workspace_dir" 
-                placeholder="/Users/lc/Documents/my-project"
+                placeholder="工作目录路径 (可点击右侧浏览选择)"
                 class="flex-1 border border-gray-300 rounded-lg px-3 py-2 text-xs font-mono focus:outline-none focus:ring-2 focus:ring-blue-500"
               >
               <button 

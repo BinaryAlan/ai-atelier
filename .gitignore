@@ -3,3 +3,5 @@ __pycache__/
 .DS_Store
 data/sessions/*.json
 !data/sessions/.gitkeep
+data/scanned_models.json
+data/*.tmp*
