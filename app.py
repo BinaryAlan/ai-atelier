@@ -15,6 +15,7 @@ from core.storage import (
 from core.engine import (
     MeetingEngine, generate_msg_id, bump_document_revision, run_with_retry,
     request_skip_current, clear_skip_current,
+    build_direct_prompt, latest_user_message,
 )
 from core.executor import Executor, validate_cli_template
 from core.scanner import scan_local_models
@@ -773,6 +774,33 @@ def _find_message(session: dict, msg_id: str) -> Optional[dict]:
     return None
 
 
+def _direct_question(session: dict, msg: dict) -> str:
+    """
+    取回「群主当时到底问了什么」，用于重试时重建 prompt。
+
+    优先用记录字段；旧数据从当时的 prompt 模板里反解析；再退化为
+    「最近一条 @ 了这位成员的用户消息」——绝不能直接拿 latest_user_message，
+    因为群主可能在失败之后又发了别的话，那会问错问题。
+    """
+    q = str(msg.get("direct_question") or "").strip()
+    if q:
+        return q
+
+    old_prompt = str(msg.get("sent_prompt") or "")
+    m = re.search(r"【会议群主直接提问/指令】\s*[:：]\s*(.+)", old_prompt)
+    if m:
+        return m.group(1).strip()
+
+    emp_name = str(msg.get("sender_name") or "").strip()
+    for item in reversed(session.get("messages") or []):
+        if not isinstance(item, dict) or item.get("sender") != "user":
+            continue
+        content = str(item.get("content") or "").strip()
+        if content and emp_name and f"@{emp_name}" in content:
+            return content
+    return latest_user_message(session).strip()
+
+
 def _append_system_message(session: dict, text: str, verdict: str = "RECOVER") -> None:
     session.setdefault("messages", []).append({
         "id": generate_msg_id(),
@@ -838,14 +866,28 @@ def api_retry_message(session_id, msg_id):
                     }), 400
                 if session.get("phase", 1) != 1:
                     return jsonify({"error": "会议已进入阶段二，补一条阶段一的立论已经没有意义"}), 400
-            prompt = str(msg.get("sent_prompt") or "").strip()
-            if not prompt:
-                return jsonify({"error": "这条记录没有留存 Prompt（早于该功能上线），无法原样重试"}), 400
             emp = _resolve_turn_employee(msg)
             if not emp:
                 return jsonify({"error": "该角色已删除或未配置 CLI，无法重试"}), 400
 
             workspace_dir = session.get("workspace_dir", "")
+            if is_direct:
+                # 早前的定向应答 prompt 只有「问题 + 人设 + 工作目录」，
+                # 没带聊天上下文与方案纪要，模型等于在真空里作答。
+                # 重试时按当前会话状态重建，并把重建后的完整 prompt 写回记录，
+                # 群主点开「查看 Prompt」看到的就是真正发出去的那一份。
+                prompt = build_direct_prompt(
+                    session, emp, _direct_question(session, msg),
+                    workspace_dir=workspace_dir,
+                    exclude_msg_id=msg_id,
+                    is_retry=True,
+                )
+                msg["sent_prompt"] = prompt
+                msg["prompt_rebuilt_at"] = int(time.time())
+            else:
+                prompt = str(msg.get("sent_prompt") or "").strip()
+            if not prompt:
+                return jsonify({"error": "这条记录没有留存 Prompt（早于该功能上线），无法原样重试"}), 400
             emp_name = emp.get("name") or emp.get("id")
             prev_status = session.get("status", "idle")
             session["current_speaker"] = f"{emp_name} (重新发言中)"

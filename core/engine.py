@@ -391,6 +391,199 @@ def _feedback_block(session: Dict[str, Any], exclude_id: Optional[str] = None, i
     )
 
 
+# ---------------------------------------------------------------------------
+# 群主 @ 某位成员时的定向应答 prompt
+#
+# CLI 是一次性无状态进程：只把「你的提问 + 人设」丢过去，它根本不知道本场会议
+# 讨论的是什么、上一轮已经定了哪些结构、右侧纪要里「E01」指的是哪一条。
+# 早期的定向应答 prompt 只有 200 字左右，模型只能反问或凭空编一套东西出来。
+# 因此这里统一组装四块上下文：
+#   1) 会议背景：议题、所处阶段、参会成员；
+#   2) 聊天窗口最近的原话（群主指令 + 各成员/主持人的回应，按时间顺序）；
+#   3) 右侧面板当前最新的方案纪要正文；
+#   4) 群主这一次的具体问题。
+# ---------------------------------------------------------------------------
+_DIRECT_CONTEXT_MAX_MESSAGES = 40
+_DIRECT_CONTEXT_MSG_CHARS = 800        # 单条消息最多展示多少字
+_DIRECT_CONTEXT_TOTAL_CHARS = 8000     # 聊天上下文总预算
+_DIRECT_DOC_MAX_CHARS = 16000          # 纪要正文上限（超长时掐头留尾）
+# 失败占位文案（超时/报错）不携带任何信息，混进上下文只会污染判断
+_FAILURE_NOTE_PREFIXES = ("【超时未能及时回复", "【执行出错", "【执行失败", "【进程")
+
+
+def _clip_text(text: str, limit: int) -> str:
+    """按字符数截断并明确标注省略量——让模型知道「这里被截过」，别把残缺当全文。"""
+    t = str(text or "").strip()
+    if limit <= 0 or len(t) <= limit:
+        return t
+    return t[:limit].rstrip() + f"…（此处省略 {len(t) - limit} 字）"
+
+
+def _is_failure_note(msg: Dict[str, Any]) -> bool:
+    """这条消息是不是「调用失败」占位（超时/报错），而不是真实发言。"""
+    content = str((msg or {}).get("content") or "").strip()
+    if not content:
+        return True
+    if any(content.startswith(p) for p in _FAILURE_NOTE_PREFIXES):
+        return True
+    # 报错/超时且内容极短，基本就是占位文案
+    return (msg or {}).get("verdict") in ("TIMEOUT", "ERROR") and len(content) <= 120
+
+
+def _speaker_label(msg: Dict[str, Any]) -> str:
+    sender = msg.get("sender")
+    if sender == "user":
+        return "群主"
+    if sender == "system":
+        return "系统广播"
+    return str(msg.get("sender_name") or sender or "成员")
+
+
+def build_chat_transcript(
+    session: Dict[str, Any],
+    exclude_ids: Optional[set] = None,
+    max_messages: int = _DIRECT_CONTEXT_MAX_MESSAGES,
+    per_msg_chars: int = _DIRECT_CONTEXT_MSG_CHARS,
+    total_chars: int = _DIRECT_CONTEXT_TOTAL_CHARS,
+) -> str:
+    """把聊天窗口最近的对话压成一段可读的文本记录（时间顺序，较早的在上）。"""
+    exclude_ids = exclude_ids or set()
+    msgs = [m for m in (session.get("messages") or []) if isinstance(m, dict)]
+
+    lines: List[str] = []
+    used = 0
+    omitted = 0
+    for m in reversed(msgs):
+        if m.get("id") in exclude_ids:
+            continue
+        if _is_failure_note(m):
+            continue
+        content = " ".join(str(m.get("content") or "").split())
+        if not content:
+            continue
+        line = f"[{_speaker_label(m)}]: {_clip_text(content, per_msg_chars)}"
+        if len(lines) >= max_messages or used + len(line) > total_chars:
+            omitted += 1
+            continue
+        lines.append(line)
+        used += len(line)
+
+    lines.reverse()
+    if omitted:
+        lines.insert(0, f"（更早还有 {omitted} 条消息未列出，如需可让群主补充）")
+    return "\n".join(lines)
+
+
+def build_document_block(session: Dict[str, Any]) -> str:
+    """渲染右侧面板当前的方案纪要与正文；没有成稿时如实说明。"""
+    doc = str(session.get("document") or "").strip()
+    if not doc or ("等待各参会成员" in doc and len(doc) < 200):
+        return "（本场会议尚未形成正式方案纪要：阶段一还在进行中，请只依据下面的聊天上下文作答。）"
+
+    if len(doc) > _DIRECT_DOC_MAX_CHARS:
+        head_len = int(_DIRECT_DOC_MAX_CHARS * 0.65)
+        tail_len = int(_DIRECT_DOC_MAX_CHARS * 0.3)
+        dropped = len(doc) - head_len - tail_len
+        doc = (
+            f"{doc[:head_len].rstrip()}\n\n"
+            f"…（中间省略 {dropped} 字，完整正文以右侧面板为准）…\n\n"
+            f"{doc[-tail_len:].lstrip()}"
+        )
+    return f"----- 方案正文开始 -----\n{doc}\n----- 方案正文结束 -----"
+
+
+def session_topic(session: Dict[str, Any]) -> str:
+    """会议议题：取群主的第一条消息（通常就是任务说明），退回会话标题。"""
+    for m in session.get("messages") or []:
+        if isinstance(m, dict) and m.get("sender") == "user":
+            content = " ".join(str(m.get("content") or "").split())
+            if content:
+                return _clip_text(content, 600)
+    return str(session.get("title") or "（未命名议题）")
+
+
+def build_direct_prompt(
+    session: Dict[str, Any],
+    target_emp: Dict[str, Any],
+    question: str,
+    workspace_dir: str = "",
+    exclude_msg_id: Optional[str] = None,
+    is_retry: bool = False,
+) -> str:
+    """
+    群主 @ 某位成员时的完整 prompt：会议背景 + 聊天上下文 + 方案纪要 + 本条提问。
+
+    exclude_msg_id：把「这次要重答的那条失败消息」排除掉，避免模型把自己的
+    报错/超时占位当成同事发言来读。
+    """
+    settings = load_settings()
+    moderator = MeetingEngine.get_moderator(settings)
+    emp_name = target_emp.get("name") or target_emp.get("id") or "成员"
+    is_moderator = target_emp.get("id") == moderator.get("id")
+
+    phase = int(session.get("phase") or 1)
+    if phase <= 1:
+        phase_line = "阶段一：各成员自由立论（尚未形成正式方案纪要）"
+    else:
+        phase_line = "阶段二：方案审阅与隐患质询（已有正式纪要与方案正文，见下方正文块）"
+
+    attendee_names: List[str] = [f"{moderator.get('name')}(主持人)"]
+    for eid in session.get("employee_ids") or []:
+        if not isinstance(eid, str):
+            continue
+        emp = MeetingEngine.get_employee(settings, eid)
+        name = emp.get("name") or eid
+        if name not in attendee_names:
+            attendee_names.append(name)
+
+    persona = str(target_emp.get("system_prompt") or "").strip() or "（该角色未配置人设，按你本身的能力作答）"
+    transcript = build_chat_transcript(
+        session,
+        exclude_ids={exclude_msg_id} if exclude_msg_id else None,
+    ) or "（聊天窗口里还没有可参考的历史消息，这是本场会议的第一轮交流）"
+
+    doc_block = build_document_block(session)
+    role_line = (
+        "你是本场会议的主持人，这条提问是群主单独找你的：直接作答即可，不需要推进会议流程。"
+        if is_moderator else
+        "你是本场会议的参会成员（不是主持人）：这条提问是群主单独问你的，只回答它，不需要推进会议流程，也不需要替别人发言。"
+    )
+    retry_note = (
+        "\n（说明：这是群主对同一条提问的重试。上一次调用因超时/报错没有取到结果，"
+        "请从头完整作答，不要提及重试本身。）"
+        if is_retry else ""
+    )
+
+    return f"""【本场会议背景】
+- 会议议题: {session_topic(session)}
+- 当前阶段: {phase_line}
+- 参会成员: {'、'.join(attendee_names)}
+- 当前工作目录: {workspace_dir or session.get('workspace_dir') or '(未设置)'}
+
+【你的身份】
+你是【{emp_name}】。
+人设定位: {persona}
+{role_line}
+
+【聊天窗口最近上下文（按时间顺序，较早的在上）】
+{transcript}
+
+【当前会议方案纪要（右侧面板最新正文）】
+{doc_block}
+（以上是本场会议已经确认的正式内容。回答里涉及方案结构、编号、结论时，一律以它为准，不要另立一套。）
+
+【群主这一次的具体提问】
+{question}
+（群主用 "@{emp_name}" 点名，这只是叫你，不必在回答里复述称呼。）{retry_note}
+
+【回答要求】
+1. 直接输出正文回答上面这一个问题，不要反问、不要复述会议流程、不要只描述你打算怎么做；
+2. 上文没有的信息不要编造：确实需要工作目录里的具体文件内容时，按下方【能力说明】去读，读不到就明确说明「缺哪份材料」；
+3. 引用纪要或聊天里的原话时保持原意，不要替任何成员补全未表达的观点；
+4. {_LENGTH_POLICY}
+{capability_block(target_emp)}"""
+
+
 class MeetingEngine:
     @staticmethod
     def get_moderator(settings: Dict[str, Any]) -> Dict[str, Any]:
@@ -734,14 +927,11 @@ class MeetingEngine:
             target_emp = MeetingEngine.get_employee(settings, direct_target)
             last_user_msg = latest_user_message(session)
 
-            prompt = f"""【会议群主直接提问/指令】: {last_user_msg}
-
-你是【{target_emp['name']}】。
-人设背景: {target_emp.get('system_prompt', '')}
-当前工作目录: {workspace_dir}
-
-请直接回应群主的上述要求。请保持客观、专业、务实，直奔核心。
-{_LENGTH_POLICY}"""
+            # 定向应答不能只给「问题 + 人设」：CLI 无状态，必须自带会议议题、
+            # 聊天上下文与当前纪要，否则模型不知道群主在说什么、也不知道已有的结论。
+            prompt = build_direct_prompt(
+                session, target_emp, last_user_msg, workspace_dir=workspace_dir
+            )
 
             session["current_speaker"] = target_emp["name"]
             save_session(session, merge=True)
@@ -787,6 +977,9 @@ class MeetingEngine:
                 # 定向应答的失败要能「重试」而不是「跳过此人」：
                 # 它是群主点名要的答案，换人没有意义，只能同一个人重问。
                 "direct_mention": True,
+                # 单独记下「群主问的是什么」：重试时据此重建 prompt，
+                # 不必从旧 prompt 里反解析，也不会被后来插入的新消息带偏。
+                "direct_question": last_user_msg,
                 "sent_prompt": prompt,
                 "raw_response": res.raw_output
             })
