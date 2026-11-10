@@ -39,18 +39,18 @@
 ## 🔄 核心运行机制
 
 ```mermaid
-graph TD
-    User([👤 群主提出议题 / 发送指令]) --> Phase1[<b>阶段一：自由立论 (Phase 1)</b><br/>参会 AI 基于专业定位陈述见解与底层假设]
-    Phase1 --> Synthesis[👑 主持人综合整理<br/>生成首版方案草案 Living Document]
-    Synthesis --> Phase2[<b>阶段二：方案审阅 (Phase 2)</b><br/>严禁无病呻吟 · 仅限重大隐患质询]
+flowchart TD
+    User(["👤 群主提出议题 / 发送指令"]) --> Phase1["阶段一：自由立论 (Phase 1)<br/>参会 AI 基于专业定位陈述见解与底层假设"]
+    Phase1 --> Synthesis["👑 主持人综合整理<br/>生成首版方案草案 Living Document"]
+    Synthesis --> Phase2["阶段二：方案审阅 (Phase 2)<br/>严禁无病呻吟 · 仅限重大隐患质询"]
     
-    Phase2 --> Check{评审结果判定}
-    Check -- "发现致命隐患 [BLOCKER]" --> Revision[👑 主持人局部针对性修订草案]
-    Revision --> Verify[🔍 提出者封闭式验收<br/>严格判定: [ACCEPT] / [REJECT]]
-    Verify -- "[ACCEPT] 验收通过" --> Phase2
-    Verify -- "[REJECT] 仍有瑕疵" --> Revision
+    Phase2 --> Check{"评审结果判定"}
+    Check -->|"发现致命隐患 [BLOCKER]"| Revision["👑 主持人局部针对性修订草案"]
+    Revision --> Verify["🔍 提出者封闭式验收<br/>严格判定: [ACCEPT] / [REJECT]"]
+    Verify -->|"[ACCEPT] 验收通过"| Phase2
+    Verify -->|"[REJECT] 仍有瑕疵"| Revision
     
-    Check -- "全员无异议 [PASS]" --> Concluded([🎉 方案达成共识 · 会议自动结案])
+    Check -->|"全员无异议 [PASS]"| Concluded(["🎉 方案达成共识 · 会议自动结案"])
 ```
 
 ### 1. 阶段双轨制（立论自由 ➡️ 审查严苛）
