@@ -10,7 +10,7 @@ from core.storage import (
     list_sessions, get_session, create_session, save_session, delete_session,
     is_valid_session_id, session_lock, SessionDeletedError
 )
-from core.engine import MeetingEngine, generate_msg_id
+from core.engine import MeetingEngine, generate_msg_id, bump_document_revision
 from core.executor import Executor, validate_cli_template
 from core.scanner import scan_local_models
 
@@ -422,7 +422,24 @@ def api_update_session(session_id):
                 return jsonify({"error": "document 必须为字符串"}), 400
             if len(document) > 2_000_000:
                 return jsonify({"error": "document 过大（上限 2MB）"}), 400
-            session["document"] = document
+            # 人工改写正文同样开新一轮：上一版文档上的审阅意见不再带入后续 prompt，
+            # 已 PASS 的结论也一并作废（针对旧正文的通过不能代表新正文）
+            if document != session.get("document"):
+                session["document"] = document
+                bump_document_revision(session)
+                session["passed_employees"] = []
+                session.setdefault("messages", []).append({
+                    "id": generate_msg_id(),
+                    "sender": "system",
+                    "sender_name": "系统广播",
+                    "content": "📝 群主改写了方案正文，审阅轮次已重置，所有成员将基于新版重新审阅。",
+                    "phase": session.get("phase", 1),
+                    "verdict": "DOC_EDIT",
+                    "elapsed_time": 0,
+                    "created_at": int(time.time()),
+                    "sent_prompt": "",
+                    "raw_response": ""
+                })
 
         save_session(session)
         return jsonify(session)

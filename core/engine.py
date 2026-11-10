@@ -67,6 +67,90 @@ def latest_user_message(session: Dict[str, Any]) -> str:
     return ""
 
 
+# 写进「其他成员意见」区块的结论标签：让后来者一眼分清哪些是阻断、哪些只是建议
+_FEEDBACK_LABELS = {
+    "PASS": "通过",
+    "BLOCKER": "提出阻断",
+    "COMMENT": "未给明确结论/仅建议",
+    "ACCEPT": "验收通过",
+    "REJECT": "验收未通过",
+}
+
+
+def bump_document_revision(session: Dict[str, Any]) -> int:
+    """
+    文档正文被改写时调用，递增版本号。
+
+    版本号同时充当“审阅轮次”的界线：BLOCKER 会清空 passed_employees 让所有人重审，
+    而重审针对的必然是改写后的新正文，所以“同一版本”== “同一轮审阅”。
+    """
+    rev = int(session.get("doc_revision") or 0) + 1
+    session["doc_revision"] = rev
+    return rev
+
+
+def _strip_verdict_marker(text: str) -> str:
+    """去掉正文开头的 [PASS] / [BLOCKER: …] 标记——已由前面的中文标签表达，避免重复噪音。"""
+    m = re.match(r"^\s*[\[【]\s*(PASS|BLOCKER|ACCEPT|REJECT|COMMENT)\b[^\]】]*[\]】]\s*", text, re.IGNORECASE)
+    if not m:
+        return text
+    rest = text[m.end():].lstrip()
+    return rest or text
+
+
+def format_round_feedback(
+    session: Dict[str, Any],
+    exclude_id: Optional[str] = None,
+    phase: int = 2,
+    limit_chars: int = 400
+) -> str:
+    """
+    汇总「本轮（当前这版文档）」其他参会成员已经给出的判断。
+
+    CLI 是一次性无状态进程，不把这段显式塞进 prompt，后来者就完全不知道前面的人说过什么，
+    只能各自从零复读文档，容易重复提问、也谈不上“圆桌讨论”。
+    """
+    rev = int(session.get("doc_revision") or 0)
+    lines = []
+
+    for m in session.get("messages") or []:
+        if not isinstance(m, dict) or m.get("phase") != phase:
+            continue
+        sender = m.get("sender")
+        if not sender or sender in ("user", "system", "moderator"):
+            continue
+        if exclude_id and sender == exclude_id:
+            continue
+        if int(m.get("doc_revision") or 0) != rev:
+            continue
+
+        label = _FEEDBACK_LABELS.get((m.get("verdict") or "").upper())
+        content = str(m.get("content") or "").strip()
+        if not label or not content:
+            continue
+
+        body = content if len(content) <= limit_chars else content[:limit_chars] + "…（已截断）"
+        lines.append(f"[{m.get('sender_name') or '成员'}｜{label}]: {_strip_verdict_marker(body)}")
+
+    return "\n".join(lines)
+
+
+def _feedback_block(session: Dict[str, Any], exclude_id: Optional[str] = None) -> str:
+    """渲染成可直接嵌入 prompt 的区块；本轮没人发过言时给出明确交代。"""
+    text = format_round_feedback(session, exclude_id=exclude_id)
+    if not text:
+        return (
+            "\n【本轮其他参会成员已给出的意见】:\n"
+            "（本轮尚无其他成员发表意见，你是第一位审阅人）\n"
+        )
+    return (
+        "\n【本轮其他参会成员已给出的意见（同一版文档）】:\n"
+        f"{text}\n"
+        "以上为同轮同事的判断，供你参考但不得盲从：已被修订解决的问题不必重复提出；\n"
+        "若你认为其中某条判断有误，请直接指出并说明理由；你仍需独立完成自己的审阅结论。\n"
+    )
+
+
 class MeetingEngine:
     @staticmethod
     def get_moderator(settings: Dict[str, Any]) -> Dict[str, Any]:
@@ -461,6 +545,7 @@ class MeetingEngine:
                     return True, "主持人整理初稿失败"
 
                 session["document"] = res.output
+                bump_document_revision(session)  # 首版正文 = 第 1 轮审阅
                 session["phase"] = 2
                 session["passed_employees"] = []
                 session["blocker_retry_count"] = 0
@@ -497,7 +582,7 @@ class MeetingEngine:
                 fix_prompt = f"""【方案修订任务】
 当前方案草案如下：
 {session['document']}
-{owner_block}
+{_feedback_block(session, exclude_id=raiser_id)}{owner_block}
 参会人【{raiser_emp['name']}】指出了以下重大问题：
 "{issue_text}"
 
@@ -515,6 +600,7 @@ class MeetingEngine:
 
                 if res_fix.status == "success" and len(res_fix.output.strip()) > 20:
                     session["document"] = res_fix.output
+                    bump_document_revision(session)  # 正文改写 = 新一轮审阅，旧意见不再带入
                 else:
                     session["status"] = "paused"
                     session["current_speaker"] = None
@@ -566,6 +652,7 @@ class MeetingEngine:
                         "verdict": verdict,
                         "elapsed_time": res_verify.elapsed,
                         "created_at": int(time.time()),
+                        "doc_revision": session.get("doc_revision", 0),
                         "sent_prompt": verify_prompt,
                         "raw_response": res_verify.raw_output
                     })
@@ -595,6 +682,7 @@ class MeetingEngine:
                     "verdict": verdict,
                     "elapsed_time": res_verify.elapsed,
                     "created_at": int(time.time()),
+                    "doc_revision": session.get("doc_revision", 0),
                     "sent_prompt": verify_prompt,
                     "raw_response": res_verify.raw_output
                 })
@@ -646,14 +734,18 @@ class MeetingEngine:
             owner_note = latest_user_message(session)
             owner_block = f"\n【群主最新指令（必须遵守，优先级最高）】: {owner_note}\n" if owner_note else ""
 
+            feedback = _feedback_block(session, exclude_id=reviewer_id)
+
             review_prompt = f"""【方案客观审阅】
 你是【{reviewer_emp['name']}】。
 人设背景: {reviewer_emp.get('system_prompt', '')}
 当前工作目录: {workspace_dir}
 
 请仔细审阅最新版方案草案：
+----- 方案正文开始 -----
 {session['document']}
-{owner_block}
+----- 方案正文结束 -----
+{feedback}{owner_block}
 【审阅原则】:
 1. 保持客观理性与专业严谨。细微修辞或非原则性小建议不作为阻断项；
 2. 只有发现存在严重逻辑漏洞、重大硬伤或不可行隐患，才允许标注为 BLOCKER；
@@ -684,6 +776,7 @@ class MeetingEngine:
                     "verdict": verdict,
                     "elapsed_time": res.elapsed,
                     "created_at": int(time.time()),
+                    "doc_revision": session.get("doc_revision", 0),
                     "sent_prompt": review_prompt,
                     "raw_response": res.raw_output
                 })
@@ -737,6 +830,7 @@ class MeetingEngine:
                 "verdict": verdict,
                 "elapsed_time": res.elapsed,
                 "created_at": int(time.time()),
+                "doc_revision": session.get("doc_revision", 0),
                 "sent_prompt": review_prompt,
                 "raw_response": res.raw_output
             })

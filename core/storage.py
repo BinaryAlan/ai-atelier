@@ -219,6 +219,7 @@ def create_session(
         "workspace_dir": os.path.abspath(workspace_dir),
         "current_speaker": None,
         "document": "# 会议方案草案\n\n*(等待各参会成员发表初步立论中...)*\n",
+        "doc_revision": 0,   # 正文版本号，同时用作「同一轮审阅」的界线
         "blocker_under_review": None,
         "blocker_retry_count": 0,
         "review_comment_retries": {},
