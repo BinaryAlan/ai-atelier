@@ -408,21 +408,21 @@ class MeetingEngine:
             reviewer_id = unpassed_ids[0]
             reviewer_emp = MeetingEngine.get_employee(settings, reviewer_id)
 
-            review_prompt = f"""【方案严格审查质询】
+            review_prompt = f"""【方案客观技术审查】
 你是【{reviewer_emp['name']}】({reviewer_emp['title']})。
 人设定位: {reviewer_emp['system_prompt']}
 本地工作目录: {workspace_dir}
 
-请仔细审阅最新版技术方案：
+请审阅最新版技术方案：
 {session['document']}
 
-【审查铁律】:
-1. 严禁无病呻吟与琐碎纠缠！代码注释、命名风格等非致命小瑕疵一律禁止阻断流程；
-2. 只有导致系统崩溃、并发死锁、严重安全漏洞或不可逆架构冲突的致命缺陷，才允许标注为 BLOCKER；
+【审查原则】:
+1. 保持客观理性与专业严谨。代码风格、细微命名等非原则性小建议不作为阻断项；
+2. 只有导致系统崩溃、并发死锁、严重安全隐患或不可逆架构冲突的致命缺陷，才允许标注为 BLOCKER；
 3. 你的回答首行必须严格为以下二者之一：
-   [PASS] - 方案在你的专业领域无致命漏洞，同意通过
-   [BLOCKER: 致命缺陷简述] - 发现不可接受的严重缺陷
-4. 随后用 100 字左右阐述关键技术依据。"""
+   [PASS] - 方案在你的专业领域可行、无致命硬伤，同意通过
+   [BLOCKER: 致命缺陷简述] - 发现不可接受的严重技术缺陷
+4. 随后用 100 字左右客观阐述技术依据与改进建议。"""
 
             session["current_speaker"] = reviewer_emp["name"]
             save_session(session)
