@@ -244,5 +244,7 @@ def api_resume(session_id):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5050))
     print(f"\n🚀 AI-Meeting (AI 圆桌会议室) 启动成功!")
-    print(f"👉 访问地址: http://127.0.0.1:{port}\n")
-    app.run(host="0.0.0.0", port=port, debug=False)
+    print(f"👉 访问地址: http://127.0.0.1:{port}")
+    print(f"⚡ 已开启代码热重载 (Auto-Reload): 修改 Python 代码后服务会自动刷新生效！\n")
+    # 开启 debug 模式与自动热重载，代码修改后自动重启服务
+    app.run(host="0.0.0.0", port=port, debug=True, use_reloader=True)
