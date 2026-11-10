@@ -142,6 +142,23 @@ class Executor:
         return killed_any
 
     @staticmethod
+    def kill_all_processes() -> int:
+        """
+        终止所有会话正在运行的 CLI 进程组（服务停止/重启前调用）。
+        不这么做的话，子进程会被 init 收养后继续跑完，白烧 token 且没人接收结果。
+        """
+        with _PROCESS_LOCK:
+            session_ids = list(ACTIVE_PROCESSES.keys())
+        killed = 0
+        for sid in session_ids:
+            try:
+                if Executor.kill_session_process(sid):
+                    killed += 1
+            except Exception as e:
+                print(f"终止会话 {sid} 的进程组失败:", e)
+        return killed
+
+    @staticmethod
     def run_employee(
         employee: Dict[str, Any],
         prompt: str,

@@ -1,6 +1,8 @@
 __pycache__/
 *.pyc
 .DS_Store
+.venv/
+venv/
 data/sessions/*.json
 !data/sessions/.gitkeep
 data/scanned_models.json

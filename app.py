@@ -1,4 +1,6 @@
 import os
+import sys
+import subprocess
 import threading
 import time
 import re
@@ -16,6 +18,12 @@ from core.scanner import scan_local_models
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
+
+# 启动时刻与运行模式（供 /api/system/status 展示，也让「重启/停止」知道该走哪条路）
+_STARTED_AT = time.time()
+_DEBUG_ENV = os.environ.get("FLASK_DEBUG", "1") in ["1", "true"]
+# werkzeug reloader 会用它自己启动子进程并置位该变量；据此判断当前是「reloader 子进程」
+_UNDER_RELOADER = os.environ.get("WERKZEUG_RUN_MAIN") == "true"
 
 app = Flask(__name__, static_folder=STATIC_DIR)
 
@@ -227,8 +235,7 @@ def sanitize_sessions_on_startup():
 
 # 只在真正运行服务的进程里执行一次自愈清理：
 # debug 模式下 reloader 会启动父子两个进程，父进程不该动数据（否则热重载会重复写盘）
-_DEBUG_ENV = os.environ.get("FLASK_DEBUG", "1") in ["1", "true"]
-if (not _DEBUG_ENV) or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
+if (not _DEBUG_ENV) or _UNDER_RELOADER:
     sanitize_sessions_on_startup()
 
 # ----------------- 静态页面路由 -----------------
@@ -613,6 +620,149 @@ def api_resume(session_id):
 
     request_resume(session_id)
     return jsonify({"success": True, "status": "running"})
+
+
+# ----------------- 服务生命周期（状态 / 重启 / 停止） -----------------
+# werkzeug reloader 把「退出码 3」视为“请重新拉起子进程”，据此实现热重启
+_RELOADER_RESTART_CODE = 3
+
+# 这类接口能杀掉整个服务，必须挡住跨站表单提交：
+# 自定义请求头无法由 <form> 或跨域 JS 直接发出（会触发预检且本服务不返回 CORS 头）
+_ACTION_HEADER = "X-Meeting-Action"
+
+
+def _require_action_header() -> bool:
+    return request.headers.get(_ACTION_HEADER) == "1"
+
+
+def _active_session_ids() -> List[str]:
+    with _RUNNER_LOCK:
+        return sorted(_ACTIVE_SESSIONS)
+
+
+def _prepare_shutdown() -> int:
+    """退出前收尾：终止所有在跑的 CLI 子进程，并把 running 的会议落盘为 paused。"""
+    killed = 0
+    try:
+        killed = Executor.kill_all_processes()
+    except Exception as e:
+        print("[Service] 终止 CLI 子进程失败:", e)
+
+    try:
+        for item in list_sessions():
+            sid = item.get("id")
+            if not sid:
+                continue
+            with session_lock(sid):
+                s = get_session(sid)
+                if s and s.get("status") == "running":
+                    s["status"] = "paused"
+                    s["current_speaker"] = None
+                    save_session(s)
+    except Exception as e:
+        print("[Service] 会话状态复位失败:", e)
+    return killed
+
+
+# 无 reloader 时的“继任者”：等本进程真正退出（端口释放）后再 exec 启动脚本，
+# 否则新进程会和旧进程抢 5050 端口而启动失败
+_SPAWN_WAIT_CODE = r"""
+import os, sys, time
+pid, target = int(sys.argv[1]), sys.argv[2]
+for _ in range(600):
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        break
+    time.sleep(0.1)
+os.execv(sys.executable, [sys.executable, target])
+"""
+
+
+def _spawn_successor() -> bool:
+    """在无 reloader 场景下拉起一个脱离当前进程的新实例。"""
+    entry = os.path.abspath(sys.argv[0] or "")
+    if not entry.endswith(".py") or not os.path.exists(entry):
+        # 不是 `python app.py` 启动的（例如 gunicorn / flask run），交给用户手动重启
+        return False
+    try:
+        subprocess.Popen(
+            [sys.executable, "-c", _SPAWN_WAIT_CODE, str(os.getpid()), entry],
+            cwd=os.getcwd(),
+            start_new_session=True,
+        )
+        return True
+    except Exception as e:
+        print("[Service] 拉起后继进程失败:", e)
+        return False
+
+
+def _schedule_exit(action: str, delay: float = 0.4) -> None:
+    """先让 HTTP 响应完整返回，再在后台真正退出/重启。"""
+    def _run():
+        time.sleep(delay)
+        _prepare_shutdown()
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+        except Exception:
+            pass
+
+        if action == "restart":
+            if _UNDER_RELOADER:
+                os._exit(_RELOADER_RESTART_CODE)
+            if _spawn_successor():
+                os._exit(0)
+            print("[Service] 无 reloader 且无法自动拉起，请手动执行 ./run.sh", file=sys.stderr)
+            os._exit(1)
+        os._exit(0)
+
+    threading.Thread(target=_run, daemon=True, name="service-exit").start()
+
+
+@app.route("/api/system/status", methods=["GET"])
+def api_system_status():
+    try:
+        sessions = list_sessions()
+    except Exception:
+        sessions = []
+    return jsonify({
+        "pid": os.getpid(),
+        "started_at": int(_STARTED_AT),
+        "uptime_seconds": int(time.time() - _STARTED_AT),
+        "debug": bool(_DEBUG_ENV),
+        "hot_reload": bool(_UNDER_RELOADER),
+        "python": "%d.%d.%d" % sys.version_info[:3],
+        "cwd": os.getcwd(),
+        "session_count": len(sessions),
+        "active_sessions": _active_session_ids(),
+    })
+
+
+@app.route("/api/system/restart", methods=["POST"])
+def api_system_restart():
+    if not _require_action_header():
+        return jsonify({"error": "缺少操作确认头"}), 400
+    _schedule_exit("restart")
+    return jsonify({
+        "success": True,
+        "action": "restart",
+        "hot_reload": bool(_UNDER_RELOADER),
+        "message": "服务正在重启，正在执行的 AI 任务已终止，会议将转为暂停",
+    })
+
+
+@app.route("/api/system/shutdown", methods=["POST"])
+def api_system_shutdown():
+    if not _require_action_header():
+        return jsonify({"error": "缺少操作确认头"}), 400
+    _schedule_exit("shutdown")
+    return jsonify({
+        "success": True,
+        "action": "shutdown",
+        "message": "服务正在停止，重新启动请运行 ./run.sh",
+    })
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5050))

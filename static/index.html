@@ -41,9 +41,49 @@
             <p class="text-xs text-gray-500">多 AI 协同圆桌讨论中枢</p>
           </div>
         </div>
-        <button @click="openSettingsModal" class="p-1.5 text-gray-500 hover:text-gray-800 hover:bg-gray-100 rounded-lg transition" title="员工与模型设置">
-          ⚙️
-        </button>
+        <div id="service-menu-wrap" class="relative flex items-center gap-0.5">
+          <button @click="toggleServiceMenu" class="p-1.5 rounded-lg transition hover:bg-gray-100" :class="systemStatus?.hot_reload ? 'text-emerald-600' : 'text-gray-500 hover:text-gray-800'" title="服务状态 · 重启 · 停止">
+            ⏻
+          </button>
+          <button @click="openSettingsModal" class="p-1.5 text-gray-500 hover:text-gray-800 hover:bg-gray-100 rounded-lg transition" title="员工与模型设置">
+            ⚙️
+          </button>
+
+          <!-- 服务控制浮层 -->
+          <div v-if="showServiceMenu" class="absolute right-0 top-full mt-1.5 w-64 bg-white border border-gray-200 rounded-xl shadow-lg z-40 p-3 space-y-2 text-xs">
+            <div class="flex items-center justify-between font-semibold text-gray-600 pb-1.5 border-b border-gray-100">
+              <span>服务进程</span>
+              <button @click="showServiceMenu = false" class="text-gray-400 hover:text-gray-600">✕</button>
+            </div>
+
+            <div v-if="systemStatus" class="space-y-1 text-[11px] text-gray-500">
+              <div class="flex justify-between"><span>PID</span><span class="text-gray-700 font-mono">{{ systemStatus.pid }}</span></div>
+              <div class="flex justify-between"><span>已运行</span><span class="text-gray-700">{{ formatUptime(systemStatus.uptime_seconds) }}</span></div>
+              <div class="flex justify-between"><span>在跑会议</span><span class="text-gray-700">{{ systemStatus.active_sessions.length }}</span></div>
+              <div class="flex justify-between">
+                <span>热重载</span>
+                <span :class="systemStatus.hot_reload ? 'text-emerald-600 font-medium' : 'text-amber-600 font-medium'">
+                  {{ systemStatus.hot_reload ? '已开启' : '未开启' }}
+                </span>
+              </div>
+              <p class="pt-1 text-[10px] leading-relaxed text-gray-400">
+                {{ systemStatus.hot_reload
+                  ? '改 .py 会自动重启进程；改 html / js / settings.json 无需重启。'
+                  : '热重载已关闭（FLASK_DEBUG=0）：改 .py 后需要点下方「重启服务」。' }}
+              </p>
+            </div>
+            <div v-else class="text-[11px] text-red-500 py-1">无法获取服务状态（进程可能已停止）</div>
+
+            <div class="pt-2 border-t border-gray-100 space-y-1.5">
+              <button @click="restartService" :disabled="serviceBusy" class="w-full py-1.5 rounded-lg bg-blue-50 text-blue-700 hover:bg-blue-100 font-medium transition disabled:opacity-50">
+                🔄 重启服务
+              </button>
+              <button @click="shutdownService" :disabled="serviceBusy" class="w-full py-1.5 rounded-lg bg-red-50 text-red-700 hover:bg-red-100 font-medium transition disabled:opacity-50">
+                ⏻ 停止服务
+              </button>
+            </div>
+          </div>
+        </div>
       </div>
 
       <!-- 发起新议题按钮 -->
@@ -810,6 +850,23 @@
         <div class="p-3 border-t border-gray-100 bg-gray-50 flex justify-end">
           <button @click="showInspectModal = false" class="px-4 py-1.5 text-xs bg-gray-200 hover:bg-gray-300 text-gray-700 rounded font-medium">关闭</button>
         </div>
+      </div>
+    </div>
+
+    <!-- 服务已停止遮罩 -->
+    <div v-if="serviceDown" class="fixed inset-0 bg-gray-900/70 z-[999] flex items-center justify-center">
+      <div class="bg-white rounded-2xl shadow-xl p-8 w-80 text-center space-y-4">
+        <div class="text-4xl">⏻</div>
+        <h3 class="font-bold text-gray-900">服务已停止</h3>
+        <p class="text-xs text-gray-500 leading-relaxed">
+          后端进程已退出，本页无法再读写数据。<br />
+          在项目目录执行
+          <code class="bg-gray-100 px-1 py-0.5 rounded font-mono">./run.sh</code>
+          重新启动后，点下方按钮重连。
+        </p>
+        <button @click="retryConnect" :disabled="serviceBusy" class="w-full py-2 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium transition disabled:opacity-50">
+          {{ serviceBusy ? "连接中…" : "重试连接" }}
+        </button>
       </div>
     </div>
 

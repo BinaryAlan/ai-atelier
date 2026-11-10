@@ -92,7 +92,13 @@ createApp({
       isComposing: false, // 正在使用输入法组词或英文回车确认
       defaultWorkspaceDir: "",
       switchToken: 0,     // 会话切换请求序号，用于丢弃过期的在途响应
-      pollInterval: null
+      pollInterval: null,
+
+      // 服务进程控制（状态 / 重启 / 停止）
+      showServiceMenu: false,
+      systemStatus: null,
+      serviceBusy: false,
+      serviceDown: false
     };
   },
   computed: {
@@ -144,6 +150,9 @@ createApp({
       if (!e.target.closest(".relative")) {
         this.showMemberDropdown = false;
       }
+      if (!e.target.closest("#service-menu-wrap")) {
+        this.showServiceMenu = false;
+      }
     },
 
     async init() {
@@ -151,6 +160,7 @@ createApp({
       await this.loadSettings();
       await this.loadSessions();
       await this.triggerScanModels(false);
+      this.fetchSystemStatus(); // 仅用于点亮服务入口，不阻塞首屏
 
       if (this.sessions.length > 0) {
         await this.switchSession(this.sessions[0].id);
@@ -468,6 +478,121 @@ createApp({
       } catch (e) {
         console.error("恢复失败:", e);
       }
+    },
+
+    // ---------------- 服务进程控制 ----------------
+    formatUptime(sec) {
+      const s = Math.max(0, Math.floor(sec || 0));
+      const d = Math.floor(s / 86400);
+      const h = Math.floor((s % 86400) / 3600);
+      const m = Math.floor((s % 3600) / 60);
+      if (d > 0) return `${d} 天 ${h} 小时`;
+      if (h > 0) return `${h} 小时 ${m} 分`;
+      if (m > 0) return `${m} 分 ${s % 60} 秒`;
+      return `${s} 秒`;
+    },
+
+    async fetchSystemStatus() {
+      try {
+        const res = await fetch("/api/system/status", { cache: "no-store" });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        this.systemStatus = await res.json();
+        this.serviceDown = false;
+        return true;
+      } catch (e) {
+        this.systemStatus = null;
+        return false;
+      }
+    },
+
+    toggleServiceMenu() {
+      this.showServiceMenu = !this.showServiceMenu;
+      if (this.showServiceMenu) this.fetchSystemStatus();
+    },
+
+    async restartService() {
+      if (this.serviceBusy) return;
+      if (!confirm("确定重启服务？\n\n正在执行的 AI 任务会被立即终止，会议自动转为暂停；重启后点「恢复讨论」即可继续。")) return;
+
+      if (!this.systemStatus) await this.fetchSystemStatus();
+      const oldStart = this.systemStatus?.started_at || 0;
+      const oldPid = this.systemStatus?.pid || 0;
+
+      this.serviceBusy = true;
+      this.showServiceMenu = false;
+      try {
+        await fetch("/api/system/restart", {
+          method: "POST",
+          headers: { "X-Meeting-Action": "1" }
+        });
+      } catch (e) {
+        // 连接被切断属于预期：服务正在退出
+      }
+
+      const ok = await this.waitForServer(oldStart, oldPid);
+      this.serviceBusy = false;
+      if (ok) {
+        location.reload();
+      } else {
+        alert("重启后 20 秒内没能连上服务。请查看终端输出，或手动执行 ./run.sh。");
+        this.serviceDown = true;
+      }
+    },
+
+    async shutdownService() {
+      if (this.serviceBusy) return;
+      if (!confirm("确定停止服务？\n\n所有在跑的 AI 任务会立即终止，会议转为暂停。停止后需重新运行 ./run.sh 才能再次使用。")) return;
+
+      this.serviceBusy = true;
+      this.showServiceMenu = false;
+      try {
+        await fetch("/api/system/shutdown", {
+          method: "POST",
+          headers: { "X-Meeting-Action": "1" }
+        });
+      } catch (e) {
+        // 同上
+      }
+      // 等进程真正退出，避免界面还显示“正在连接”
+      for (let i = 0; i < 20; i++) {
+        await new Promise(r => setTimeout(r, 300));
+        if (!(await this.fetchSystemStatus())) break;
+      }
+      this.serviceBusy = false;
+      if (!this.systemStatus) {
+        this.serviceDown = true;
+      } else {
+        alert("停止指令已发出，但服务仍在响应。请查看终端是否有异常。");
+      }
+    },
+
+    async waitForServer(oldStart, oldPid) {
+      let sawDown = false;
+      for (let i = 0; i < 40; i++) {
+        await new Promise(r => setTimeout(r, 500));
+        try {
+          const res = await fetch("/api/system/status", { cache: "no-store" });
+          if (!res.ok) {
+            sawDown = true;
+            continue;
+          }
+          const st = await res.json();
+          if (oldStart && st.started_at !== oldStart) return true;
+          if (oldPid && st.pid !== oldPid) return true;
+          // 拿不到旧进程身份时，至少要确认服务真的断过一次，否则可能只是还没退出
+          if (!oldStart && !oldPid && sawDown) return true;
+        } catch (e) {
+          sawDown = true;
+        }
+      }
+      return false;
+    },
+
+    async retryConnect() {
+      this.serviceBusy = true;
+      const ok = await this.fetchSystemStatus();
+      this.serviceBusy = false;
+      if (ok) location.reload();
     },
 
     async pollActiveSession() {
