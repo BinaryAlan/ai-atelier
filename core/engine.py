@@ -161,6 +161,34 @@ def looks_like_incomplete(text: str) -> bool:
     return False
 
 
+def is_valid_speech(msg: Dict[str, Any]) -> bool:
+    """一条发言能否被当作「成员的真实观点」引用：空、只剩工具标记、只说了计划都不算。"""
+    content = sanitize_model_output(str((msg or {}).get("content") or ""))
+    return not looks_like_incomplete(content)
+
+
+def split_valid_opinions(messages) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """
+    把参会发言拆成「有效」与「无效（该成员本轮等于没说话）」两堆。
+
+    主持人合成纪要时若把「我先去读文件」这类空壳当成观点喂进去，模型会顺着气口
+    替它补出一整段立场——实测出现过给两位没发言的成员各写 1000 字「发言摘要」的情况，
+    等于伪造会议记录。所以无效发言一律不进 prompt，并单独告知主持人谁没说话。
+    """
+    valid: List[Dict[str, Any]] = []
+    dropped: List[str] = []
+    for m in messages or []:
+        if not isinstance(m, dict):
+            continue
+        if is_valid_speech(m):
+            valid.append(m)
+        else:
+            name = m.get("sender_name") or m.get("sender") or "未知成员"
+            if name not in dropped:
+                dropped.append(name)
+    return valid, dropped
+
+
 def run_with_retry(
     employee: Dict[str, Any],
     prompt: str,
@@ -245,6 +273,9 @@ def format_round_feedback(
         label = _FEEDBACK_LABELS.get((m.get("verdict") or "").upper())
         content = str(m.get("content") or "").strip()
         if not label or not content:
+            continue
+        # 空壳发言（只剩工具标记 / 只说了“我先去读”）不能当同事意见喂给下一位
+        if not is_valid_speech(m):
             continue
 
         body = content if len(content) <= limit_chars else content[:limit_chars] + "…（已截断）"
@@ -560,8 +591,16 @@ class MeetingEngine:
                 emp = MeetingEngine.get_employee(settings, next_emp_id)
                 user_topic = session["messages"][last_user_idx]["content"] if last_user_idx != -1 else "方案研讨"
 
-                p1_context = [f"[{m['sender_name']}]: {m['content']}" for m in relevant_msgs if m.get("phase") == 1]
+                prior_valid, prior_silent = split_valid_opinions(
+                    [m for m in relevant_msgs if m.get("phase") == 1]
+                )
+                p1_context = [f"[{m['sender_name']}]: {m['content']}" for m in prior_valid]
                 context_str = "\n".join(p1_context) if p1_context else "(你是第一个发言人)"
+                if prior_silent:
+                    context_str += (
+                        f"\n（本轮以下成员尚未给出有效发言：{'、'.join(prior_silent)}；"
+                        "请勿替他们补全观点，也不要假装看到过他们的意见）"
+                    )
                 capability = capability_block(emp)
 
                 prompt = f"""【会议议题】: {user_topic}
@@ -630,20 +669,32 @@ class MeetingEngine:
             else:
                 # 阶段一全部人发表完毕 ➡️ 主持人合成首版草案文档
                 user_topic = session["messages"][last_user_idx]["content"] if last_user_idx != -1 else "方案研讨"
-                p1_context = [f"[{m['sender_name']}]: {m['content']}" for m in relevant_msgs if m.get("phase") == 1 and m.get("verdict") == "OPINION"]
-                context_str = "\n".join(p1_context)
+                opinions = [m for m in relevant_msgs
+                            if m.get("phase") == 1 and m.get("verdict") == "OPINION"]
+                valid_ops, silent_names = split_valid_opinions(opinions)
+                p1_context = [f"[{m['sender_name']}]: {m['content']}" for m in valid_ops]
+                context_str = "\n".join(p1_context) if p1_context else "（本轮没有任何成员给出有效发言，下面只能依据议题本身整理）"
+                gap_note = ""
+                if silent_names:
+                    gap_note = (
+                        f"\n【数据完整性约束】本轮以下成员**没有**给出有效发言：{'、'.join(silent_names)}。\n"
+                        "严禁替他们虚构、推测或“补全”任何立场、观点、数据与结论；纪要里最多写一句"
+                        "「该成员本轮未发言」。编造他人观点会直接毁掉后续所有审阅的依据。\n"
+                    )
 
                 synth_prompt = f"""【会议纪要与方案草案整理任务】
 议题: "{user_topic}"
 工作目录: {workspace_dir}
 各参会成员初步发言汇总如下：
 {context_str}
-
+{gap_note}
 你是【{moderator['name']}】。
 请综合各方建议与共识，输出一份标准的《方案草案与工作纪要 (初稿)》。
 {capability_block(moderator)}
 要求：
 - 结构清晰、条理规整，涵盖核心结论、执行要点与待办细节；
+- 只转述上面**确实出现过**的发言，不得替任何成员编造主张；
+- 你自己的推理或补充，必须显式标注为「主持人补充」，不要混进他人名下；
 - 输出纯 Markdown 格式。"""
 
                 session["current_speaker"] = f"{moderator['name']} (主持人正在整理草案)"
@@ -668,7 +719,17 @@ class MeetingEngine:
                     save_session(session, merge=True)
                     return True, "主持人整理初稿失败"
 
-                session["document"] = res.output
+                # 纪要里留一条可核对的说明：谁本轮没说话，别让后人以为那份文档是全员共识
+                doc_text = res.output
+                if silent_names:
+                    doc_text = doc_text.rstrip() + (
+                        "\n\n---\n\n### 数据完整性说明\n"
+                        f"- 本轮以下成员未给出有效发言，纪要未采纳任何来自他们的观点："
+                        f"{'、'.join(silent_names)}。\n"
+                        "- 若需要他们的判断，请重新点名，或检查其 CLI 是否具备读文件能力（`--tools`）。\n"
+                    )
+
+                session["document"] = doc_text
                 bump_document_revision(session)  # 首版正文 = 第 1 轮审阅
                 session["phase"] = 2
                 session["passed_employees"] = []
