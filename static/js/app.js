@@ -3,6 +3,7 @@ const { createApp } = Vue;
 createApp({
   data() {
     return {
+      sessionTab: "all", // 'all' | 'fav'
       sessions: [],
       currentSessionId: null,
       currentSession: {
@@ -11,18 +12,51 @@ createApp({
         messages: [],
         document: "",
         employee_ids: [],
+        moderator_id: "antigravity",
+        workspace_dir: "",
         status: "idle",
         phase: 1,
         current_speaker: null
       },
       settings: {
-        moderator_id: "antigravity",
+        default_moderator_id: "antigravity",
         employees: []
       },
       inputContent: "",
-      isNewDirection: false,
-      docViewMode: "preview",
+      rightTab: "doc", // 'doc' | 'workspace'
+      workspaceItems: [],
+      selectedWorkspaceFile: null,
+      selectedFileContent: "",
+
+      // 新建议题弹窗
+      showNewSessionModal: false,
+      newSessionForm: {
+        title: "",
+        workspace_dir: "",
+        moderator_id: "",
+        employee_ids: []
+      },
+
+      // 员工设置弹窗
       showSettingsModal: false,
+      showEmpEditModal: false,
+      isEditingEmployee: false,
+      editingEmpIdx: -1,
+      selectedModelId: "",
+      scannedModels: [],
+      editingEmp: {
+        id: "",
+        name: "",
+        title: "",
+        avatar: "🤖",
+        avatar_color: "#3b82f6",
+        type: "cli",
+        cli_cmd: "",
+        system_prompt: "",
+        enabled: true
+      },
+      presetAvatars: ["🤖", "🧠", "⚡", "🦉", "🛡️", "🚀", "💻", "🔬", "🎯", "🎨", "👑", "🕵️", "🔧", "💡", "⚖️", "📊"],
+
       pollInterval: null
     };
   },
@@ -30,8 +64,11 @@ createApp({
     favoriteSessions() {
       return this.sessions.filter(s => s.is_favorite);
     },
-    normalSessions() {
-      return this.sessions.filter(s => !s.is_favorite);
+    displayedSessions() {
+      if (this.sessionTab === "fav") {
+        return this.favoriteSessions;
+      }
+      return this.sessions;
     },
     availableEmployees() {
       return this.settings.employees.filter(e => e.enabled);
@@ -46,7 +83,6 @@ createApp({
   },
   mounted() {
     this.init();
-    // 启动全局轮询器（当会议 running 时实时同步状态）
     this.pollInterval = setInterval(this.pollActiveSession, 1500);
   },
   beforeUnmount() {
@@ -56,10 +92,12 @@ createApp({
     async init() {
       await this.loadSettings();
       await this.loadSessions();
+      await this.triggerScanModels(false);
+
       if (this.sessions.length > 0) {
         await this.switchSession(this.sessions[0].id);
       } else {
-        await this.createNewSession();
+        this.openNewSessionModal();
       }
     },
 
@@ -83,35 +121,55 @@ createApp({
 
     async switchSession(id) {
       this.currentSessionId = id;
+      this.selectedWorkspaceFile = null;
+      this.selectedFileContent = "";
       try {
         const res = await fetch(`/api/sessions/${id}`);
         if (res.ok) {
           this.currentSession = await res.json();
           this.$nextTick(this.scrollToBottom);
+          this.loadWorkspaceFiles();
         }
       } catch (e) {
         console.error("切换会话失败:", e);
       }
     },
 
-    async createNewSession() {
+    // ----------------- 新建议题 Modal -----------------
+    openNewSessionModal() {
+      const defaultDir = this.currentSession?.workspace_dir || "/Users/lc/Code/ai-meeting";
+      this.newSessionForm = {
+        title: "",
+        workspace_dir: defaultDir,
+        moderator_id: this.settings.default_moderator_id || (this.availableEmployees[0]?.id || "antigravity"),
+        employee_ids: this.availableEmployees.map(e => e.id)
+      };
+      this.showNewSessionModal = true;
+    },
+
+    async confirmCreateSession() {
+      const title = this.newSessionForm.title.trim() || "新架构评审会议";
       try {
         const res = await fetch("/api/sessions", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            title: "新架构评审会议",
-            employee_ids: this.availableEmployees.map(e => e.id)
+            title: title,
+            workspace_dir: this.newSessionForm.workspace_dir.trim(),
+            moderator_id: this.newSessionForm.moderator_id,
+            employee_ids: this.newSessionForm.employee_ids
           })
         });
         const newSession = await res.json();
+        this.showNewSessionModal = false;
         await this.loadSessions();
         await this.switchSession(newSession.id);
       } catch (e) {
-        console.error("新建会话失败:", e);
+        alert("创建会议失败: " + e);
       }
     },
 
+    // ----------------- 收藏与重命名 -----------------
     async toggleFavorite(session) {
       try {
         await fetch(`/api/sessions/${session.id}`, {
@@ -156,7 +214,7 @@ createApp({
           if (this.sessions.length > 0) {
             await this.switchSession(this.sessions[0].id);
           } else {
-            await this.createNewSession();
+            this.openNewSessionModal();
           }
         }
       } catch (e) {
@@ -177,22 +235,17 @@ createApp({
       }
     },
 
+    // ----------------- 消息发送与暂停 -----------------
     async sendMessage() {
       const text = this.inputContent.trim();
       if (!text || !this.currentSessionId) return;
 
-      const isNew = this.isNewDirection;
       this.inputContent = "";
-      this.isNewDirection = false;
-
       try {
         const res = await fetch(`/api/sessions/${this.currentSessionId}/message`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            content: text,
-            is_new_direction: isNew
-          })
+          body: JSON.stringify({ content: text })
         });
         if (res.ok) {
           this.currentSession = await res.json();
@@ -207,8 +260,16 @@ createApp({
     async pauseMeeting() {
       if (!this.currentSessionId) return;
       try {
-        await fetch(`/api/sessions/${this.currentSessionId}/pause`, { method: "POST" });
-        this.currentSession.status = "paused";
+        const res = await fetch(`/api/sessions/${this.currentSessionId}/pause`, { method: "POST" });
+        if (res.ok) {
+          const data = await res.json();
+          this.currentSession.status = "paused";
+          this.currentSession.current_speaker = null;
+          // 重新拉取最新记录
+          const sRes = await fetch(`/api/sessions/${this.currentSessionId}`);
+          this.currentSession = await sRes.json();
+          this.$nextTick(this.scrollToBottom);
+        }
       } catch (e) {
         console.error("暂停失败:", e);
       }
@@ -221,20 +282,6 @@ createApp({
         this.currentSession.status = "running";
       } catch (e) {
         console.error("恢复失败:", e);
-      }
-    },
-
-    async stepMeeting() {
-      if (!this.currentSessionId) return;
-      try {
-        const res = await fetch(`/api/sessions/${this.currentSessionId}/step`, { method: "POST" });
-        const data = await res.json();
-        if (data.session) {
-          this.currentSession = data.session;
-          this.$nextTick(this.scrollToBottom);
-        }
-      } catch (e) {
-        console.error("单步推进失败:", e);
       }
     },
 
@@ -267,33 +314,138 @@ createApp({
       return emp?.avatar_color || "#3b82f6";
     },
 
-    copyDoc() {
-      const doc = this.currentSession?.document || "";
-      navigator.clipboard.writeText(doc).then(() => {
-        alert("Markdown 方案已复制到剪贴板！");
-      });
+    getEmployeeAvatar(senderId) {
+      if (senderId === "system") return "📢";
+      const emp = this.settings.employees.find(e => e.id === senderId);
+      return emp?.avatar || "🤖";
     },
 
-    exportDoc() {
-      if (!this.currentSessionId) return;
-      window.open(`/api/sessions/${this.currentSessionId}/export`, "_blank");
-    },
-
-    async saveDocManual() {
-      if (!this.currentSessionId) return;
+    // ----------------- 工作目录文件浏览器 -----------------
+    async loadWorkspaceFiles() {
+      const dir = this.currentSession?.workspace_dir;
+      if (!dir) return;
       try {
-        await fetch(`/api/sessions/${this.currentSessionId}`, {
-          method: "PUT",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ document: this.currentSession.document })
-        });
+        const res = await fetch(`/api/workspace/files?path=${encodeURIComponent(dir)}`);
+        const data = await res.json();
+        this.workspaceItems = data.items || [];
       } catch (e) {
-        console.error("保存文档失败:", e);
+        console.error("获取工作区文件失败:", e);
       }
     },
 
+    async onWorkspaceItemClick(item) {
+      if (item.is_dir) {
+        // 进入子目录
+        try {
+          const res = await fetch(`/api/workspace/files?path=${encodeURIComponent(item.path)}`);
+          const data = await res.json();
+          this.workspaceItems = data.items || [];
+        } catch (e) {
+          console.error("展开目录失败:", e);
+        }
+      } else {
+        // 读取文件内容
+        try {
+          const res = await fetch(`/api/workspace/file?path=${encodeURIComponent(item.path)}`);
+          const data = await res.json();
+          this.selectedWorkspaceFile = item;
+          this.selectedFileContent = data.content || "(空文件)";
+        } catch (e) {
+          alert("读取文件失败: " + e);
+        }
+      }
+    },
+
+    formatFileSize(bytes) {
+      if (!bytes || bytes === 0) return "0 B";
+      const k = 1024;
+      const sizes = ["B", "KB", "MB", "GB"];
+      const i = Math.floor(Math.log(bytes) / Math.log(k));
+      return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + " " + sizes[i];
+    },
+
+    // ----------------- 员工与模型扫描设置 -----------------
     openSettingsModal() {
       this.showSettingsModal = true;
+    },
+
+    async triggerScanModels(force = true) {
+      try {
+        const res = await fetch(`/api/scan_models?refresh=${force ? 1 : 0}`);
+        const data = await res.json();
+        this.scannedModels = data.models || [];
+      } catch (e) {
+        console.error("扫描模型失败:", e);
+      }
+    },
+
+    openAddEmployeeModal() {
+      this.isEditingEmployee = false;
+      this.editingEmpIdx = -1;
+      this.selectedModelId = "";
+      this.editingEmp = {
+        id: "emp_" + Math.random().toString(36).substring(2, 7),
+        name: "",
+        title: "",
+        avatar: "🤖",
+        avatar_color: "#3b82f6",
+        type: "cli",
+        cli_cmd: "",
+        system_prompt: "",
+        enabled: true
+      };
+      this.showEmpEditModal = true;
+    },
+
+    openEditEmployeeModal(emp, idx) {
+      this.isEditingEmployee = true;
+      this.editingEmpIdx = idx;
+      this.editingEmp = JSON.parse(JSON.stringify(emp));
+      // 匹配模型
+      const match = this.scannedModels.find(m => m.cli_cmd === emp.cli_cmd);
+      this.selectedModelId = match ? match.model_id : "";
+      this.showEmpEditModal = true;
+    },
+
+    onModelSelectChanged() {
+      const match = this.scannedModels.find(m => m.model_id === this.selectedModelId);
+      if (match) {
+        this.editingEmp.cli_cmd = match.cli_cmd;
+        if (!this.editingEmp.name) {
+          this.editingEmp.name = match.display_name.replace(/\[.*?\]\s*/g, "");
+        }
+        if (!this.editingEmp.title) {
+          this.editingEmp.title = match.default_title;
+        }
+        if (!this.editingEmp.system_prompt) {
+          this.editingEmp.system_prompt = match.default_prompt;
+        }
+      }
+    },
+
+    saveEmployeeItem() {
+      if (!this.editingEmp.name.trim()) {
+        alert("请输入员工姓名！");
+        return;
+      }
+      if (!this.editingEmp.cli_cmd.trim()) {
+        alert("CLI 执行模板不能为空！");
+        return;
+      }
+
+      if (this.isEditingEmployee && this.editingEmpIdx >= 0) {
+        this.settings.employees[this.editingEmpIdx] = JSON.parse(JSON.stringify(this.editingEmp));
+      } else {
+        this.settings.employees.push(JSON.parse(JSON.stringify(this.editingEmp)));
+      }
+
+      this.showEmpEditModal = false;
+    },
+
+    deleteEmployee(idx) {
+      if (confirm(`确定要删除员工 [${this.settings.employees[idx].name}] 吗？`)) {
+        this.settings.employees.splice(idx, 1);
+      }
     },
 
     async saveSettingsToServer() {
@@ -305,7 +457,7 @@ createApp({
         });
         if (res.ok) {
           this.showSettingsModal = false;
-          alert("员工配置保存成功！");
+          alert("配置已成功保存！");
         }
       } catch (e) {
         console.error("保存配置失败:", e);

@@ -13,15 +13,16 @@ SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
 os.makedirs(SESSIONS_DIR, exist_ok=True)
 
 DEFAULT_SETTINGS = {
-    "moderator_id": "antigravity",
+    "default_moderator_id": "antigravity",
     "employees": [
         {
             "id": "antigravity",
             "name": "Antigravity",
             "title": "全局首席架构师",
+            "avatar": "🏛️",
             "avatar_color": "#2563eb",  # 蓝
             "type": "cli",
-            "cli_cmd": "agy -p \"{prompt}\"",
+            "cli_cmd": 'agy -p "{prompt}"',
             "system_prompt": "你是 Google Antigravity，技术评审团的全局首席架构师。注重工程规范、模块解耦、长远扩展性与高可靠性。",
             "enabled": True
         },
@@ -29,19 +30,21 @@ DEFAULT_SETTINGS = {
             "id": "codebuddy-ds4",
             "name": "DeepSeek-V4 (DS4)",
             "title": "底层算法与代码挑刺官",
+            "avatar": "🧠",
             "avatar_color": "#9333ea",  # 紫
             "type": "cli",
-            "cli_cmd": "codebuddy --model deepseek-v4-pro --tools \"\" -p \"{prompt}\"",
+            "cli_cmd": 'codebuddy --model deepseek-v4-pro --tools "" -p "{prompt}"',
             "system_prompt": "你是 DeepSeek V4，技术评审团的代码与性能挑刺官。敏锐寻找高并发死锁、内存隐患、边界漏洞与安全陷阱，严禁客套。",
             "enabled": True
         },
         {
             "id": "codebuddy-hy4",
             "name": "混元-4 (HY4)",
-            "title": "业务落地与成本把控专家",
+            "title": "业务落地与工程效率专家",
+            "avatar": "⚡",
             "avatar_color": "#059669",  # 绿
             "type": "cli",
-            "cli_cmd": "codebuddy --model hy4std --tools \"\" -p \"{prompt}\"",
+            "cli_cmd": 'codebuddy --model hy4std --tools "" -p "{prompt}"',
             "system_prompt": "你是腾讯混元4，技术评审团的业务落地与效率专家。注重开发周期、团队维护成本、中文业务适配度与工程可行性。",
             "enabled": True
         }
@@ -54,7 +57,11 @@ def load_settings() -> Dict[str, Any]:
         return DEFAULT_SETTINGS
     try:
         with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
+            # 兼容旧版本缺少的字段
+            if "default_moderator_id" not in data:
+                data["default_moderator_id"] = "antigravity"
+            return data
     except Exception:
         return DEFAULT_SETTINGS
 
@@ -80,7 +87,9 @@ def list_sessions() -> List[Dict[str, Any]]:
                         "updated_at": data.get("updated_at"),
                         "status": data.get("status", "idle"),
                         "phase": data.get("phase", 1),
-                        "employee_ids": data.get("employee_ids", [])
+                        "employee_ids": data.get("employee_ids", []),
+                        "moderator_id": data.get("moderator_id", "antigravity"),
+                        "workspace_dir": data.get("workspace_dir", "")
                     })
             except Exception:
                 continue
@@ -98,12 +107,27 @@ def get_session(session_id: str) -> Optional[Dict[str, Any]]:
     except Exception:
         return None
 
-def create_session(title: str = "新架构评审会议", employee_ids: List[str] = None) -> Dict[str, Any]:
+def create_session(
+    title: str = "新架构评审会议",
+    employee_ids: List[str] = None,
+    moderator_id: str = None,
+    workspace_dir: str = None
+) -> Dict[str, Any]:
     session_id = str(uuid.uuid4())[:8]
     now = int(time.time())
+    settings = load_settings()
+
     if not employee_ids:
-        settings = load_settings()
         employee_ids = [e["id"] for e in settings["employees"] if e.get("enabled", True)]
+
+    if not moderator_id:
+        moderator_id = settings.get("default_moderator_id", employee_ids[0] if employee_ids else "antigravity")
+
+    # 默认工作目录
+    if not workspace_dir:
+        workspace_dir = os.path.expanduser("~/Code")
+        if not os.path.exists(workspace_dir):
+            workspace_dir = os.getcwd()
 
     session_data = {
         "id": session_id,
@@ -114,7 +138,8 @@ def create_session(title: str = "新架构评审会议", employee_ids: List[str]
         "status": "idle",  # idle | running | paused | concluded
         "phase": 1,        # 1: 自由立论与出谋划策; 2: 严格审查与重大阻断
         "employee_ids": employee_ids,
-        "moderator_id": "antigravity",
+        "moderator_id": moderator_id,
+        "workspace_dir": os.path.abspath(workspace_dir),
         "current_speaker": None,
         "document": "# 会议技术方案草案\n\n*(等待各参会专家发表初步立论中...)*\n",
         "blocker_under_review": None,
