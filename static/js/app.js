@@ -39,6 +39,13 @@ createApp({
 
       showMemberDropdown: false,
 
+      // 文件夹选择器弹窗 (小窗口选择本地目录)
+      showFolderPickerModal: false,
+      folderPickerPath: "",
+      folderPickerParent: null,
+      folderPickerDirs: [],
+      folderPickerTargetForm: "newSessionForm", // 'newSessionForm' | 'editingSessionForm'
+
       // 新建议题弹窗
       showNewSessionModal: false,
       newSessionForm: {
@@ -67,7 +74,6 @@ createApp({
       editingEmp: {
         id: "",
         name: "",
-        title: "",
         avatar: "🤖",
         avatar_color: "#3b82f6",
         type: "cli",
@@ -87,6 +93,10 @@ createApp({
     };
   },
   computed: {
+    totalParticipantsCount() {
+      // 主持人(1) + 勾选的参会员工数量
+      return 1 + (this.currentSession?.employee_ids?.length || 0);
+    },
     favoriteSessions() {
       return this.sessions.filter(s => s.is_favorite);
     },
@@ -242,6 +252,40 @@ createApp({
       }
     },
 
+    // ----------------- 本地文件夹选择器 Modal -----------------
+    async openFolderPicker(targetForm = "newSessionForm") {
+      this.folderPickerTargetForm = targetForm;
+      let startPath = "";
+      if (targetForm === "newSessionForm") {
+        startPath = this.newSessionForm.workspace_dir || "";
+      } else if (targetForm === "editingSessionForm") {
+        startPath = this.editingSessionForm.workspace_dir || "";
+      }
+      await this.browseFolder(startPath);
+      this.showFolderPickerModal = true;
+    },
+
+    async browseFolder(path = "") {
+      try {
+        const res = await fetch(`/api/browse_dirs?path=${encodeURIComponent(path)}`);
+        const data = await res.json();
+        this.folderPickerPath = data.current || "";
+        this.folderPickerParent = data.parent || null;
+        this.folderPickerDirs = data.dirs || [];
+      } catch (e) {
+        console.error("浏览目录失败:", e);
+      }
+    },
+
+    confirmSelectFolder() {
+      if (this.folderPickerTargetForm === "newSessionForm") {
+        this.newSessionForm.workspace_dir = this.folderPickerPath;
+      } else if (this.folderPickerTargetForm === "editingSessionForm") {
+        this.editingSessionForm.workspace_dir = this.folderPickerPath;
+      }
+      this.showFolderPickerModal = false;
+    },
+
     // ----------------- 收藏与删除 -----------------
     async toggleFavorite(session) {
       try {
@@ -395,7 +439,7 @@ createApp({
     },
 
     isModerator(senderId) {
-      return senderId === "moderator" || senderId === this.settings.moderator?.id;
+      return senderId === "moderator" || senderId === "antigravity" || senderId === this.settings.moderator?.id;
     },
 
     getEmployeeColor(senderId) {
@@ -504,7 +548,6 @@ createApp({
       this.editingEmp = {
         id: uniqueId,
         name: "",
-        title: "",
         avatar: "🤖",
         avatar_color: "#3b82f6",
         type: "cli",
@@ -533,10 +576,8 @@ createApp({
         if (!this.editingEmp.name) {
           this.editingEmp.name = match.display_name.replace(/\[.*?\]\s*/g, "");
         }
-        if (!this.editingEmp.title) {
-          this.editingEmp.title = match.default_title;
-        }
-        if (!this.editingEmp.system_prompt) {
+        // 如果用户尚未填写 Prompt，且扫描出来的模型有预设则使用；否则保持干净空白
+        if (!this.editingEmp.system_prompt && match.default_prompt) {
           this.editingEmp.system_prompt = match.default_prompt;
         }
       }

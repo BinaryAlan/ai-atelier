@@ -83,7 +83,7 @@
             <button @click.stop="toggleFavorite(s)" class="text-xs hover:scale-110" :title="s.is_favorite ? '取消收藏' : '收藏'">
               {{ s.is_favorite ? '★' : '☆' }}
             </button>
-            <button @click.stop="openEditSessionModal(s)" class="text-xs hover:scale-110" title="编辑会议（改名/目录/参会人）">✏️</button>
+            <button @click.stop="openEditSessionModal(s)" class="text-xs hover:scale-110" title="编辑会议（改名/目录/增减参会人）">✏️</button>
             <button @click.stop="deleteSessionItem(s.id)" class="text-xs hover:scale-110 text-red-500" title="删除">🗑️</button>
           </div>
         </div>
@@ -95,7 +95,7 @@
 
     <!-- 2. 中间区：会议室群聊面板 -->
     <div class="flex-1 flex flex-col bg-white border-r border-gray-200 min-w-0">
-      <!-- 房间顶部信息栏 (整合参会人员抽屉与会议设置) -->
+      <!-- 房间顶部信息栏 -->
       <div class="px-5 py-3 border-b border-gray-100 flex items-center justify-between bg-white shrink-0 relative">
         <div class="flex items-center gap-3 truncate">
           <h2 class="font-bold text-gray-900 text-base truncate">{{ currentSession?.title || '未选择会议' }}</h2>
@@ -111,26 +111,36 @@
         </div>
 
         <div class="flex items-center gap-3 shrink-0">
-          <!-- 优雅的参会成员下拉选择器 (即使有20个员工也不挤爆顶部) -->
+          <!-- 参会人员下拉选择器 (显示主持人且不可踢) -->
           <div class="relative">
             <button 
               @click="showMemberDropdown = !showMemberDropdown"
               class="px-2.5 py-1 text-xs rounded-lg border border-gray-200 bg-gray-50 hover:bg-gray-100 text-gray-700 flex items-center gap-1.5 transition"
             >
               <span>👥</span>
-              <span>参会成员 ({{ currentSession?.employee_ids?.length || 0 }}/{{ availableEmployees.length }})</span>
+              <span>参会成员 ({{ totalParticipantsCount }}人)</span>
               <span class="text-[10px] text-gray-400">▾</span>
             </button>
 
             <!-- 参会人员下拉选择浮层 -->
             <div 
               v-if="showMemberDropdown" 
-              class="absolute right-0 top-full mt-1.5 w-60 bg-white border border-gray-200 rounded-xl shadow-lg z-30 p-2.5 space-y-1 text-xs"
+              class="absolute right-0 top-full mt-1.5 w-64 bg-white border border-gray-200 rounded-xl shadow-lg z-30 p-2.5 space-y-1 text-xs"
             >
               <div class="font-semibold text-gray-500 pb-1 border-b border-gray-100 flex items-center justify-between">
-                <span>参会员工选择</span>
+                <span>参会人员列表</span>
                 <button @click="showMemberDropdown = false" class="text-gray-400 hover:text-gray-600">✕</button>
               </div>
+
+              <!-- 主持人 (始终在席，不可踢) -->
+              <div class="flex items-center gap-2 p-1.5 rounded bg-amber-50/80 border border-amber-200/70 mb-1 cursor-default">
+                <input type="checkbox" checked disabled class="rounded text-amber-600 h-3.5 w-3.5 opacity-60">
+                <span class="text-sm">{{ settings.moderator?.avatar || '👑' }}</span>
+                <span class="font-bold text-amber-950 truncate">{{ settings.moderator?.name }}</span>
+                <span class="text-[10px] bg-amber-200 text-amber-900 px-1 rounded font-bold ml-auto shrink-0">主持人 · 必选</span>
+              </div>
+
+              <!-- 其他员工 (可勾选/踢出) -->
               <div class="max-h-48 overflow-y-auto space-y-1 pt-1">
                 <label 
                   v-for="emp in availableEmployees" 
@@ -144,7 +154,7 @@
                     @change="saveSessionEmployees"
                     class="rounded text-blue-600 h-3.5 w-3.5"
                   >
-                  <span>{{ emp.avatar || '🤖' }}</span>
+                  <span class="text-sm">{{ emp.avatar || '🤖' }}</span>
                   <span class="truncate font-medium text-gray-700">{{ emp.name }}</span>
                 </label>
               </div>
@@ -207,7 +217,6 @@
             <div v-if="msg.sender !== 'system'" class="flex items-center justify-between gap-3 mb-1 text-xs opacity-80">
               <div class="flex items-center gap-1.5">
                 <span class="font-semibold">{{ msg.sender_name }}</span>
-                <!-- 主持人专属标识 -->
                 <span v-if="isModerator(msg.sender)" class="px-1.5 py-0.2 rounded bg-amber-200 text-amber-900 font-bold text-[10px] flex items-center gap-0.5">
                   👑 主持人
                 </span>
@@ -220,7 +229,6 @@
                 <span v-else-if="msg.verdict === 'ACCEPT'" class="px-1.5 py-0.2 rounded bg-emerald-100 text-emerald-700 font-bold text-[10px]">ACCEPT 验收</span>
                 <span v-if="msg.elapsed_time > 0" class="text-[11px] opacity-75">⏱️ {{ msg.elapsed_time }}s</span>
 
-                <!-- ℹ️ 审查按钮：查看 Prompt 与原始回复 -->
                 <button 
                   v-if="msg.sender !== 'user'" 
                   @click.stop="openInspectModal(msg)" 
@@ -246,7 +254,7 @@
 
       <!-- 底部输入栏 -->
       <div class="p-4 border-t border-gray-200 bg-white shrink-0">
-        <!-- 快捷 @ 菜单 (水平滚动条，不挤爆垂直空间) -->
+        <!-- 快捷 @ 菜单 -->
         <div class="flex items-center gap-1.5 mb-2 overflow-x-auto pb-1">
           <span class="text-xs text-gray-400 shrink-0">快捷@:</span>
           <button 
@@ -272,14 +280,14 @@
           </button>
         </div>
 
-        <!-- 文本输入框 (支持 Backspace 一键整删 @ 标签) -->
+        <!-- 文本输入框 (Backspace 整删 @ 标签) -->
         <div class="flex gap-2">
           <textarea 
             ref="chatInput"
             v-model="inputContent" 
             @keydown="onInputKeydown"
             rows="2"
-            placeholder="输入议题、补充要求或指令... (Enter 发送)" 
+            placeholder="输入议题、提问、补充要求或指令... (Enter 发送)" 
             class="flex-1 border border-gray-300 rounded-lg p-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 resize-none"
           ></textarea>
           <button 
@@ -378,52 +386,55 @@
             >
           </div>
 
+          <!-- 本地工作目录 (支持小窗口选择) -->
           <div>
             <label class="block text-xs font-semibold text-gray-600 mb-1">本地工作目录 (读取资料与交付物路径):</label>
-            <input 
-              type="text" 
-              v-model="newSessionForm.workspace_dir" 
-              placeholder="/Users/lc/Documents/my-project"
-              class="w-full border border-gray-300 rounded-lg px-3 py-2 text-xs font-mono focus:outline-none focus:ring-2 focus:ring-blue-500"
-            >
-          </div>
-
-          <!-- 主持人展示 -->
-          <div class="p-3 rounded-xl bg-amber-50/60 border border-amber-200/80 flex items-center justify-between">
-            <div class="flex items-center gap-2.5">
-              <span class="text-2xl">{{ settings.moderator?.avatar || '👑' }}</span>
-              <div>
-                <div class="font-bold text-xs text-amber-950 flex items-center gap-1">
-                  <span>{{ settings.moderator?.name }}</span>
-                  <span class="px-1.5 py-0.2 bg-amber-200 text-amber-900 text-[10px] rounded font-bold">主持人</span>
-                </div>
-                <div class="text-[11px] text-amber-800/80">{{ settings.moderator?.title }}</div>
-              </div>
-            </div>
-            <span class="text-xs text-amber-700 font-medium">主持讨论并整理终稿</span>
-          </div>
-
-          <!-- 参会打工仔选择 -->
-          <div>
-            <label class="block text-xs font-semibold text-gray-600 mb-1.5">勾选参会人员角色:</label>
-            <div class="grid grid-cols-2 gap-2 max-h-48 overflow-y-auto">
-              <label 
-                v-for="emp in availableEmployees" 
-                :key="emp.id"
-                class="flex items-center gap-2 p-2 rounded-lg border border-gray-200 cursor-pointer hover:bg-gray-50 text-xs"
+            <div class="flex gap-2">
+              <input 
+                type="text" 
+                v-model="newSessionForm.workspace_dir" 
+                placeholder="/Users/lc/Documents/my-project"
+                class="flex-1 border border-gray-300 rounded-lg px-3 py-2 text-xs font-mono focus:outline-none focus:ring-2 focus:ring-blue-500"
               >
-                <input 
-                  type="checkbox" 
-                  :value="emp.id" 
-                  v-model="newSessionForm.employee_ids"
-                  class="rounded text-blue-600 h-4 w-4"
+              <button 
+                type="button" 
+                @click="openFolderPicker('newSessionForm')" 
+                class="px-3 py-2 bg-gray-100 hover:bg-gray-200 border border-gray-300 rounded-lg text-xs font-medium text-gray-700 transition shrink-0 flex items-center gap-1"
+              >
+                📁 浏览...
+              </button>
+            </div>
+          </div>
+
+          <!-- 参会人员名单 (显示主持人但不可踢) -->
+          <div>
+            <label class="block text-xs font-semibold text-gray-600 mb-1.5">参会人员名单:</label>
+            <div class="space-y-1.5 max-h-48 overflow-y-auto">
+              <!-- 主持人 (必选且不可踢) -->
+              <div class="flex items-center gap-2 p-2 rounded-lg bg-amber-50 border border-amber-200 text-xs">
+                <input type="checkbox" checked disabled class="rounded text-amber-600 h-4 w-4 opacity-60">
+                <span class="text-base">{{ settings.moderator?.avatar || '👑' }}</span>
+                <span class="font-bold text-amber-950">{{ settings.moderator?.name }}</span>
+                <span class="text-[10px] bg-amber-200 text-amber-900 px-1 rounded font-bold ml-auto">主持人 · 必选</span>
+              </div>
+
+              <!-- 员工角色 (可多选) -->
+              <div class="grid grid-cols-2 gap-2">
+                <label 
+                  v-for="emp in availableEmployees" 
+                  :key="emp.id"
+                  class="flex items-center gap-2 p-2 rounded-lg border border-gray-200 cursor-pointer hover:bg-gray-50 text-xs"
                 >
-                <span class="text-base">{{ emp.avatar || '🤖' }}</span>
-                <div class="truncate">
+                  <input 
+                    type="checkbox" 
+                    :value="emp.id" 
+                    v-model="newSessionForm.employee_ids"
+                    class="rounded text-blue-600 h-4 w-4"
+                  >
+                  <span class="text-base">{{ emp.avatar || '🤖' }}</span>
                   <div class="font-medium text-gray-800 truncate">{{ emp.name }}</div>
-                  <div class="text-[10px] text-gray-400 truncate">{{ emp.title }}</div>
-                </div>
-              </label>
+                </label>
+              </div>
             </div>
           </div>
         </div>
@@ -435,7 +446,7 @@
       </div>
     </div>
 
-    <!-- 5. 编辑会议信息 Modal (支持修改标题、工作目录、参会人) -->
+    <!-- 5. 编辑会议信息 Modal (标题、工作目录弹窗选择、参会人) -->
     <div v-if="showEditSessionModal" class="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
       <div class="bg-white rounded-2xl shadow-xl w-full max-w-lg overflow-hidden flex flex-col">
         <div class="p-4 border-b border-gray-100 flex items-center justify-between">
@@ -457,33 +468,50 @@
 
           <div>
             <label class="block text-xs font-semibold text-gray-600 mb-1">本地工作目录 (读取资料与交付物路径):</label>
-            <input 
-              type="text" 
-              v-model="editingSessionForm.workspace_dir" 
-              class="w-full border border-gray-300 rounded-lg px-3 py-2 text-xs font-mono focus:outline-none focus:ring-2 focus:ring-blue-500"
-            >
+            <div class="flex gap-2">
+              <input 
+                type="text" 
+                v-model="editingSessionForm.workspace_dir" 
+                class="flex-1 border border-gray-300 rounded-lg px-3 py-2 text-xs font-mono focus:outline-none focus:ring-2 focus:ring-blue-500"
+              >
+              <button 
+                type="button" 
+                @click="openFolderPicker('editingSessionForm')" 
+                class="px-3 py-2 bg-gray-100 hover:bg-gray-200 border border-gray-300 rounded-lg text-xs font-medium text-gray-700 transition shrink-0 flex items-center gap-1"
+              >
+                📁 浏览...
+              </button>
+            </div>
           </div>
 
           <div>
             <label class="block text-xs font-semibold text-gray-600 mb-1.5">参会人员名单 (勾选或踢掉):</label>
-            <div class="grid grid-cols-2 gap-2 max-h-48 overflow-y-auto">
-              <label 
-                v-for="emp in availableEmployees" 
-                :key="emp.id"
-                class="flex items-center gap-2 p-2 rounded-lg border border-gray-200 cursor-pointer hover:bg-gray-50 text-xs"
-              >
-                <input 
-                  type="checkbox" 
-                  :value="emp.id" 
-                  v-model="editingSessionForm.employee_ids"
-                  class="rounded text-blue-600 h-4 w-4"
+            <div class="space-y-1.5 max-h-48 overflow-y-auto">
+              <!-- 主持人 (必选且不可踢) -->
+              <div class="flex items-center gap-2 p-2 rounded-lg bg-amber-50 border border-amber-200 text-xs">
+                <input type="checkbox" checked disabled class="rounded text-amber-600 h-4 w-4 opacity-60">
+                <span class="text-base">{{ settings.moderator?.avatar || '👑' }}</span>
+                <span class="font-bold text-amber-950">{{ settings.moderator?.name }}</span>
+                <span class="text-[10px] bg-amber-200 text-amber-900 px-1 rounded font-bold ml-auto">主持人 · 必选</span>
+              </div>
+
+              <!-- 其他员工 -->
+              <div class="grid grid-cols-2 gap-2">
+                <label 
+                  v-for="emp in availableEmployees" 
+                  :key="emp.id"
+                  class="flex items-center gap-2 p-2 rounded-lg border border-gray-200 cursor-pointer hover:bg-gray-50 text-xs"
                 >
-                <span class="text-base">{{ emp.avatar || '🤖' }}</span>
-                <div class="truncate">
+                  <input 
+                    type="checkbox" 
+                    :value="emp.id" 
+                    v-model="editingSessionForm.employee_ids"
+                    class="rounded text-blue-600 h-4 w-4"
+                  >
+                  <span class="text-base">{{ emp.avatar || '🤖' }}</span>
                   <div class="font-medium text-gray-800 truncate">{{ emp.name }}</div>
-                  <div class="text-[10px] text-gray-400 truncate">{{ emp.title }}</div>
-                </div>
-              </label>
+                </label>
+              </div>
             </div>
           </div>
         </div>
@@ -495,7 +523,64 @@
       </div>
     </div>
 
-    <!-- 6. 员工与主持人配置设置 Modal -->
+    <!-- 6. 文件夹选择弹窗 Modal (点击小窗选择本地目录) -->
+    <div v-if="showFolderPickerModal" class="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
+      <div class="bg-white rounded-2xl shadow-xl w-full max-w-lg max-h-[80vh] flex flex-col overflow-hidden">
+        <div class="p-4 border-b border-gray-100 flex items-center justify-between">
+          <h3 class="font-bold text-gray-900 text-sm flex items-center gap-1.5">
+            <span>📁</span> 选择本地工作目录
+          </h3>
+          <button @click="showFolderPickerModal = false" class="text-gray-400 hover:text-gray-600 text-xl font-bold">×</button>
+        </div>
+
+        <!-- 路径面包屑与快捷跳转 -->
+        <div class="px-4 py-2.5 bg-gray-50 border-b border-gray-100 space-y-2 text-xs">
+          <div class="flex items-center gap-1.5">
+            <span class="text-gray-400">当前路径:</span>
+            <span class="font-mono font-medium text-gray-800 truncate">{{ folderPickerPath }}</span>
+          </div>
+          <div class="flex items-center gap-1.5 flex-wrap">
+            <button v-if="folderPickerParent" @click="browseFolder(folderPickerParent)" class="px-2 py-0.5 bg-white border border-gray-200 rounded hover:bg-gray-100 text-gray-700">
+              ⬆️ 返回上一级
+            </button>
+            <button @click="browseFolder('~')" class="px-2 py-0.5 bg-white border border-gray-200 rounded hover:bg-gray-100 text-gray-700">
+              🏠 家目录 (~)
+            </button>
+            <button @click="browseFolder('~/Documents')" class="px-2 py-0.5 bg-white border border-gray-200 rounded hover:bg-gray-100 text-gray-700">
+              📄 Documents
+            </button>
+            <button @click="browseFolder('~/Code')" class="px-2 py-0.5 bg-white border border-gray-200 rounded hover:bg-gray-100 text-gray-700">
+              💻 Code
+            </button>
+          </div>
+        </div>
+
+        <!-- 子文件夹列表 -->
+        <div class="p-3 overflow-y-auto flex-1 space-y-1 divide-y divide-gray-50 text-xs">
+          <div 
+            v-for="d in folderPickerDirs" 
+            :key="d.path"
+            @click="browseFolder(d.path)"
+            class="flex items-center gap-2 p-2 rounded-lg hover:bg-blue-50 cursor-pointer transition text-gray-700 hover:text-blue-700"
+          >
+            <span class="text-base">📁</span>
+            <span class="truncate font-medium">{{ d.name }}</span>
+            <span class="ml-auto text-gray-400 text-[10px]">进入 ➔</span>
+          </div>
+          <div v-if="folderPickerDirs.length === 0" class="text-xs text-gray-400 text-center py-8">该目录下无可见子文件夹</div>
+        </div>
+
+        <!-- 确认选择按钮 -->
+        <div class="p-3 border-t border-gray-100 bg-gray-50 flex items-center justify-between">
+          <span class="text-xs text-gray-500 truncate mr-2">将选定: {{ folderPickerPath }}</span>
+          <button @click="confirmSelectFolder" class="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white text-xs font-medium rounded-lg shadow-sm shrink-0">
+            ✅ 选定当前目录
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 7. 员工与主持人配置设置 Modal -->
     <div v-if="showSettingsModal" class="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
       <div class="bg-white rounded-2xl shadow-xl w-full max-w-xl max-h-[90vh] flex flex-col overflow-hidden">
         <div class="p-4 border-b border-gray-100 flex items-center justify-between">
@@ -506,7 +591,7 @@
         </div>
 
         <div class="p-5 overflow-y-auto flex-1 space-y-6">
-          <!-- 区块 1: 单独的主持人配置 -->
+          <!-- 区块 1: 主持人配置 (纯粹主持人，无额外兼职) -->
           <div>
             <div class="flex items-center justify-between mb-2">
               <div class="flex items-center gap-1.5">
@@ -525,14 +610,13 @@
                 </div>
                 <div class="truncate">
                   <div class="font-bold text-sm text-gray-900 truncate">{{ settings.moderator?.name }}</div>
-                  <div class="text-xs text-amber-800 font-medium truncate">{{ settings.moderator?.title }}</div>
                   <div class="text-[11px] text-gray-500 truncate font-mono mt-0.5">{{ settings.moderator?.cli_cmd }}</div>
                 </div>
               </div>
             </div>
           </div>
 
-          <!-- 区块 2: 参会员工角色列表 -->
+          <!-- 区块 2: 参会员工角色列表 (已删除职能信息框) -->
           <div>
             <div class="flex items-center justify-between mb-1.5">
               <div>
@@ -556,7 +640,7 @@
                   </div>
                   <div class="truncate">
                     <div class="font-bold text-sm text-gray-900 truncate">{{ emp.name }}</div>
-                    <div class="text-xs text-gray-500 truncate">{{ emp.title || '参会专家' }}</div>
+                    <div class="text-[11px] text-gray-400 truncate font-mono">{{ emp.cli_cmd }}</div>
                   </div>
                 </div>
 
@@ -581,7 +665,7 @@
       </div>
     </div>
 
-    <!-- 7. 添加/编辑 员工或主持人 子弹窗 Modal -->
+    <!-- 8. 添加/编辑 员工或主持人 子弹窗 (已彻底删除“职能信息”输入框) -->
     <div v-if="showEmpEditModal" class="fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4">
       <div class="bg-white rounded-2xl shadow-2xl w-full max-w-lg overflow-hidden flex flex-col">
         <div class="p-4 border-b border-gray-100 flex items-center justify-between">
@@ -592,6 +676,7 @@
         </div>
 
         <div class="p-5 space-y-4 text-xs">
+          <!-- 模型选择 -->
           <div>
             <div class="flex items-center justify-between mb-1">
               <label class="font-semibold text-gray-600">选择本地已安装的 AI 模型:</label>
@@ -604,24 +689,20 @@
               @change="onModelSelectChanged"
               class="w-full border border-gray-300 rounded-lg px-2.5 py-2 text-xs bg-white focus:outline-none focus:ring-2 focus:ring-blue-500 font-mono"
             >
-              <option value="">-- 请选择或绑定模型 --</option>
+              <option value="">-- 请选择绑定模型 --</option>
               <option v-for="m in scannedModels" :key="m.model_id" :value="m.model_id">
                 [{{ m.cli }}] {{ m.display_name }}
               </option>
             </select>
           </div>
 
-          <div class="grid grid-cols-2 gap-3">
-            <div>
-              <label class="block font-semibold text-gray-600 mb-1">角色姓名:</label>
-              <input type="text" v-model="editingEmp.name" placeholder="例如: 混元-4" class="w-full border border-gray-300 rounded-lg px-2.5 py-1.5 text-xs">
-            </div>
-            <div>
-              <label class="block font-semibold text-gray-600 mb-1">职能头衔:</label>
-              <input type="text" v-model="editingEmp.title" placeholder="例如: 落地效能顾问" class="w-full border border-gray-300 rounded-lg px-2.5 py-1.5 text-xs">
-            </div>
+          <!-- 角色姓名 (仅姓名，无多余职能框) -->
+          <div>
+            <label class="block font-semibold text-gray-600 mb-1">角色姓名:</label>
+            <input type="text" v-model="editingEmp.name" placeholder="例如: agy 或 混元-4" class="w-full border border-gray-300 rounded-lg px-2.5 py-1.5 text-xs">
           </div>
 
+          <!-- 内置头像选择 -->
           <div>
             <label class="block font-semibold text-gray-600 mb-1">内置头像选择:</label>
             <div class="flex flex-wrap gap-2">
@@ -637,16 +718,18 @@
             </div>
           </div>
 
+          <!-- 预置人设 Prompt (选填) -->
           <div>
-            <label class="block font-semibold text-gray-600 mb-1">预置人设 Prompt (选填):</label>
+            <label class="block font-semibold text-gray-600 mb-1">预置人设 Prompt (选填，留空则为纯净通用 AI):</label>
             <textarea 
               v-model="editingEmp.system_prompt" 
               rows="3" 
-              placeholder="选填。留空则为通用 AI 模型；填写则具备特定专业偏好..."
+              placeholder="选填。留空则直接使用模型的出厂通用语气；填写则具备特定立场或风格偏好..."
               class="w-full border border-gray-300 rounded-lg p-2 text-xs"
             ></textarea>
           </div>
 
+          <!-- CLI 执行模板 (自动生成) -->
           <div>
             <label class="block font-semibold text-gray-500 mb-1">CLI 执行模板 (自动生成，保留 {prompt}):</label>
             <input type="text" v-model="editingEmp.cli_cmd" class="w-full border border-gray-200 bg-gray-50 rounded px-2 py-1 text-[11px] font-mono text-gray-600">
@@ -660,7 +743,7 @@
       </div>
     </div>
 
-    <!-- 8. 消息审查与 Prompt 详情弹窗 (ℹ️ 点击打开) -->
+    <!-- 9. 消息审查与 Prompt 详情弹窗 (ℹ️ 点击打开) -->
     <div v-if="showInspectModal" class="fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4">
       <div class="bg-white rounded-2xl shadow-2xl w-full max-w-2xl max-h-[85vh] flex flex-col overflow-hidden">
         <div class="p-4 border-b border-gray-100 flex items-center justify-between">

@@ -1,37 +1,45 @@
 {
   "moderator": {
     "id": "moderator",
-    "name": "Antigravity (首席主持)",
-    "title": "会议主持人兼总架构师",
+    "name": "Antigravity",
     "avatar": "👑",
     "avatar_color": "#d97706",
     "type": "cli",
     "cli_cmd": "agy -p \"{prompt}\"",
-    "system_prompt": "你是会议主持人兼全局首席架构师。注重工程规范、模块解耦与长远扩展性。负责客观综合各方意见生成架构草案、协调分歧并在结案时输出权威定稿。",
+    "system_prompt": "你是会议主持人。负责中立客观地主持会议进程、梳理记录各方发言要点、综合整理方案纪要，并在全员达成共识时出具定稿报告。",
     "timeout": 180
   },
   "employees": [
     {
+      "id": "emp_agy",
+      "name": "agy",
+      "avatar": "🦉",
+      "avatar_color": "#2563eb",
+      "type": "cli",
+      "cli_cmd": "agy -p \"{prompt}\"",
+      "system_prompt": "",
+      "enabled": true,
+      "timeout": 180
+    },
+    {
       "id": "codebuddy-ds4",
       "name": "DeepSeek-V4 (DS4)",
-      "title": "系统架构与性能专家",
       "avatar": "🧠",
       "avatar_color": "#9333ea",
       "type": "cli",
       "cli_cmd": "codebuddy --model deepseek-v4-pro --tools \"\" -p \"{prompt}\"",
-      "system_prompt": "你是底层系统与性能架构专家。关注算法效率、高并发死锁、内存隐患与边界防御，以严谨客观的态度提出建设性意见，直击要点，不讲套话。",
+      "system_prompt": "擅长深度逻辑推演、推演潜在隐患与方案边界风险，以客观严谨的态度提出建设性意见。",
       "enabled": true,
       "timeout": 180
     },
     {
       "id": "codebuddy-hy4",
       "name": "混元-4 (HY4)",
-      "title": "业务落地与工程效能专家",
       "avatar": "⚡",
       "avatar_color": "#059669",
       "type": "cli",
       "cli_cmd": "codebuddy --model hy4std --tools \"\" -p \"{prompt}\"",
-      "system_prompt": "你是业务落地与工程效能顾问。注重研发周期、团队维护成本、架构平滑演进与实际可行性，提供稳健务实的技术方案与建议。",
+      "system_prompt": "注重实际落地执行可行性、周期效率与实操适配度，提供稳健务实的路径建议。",
       "enabled": true,
       "timeout": 120
     }

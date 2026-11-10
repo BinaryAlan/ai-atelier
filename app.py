@@ -141,7 +141,37 @@ def api_delete_session(session_id):
     success = delete_session(session_id)
     return jsonify({"success": success})
 
-# ----------------- Workspace Explorer API -----------------
+# ----------------- Workspace Explorer & Folder Picker API -----------------
+@app.route("/api/browse_dirs", methods=["GET"])
+def api_browse_dirs():
+    """本地文件夹浏览选择器: 供前端弹窗点击点选目录"""
+    target = request.args.get("path", "").strip()
+    if not target:
+        target = os.path.expanduser("~")
+    target = os.path.abspath(os.path.expanduser(target))
+    if not os.path.exists(target) or not os.path.isdir(target):
+        target = os.path.expanduser("~")
+
+    dirs = []
+    try:
+        for entry in os.scandir(target):
+            if entry.name.startswith(".") or entry.name in ["Library", "node_modules", ".git", "__pycache__", "venv"]:
+                continue
+            if entry.is_dir():
+                dirs.append({
+                    "name": entry.name,
+                    "path": entry.path
+                })
+        dirs.sort(key=lambda x: x["name"].lower())
+        parent = os.path.dirname(target) if target != "/" else None
+        return jsonify({
+            "current": target,
+            "parent": parent,
+            "dirs": dirs
+        })
+    except Exception as e:
+        return jsonify({"current": target, "parent": None, "dirs": [], "error": str(e)})
+
 @app.route("/api/workspace/files", methods=["GET"])
 def api_workspace_files():
     path = request.args.get("path", "").strip()

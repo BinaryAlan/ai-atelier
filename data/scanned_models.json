@@ -4,143 +4,125 @@
     "model_id": "default",
     "display_name": "Google Antigravity (Gemini)",
     "cli_cmd": "agy -p \"{prompt}\"",
-    "default_title": "全局首席架构师",
-    "default_prompt": "你是 Google Antigravity，技术评审团的全局首席架构师。注重工程规范、模块解耦、长远扩展性与高可靠性。"
+    "default_prompt": ""
   },
   {
     "cli": "codebuddy",
     "model_id": "hy4free",
     "display_name": "腾讯混元 4 (免费版 hy4free)",
     "cli_cmd": "codebuddy --model hy4free --tools \"\" -p \"{prompt}\"",
-    "default_title": "业务落地与工程效率专家",
-    "default_prompt": "你是技术评审团的业务落地与成本把控专家。注重开发周期、团队维护成本、中文业务适配度与工程可行性。"
+    "default_prompt": ""
   },
   {
     "cli": "codebuddy",
     "model_id": "hy4std",
     "display_name": "腾讯混元 4 (标准版 hy4std)",
     "cli_cmd": "codebuddy --model hy4std --tools \"\" -p \"{prompt}\"",
-    "default_title": "业务落地与工程效率专家",
-    "default_prompt": "你是技术评审团的业务落地与成本把控专家。注重开发周期、团队维护成本、中文业务适配度与工程可行性。"
+    "default_prompt": ""
   },
   {
     "cli": "codebuddy",
     "model_id": "hy3",
     "display_name": "腾讯混元 3 (hy3)",
     "cli_cmd": "codebuddy --model hy3 --tools \"\" -p \"{prompt}\"",
-    "default_title": "业务落地与工程效率专家",
-    "default_prompt": "你是技术评审团的业务落地与成本把控专家。注重开发周期、团队维护成本、中文业务适配度与工程可行性。"
+    "default_prompt": ""
   },
   {
     "cli": "codebuddy",
     "model_id": "hy3-x",
     "display_name": "腾讯混元 3-X (hy3-x)",
     "cli_cmd": "codebuddy --model hy3-x --tools \"\" -p \"{prompt}\"",
-    "default_title": "业务落地与工程效率专家",
-    "default_prompt": "你是技术评审团的业务落地与成本把控专家。注重开发周期、团队维护成本、中文业务适配度与工程可行性。"
+    "default_prompt": ""
   },
   {
     "cli": "codebuddy",
     "model_id": "deepseek-v4.1-flash",
     "display_name": "DeepSeek V4.1 Flash (快速版)",
     "cli_cmd": "codebuddy --model deepseek-v4.1-flash --tools \"\" -p \"{prompt}\"",
-    "default_title": "底层算法与代码挑刺官",
-    "default_prompt": "你是技术评审团的代码与性能挑刺官。敏锐寻找高并发死锁、内存隐患、边界漏洞与安全陷阱，严禁客套。"
+    "default_prompt": ""
   },
   {
     "cli": "codebuddy",
     "model_id": "glm-5.3",
     "display_name": "智谱 GLM 5.3",
     "cli_cmd": "codebuddy --model glm-5.3 --tools \"\" -p \"{prompt}\"",
-    "default_title": "AI 工程师",
-    "default_prompt": "你是基于 glm-5.3 模型的技术专家，具备扎实的工程实现与逻辑分析能力。"
+    "default_prompt": ""
   },
   {
     "cli": "codebuddy",
     "model_id": "glm-5.3-flash",
     "display_name": "智谱 GLM 5.3 Flash",
     "cli_cmd": "codebuddy --model glm-5.3-flash --tools \"\" -p \"{prompt}\"",
-    "default_title": "AI 工程师",
-    "default_prompt": "你是基于 glm-5.3-flash 模型的技术专家，具备扎实的工程实现与逻辑分析能力。"
+    "default_prompt": ""
   },
   {
     "cli": "codebuddy",
     "model_id": "glm-5.2",
     "display_name": "智谱 GLM 5.2",
     "cli_cmd": "codebuddy --model glm-5.2 --tools \"\" -p \"{prompt}\"",
-    "default_title": "AI 工程师",
-    "default_prompt": "你是基于 glm-5.2 模型的技术专家，具备扎实的工程实现与逻辑分析能力。"
+    "default_prompt": ""
   },
   {
     "cli": "codebuddy",
     "model_id": "space-bunny",
     "display_name": "Space Bunny",
     "cli_cmd": "codebuddy --model space-bunny --tools \"\" -p \"{prompt}\"",
-    "default_title": "AI 工程师",
-    "default_prompt": "你是基于 space-bunny 模型的技术专家，具备扎实的工程实现与逻辑分析能力。"
+    "default_prompt": ""
   },
   {
     "cli": "codebuddy",
     "model_id": "minimax-m3.1-flash",
     "display_name": "MiniMax M3.1 Flash",
     "cli_cmd": "codebuddy --model minimax-m3.1-flash --tools \"\" -p \"{prompt}\"",
-    "default_title": "AI 工程师",
-    "default_prompt": "你是基于 minimax-m3.1-flash 模型的技术专家，具备扎实的工程实现与逻辑分析能力。"
+    "default_prompt": ""
   },
   {
     "cli": "codebuddy",
     "model_id": "minimax-m2.7",
     "display_name": "MiniMax M2.7",
     "cli_cmd": "codebuddy --model minimax-m2.7 --tools \"\" -p \"{prompt}\"",
-    "default_title": "AI 工程师",
-    "default_prompt": "你是基于 minimax-m2.7 模型的技术专家，具备扎实的工程实现与逻辑分析能力。"
+    "default_prompt": ""
   },
   {
     "cli": "codebuddy",
     "model_id": "kimi-k3.1-pro",
     "display_name": "月之暗面 Kimi K3.1 Pro",
     "cli_cmd": "codebuddy --model kimi-k3.1-pro --tools \"\" -p \"{prompt}\"",
-    "default_title": "长文档与上下文分析专家",
-    "default_prompt": "你是长文档与海量上下文技术专家，善于梳理复杂架构规范与详细边界条件。"
+    "default_prompt": ""
   },
   {
     "cli": "codebuddy",
     "model_id": "kimi-k3-1",
     "display_name": "月之暗面 Kimi K3.1",
     "cli_cmd": "codebuddy --model kimi-k3-1 --tools \"\" -p \"{prompt}\"",
-    "default_title": "长文档与上下文分析专家",
-    "default_prompt": "你是长文档与海量上下文技术专家，善于梳理复杂架构规范与详细边界条件。"
+    "default_prompt": ""
   },
   {
     "cli": "codebuddy",
     "model_id": "kimi-k2.8-preview",
     "display_name": "月之暗面 Kimi K2.8 Preview",
     "cli_cmd": "codebuddy --model kimi-k2.8-preview --tools \"\" -p \"{prompt}\"",
-    "default_title": "长文档与上下文分析专家",
-    "default_prompt": "你是长文档与海量上下文技术专家，善于梳理复杂架构规范与详细边界条件。"
+    "default_prompt": ""
   },
   {
     "cli": "codebuddy",
     "model_id": "deepseek-v4-pro",
     "display_name": "DeepSeek V4 Pro (深度推理)",
     "cli_cmd": "codebuddy --model deepseek-v4-pro --tools \"\" -p \"{prompt}\"",
-    "default_title": "底层算法与代码挑刺官",
-    "default_prompt": "你是技术评审团的代码与性能挑刺官。敏锐寻找高并发死锁、内存隐患、边界漏洞与安全陷阱，严禁客套。"
+    "default_prompt": ""
   },
   {
     "cli": "codebuddy",
     "model_id": "step-5-preview",
     "display_name": "阶跃星辰 Step 5 Preview",
     "cli_cmd": "codebuddy --model step-5-preview --tools \"\" -p \"{prompt}\"",
-    "default_title": "AI 工程师",
-    "default_prompt": "你是基于 step-5-preview 模型的技术专家，具备扎实的工程实现与逻辑分析能力。"
+    "default_prompt": ""
   },
   {
     "cli": "codebuddy",
     "model_id": "mimo-v2.6-pro",
     "display_name": "Mimo V2.6 Pro",
     "cli_cmd": "codebuddy --model mimo-v2.6-pro --tools \"\" -p \"{prompt}\"",
-    "default_title": "AI 工程师",
-    "default_prompt": "你是基于 mimo-v2.6-pro 模型的技术专家，具备扎实的工程实现与逻辑分析能力。"
+    "default_prompt": ""
   }
 ]

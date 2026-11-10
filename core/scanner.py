@@ -48,8 +48,7 @@ def scan_local_models(force_refresh: bool = False) -> List[Dict[str, Any]]:
             "model_id": "default",
             "display_name": "Google Antigravity (Gemini)",
             "cli_cmd": 'agy -p "{prompt}"',
-            "default_title": "综合规划顾问",
-            "default_prompt": "注重全局规划、系统化思考与规范性，以客观理性的态度提供综合建议。"
+            "default_prompt": ""
         })
 
     # 2. CodeBuddy CLI
@@ -61,26 +60,12 @@ def scan_local_models(force_refresh: bool = False) -> List[Dict[str, Any]]:
                 raw_models = [m.strip() for m in match.group(1).split(",")]
                 for mid in raw_models:
                     display = MODEL_ALIASES.get(mid, f"CodeBuddy ({mid})")
-                    title = "专业顾问"
-                    prompt = f"基于 {mid} 模型，具备扎实的逻辑推演与分析能力，客观务实地提供建议。"
-
-                    if "deepseek" in mid.lower():
-                        title = "深度逻辑与风控顾问"
-                        prompt = "擅长深度逻辑推演、推演潜在隐患与方案边界风险，以客观严谨的态度提出建设性意见。"
-                    elif "hy4" in mid.lower() or "hy3" in mid.lower():
-                        title = "落地执行与效能顾问"
-                        prompt = "注重实际落地执行可行性、周期效率与实操适配度，提供稳健务实的路径建议。"
-                    elif "kimi" in mid.lower():
-                        title = "长文档与资料分析顾问"
-                        prompt = "擅长长篇资料梳理、文本规范提炼与详细条款分析。"
-
                     models.append({
                         "cli": "codebuddy",
                         "model_id": mid,
                         "display_name": display,
                         "cli_cmd": f'codebuddy --model {mid} --tools "" -p "{{prompt}}"',
-                        "default_title": title,
-                        "default_prompt": prompt
+                        "default_prompt": ""
                     })
         except Exception as e:
             print("扫描 CodeBuddy 模型异常:", e)
