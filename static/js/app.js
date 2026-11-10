@@ -12,14 +12,23 @@ createApp({
         messages: [],
         document: "",
         employee_ids: [],
-        moderator_id: "antigravity",
         workspace_dir: "",
         status: "idle",
         phase: 1,
         current_speaker: null
       },
       settings: {
-        default_moderator_id: "antigravity",
+        moderator: {
+          id: "moderator",
+          name: "Antigravity (首席主持)",
+          title: "会议主持人兼总架构师",
+          avatar: "👑",
+          avatar_color: "#d97706",
+          type: "cli",
+          cli_cmd: 'agy -p "{prompt}"',
+          system_prompt: "你是会议主持人兼全局首席架构师。负责综合立论生成草案、协调分歧并在结案时输出定稿。",
+          timeout: 180
+        },
         employees: []
       },
       inputContent: "",
@@ -33,13 +42,13 @@ createApp({
       newSessionForm: {
         title: "",
         workspace_dir: "",
-        moderator_id: "",
         employee_ids: []
       },
 
-      // 员工设置弹窗
+      // 员工与主持人配置弹窗
       showSettingsModal: false,
       showEmpEditModal: false,
+      isEditingModerator: false,
       isEditingEmployee: false,
       editingEmpIdx: -1,
       selectedModelId: "",
@@ -53,13 +62,14 @@ createApp({
         type: "cli",
         cli_cmd: "",
         system_prompt: "",
-        enabled: true
+        enabled: true,
+        timeout: 180
       },
       presetAvatars: ["🤖", "🧠", "⚡", "🦉", "🛡️", "🚀", "💻", "🔬", "🎯", "🎨", "👑", "🕵️", "🔧", "💡", "⚖️", "📊"],
 
       // 消息审查详情弹窗
       showInspectModal: false,
-      inspectTab: "prompt", // 'prompt' | 'response'
+      inspectTab: "prompt",
       inspectingMsg: null,
 
       pollInterval: null
@@ -76,7 +86,7 @@ createApp({
       return this.sessions;
     },
     availableEmployees() {
-      return this.settings.employees.filter(e => e.enabled);
+      return (this.settings.employees || []).filter(e => e.enabled);
     },
     renderedDoc() {
       const doc = this.currentSession?.document || "*(暂无方案文档)*";
@@ -146,7 +156,6 @@ createApp({
       this.newSessionForm = {
         title: "",
         workspace_dir: defaultDir,
-        moderator_id: this.settings.default_moderator_id || (this.availableEmployees[0]?.id || "antigravity"),
         employee_ids: this.availableEmployees.map(e => e.id)
       };
       this.showNewSessionModal = true;
@@ -161,7 +170,6 @@ createApp({
           body: JSON.stringify({
             title: title,
             workspace_dir: this.newSessionForm.workspace_dir.trim(),
-            moderator_id: this.newSessionForm.moderator_id,
             employee_ids: this.newSessionForm.employee_ids
           })
         });
@@ -227,6 +235,7 @@ createApp({
       }
     },
 
+    // ----------------- 拉起和踢掉参会员工 (基于唯一 id) -----------------
     async saveSessionEmployees() {
       if (!this.currentSessionId) return;
       try {
@@ -311,15 +320,21 @@ createApp({
       this.inputContent = (this.inputContent ? this.inputContent + " " : "") + `@${name} `;
     },
 
+    isModerator(senderId) {
+      return senderId === "moderator" || senderId === this.settings.moderator?.id;
+    },
+
     getEmployeeColor(senderId) {
       if (senderId === "system") return "#f59e0b";
-      const emp = this.settings.employees.find(e => e.id === senderId);
+      if (this.isModerator(senderId)) return this.settings.moderator?.avatar_color || "#d97706";
+      const emp = (this.settings.employees || []).find(e => e.id === senderId);
       return emp?.avatar_color || "#3b82f6";
     },
 
     getEmployeeAvatar(senderId) {
       if (senderId === "system") return "📢";
-      const emp = this.settings.employees.find(e => e.id === senderId);
+      if (this.isModerator(senderId)) return this.settings.moderator?.avatar || "👑";
+      const emp = (this.settings.employees || []).find(e => e.id === senderId);
       return emp?.avatar || "🤖";
     },
 
@@ -379,7 +394,7 @@ createApp({
       });
     },
 
-    // ----------------- 员工与模型扫描设置 -----------------
+    // ----------------- 员工与主持人配置设置 -----------------
     openSettingsModal() {
       this.showSettingsModal = true;
     },
@@ -394,12 +409,29 @@ createApp({
       }
     },
 
+    // 打开编辑主持人弹窗
+    openEditModeratorModal() {
+      this.isEditingModerator = true;
+      this.isEditingEmployee = false;
+      this.editingEmpIdx = -1;
+      this.editingEmp = JSON.parse(JSON.stringify(this.settings.moderator || {}));
+      const match = this.scannedModels.find(m => m.cli_cmd === this.editingEmp.cli_cmd);
+      this.selectedModelId = match ? match.model_id : "";
+      this.showEmpEditModal = true;
+    },
+
+    // 打开添加员工角色弹窗 (自动生成系统全局唯一唯一 ID)
     openAddEmployeeModal() {
+      this.isEditingModerator = false;
       this.isEditingEmployee = false;
       this.editingEmpIdx = -1;
       this.selectedModelId = "";
+      
+      // 生成具有高区分度且唯一的前缀 ID: emp_时间戳_随机串
+      const uniqueId = "emp_" + Date.now().toString(36) + "_" + Math.random().toString(36).substring(2, 6);
+      
       this.editingEmp = {
-        id: "emp_" + Math.random().toString(36).substring(2, 7),
+        id: uniqueId,
         name: "",
         title: "",
         avatar: "🤖",
@@ -407,12 +439,15 @@ createApp({
         type: "cli",
         cli_cmd: "",
         system_prompt: "",
-        enabled: true
+        enabled: true,
+        timeout: 180
       };
       this.showEmpEditModal = true;
     },
 
+    // 打开编辑员工角色弹窗 (保留原本不可变的唯一 ID)
     openEditEmployeeModal(emp, idx) {
+      this.isEditingModerator = false;
       this.isEditingEmployee = true;
       this.editingEmpIdx = idx;
       this.editingEmp = JSON.parse(JSON.stringify(emp));
@@ -439,7 +474,7 @@ createApp({
 
     saveEmployeeItem() {
       if (!this.editingEmp.name.trim()) {
-        alert("请输入员工姓名！");
+        alert("请输入角色姓名！");
         return;
       }
       if (!this.editingEmp.cli_cmd.trim()) {
@@ -447,18 +482,30 @@ createApp({
         return;
       }
 
-      if (this.isEditingEmployee && this.editingEmpIdx >= 0) {
-        this.settings.employees[this.editingEmpIdx] = JSON.parse(JSON.stringify(this.editingEmp));
+      if (this.isEditingModerator) {
+        // 保存主持人配置
+        this.settings.moderator = JSON.parse(JSON.stringify(this.editingEmp));
       } else {
-        this.settings.employees.push(JSON.parse(JSON.stringify(this.editingEmp)));
+        // 保存员工配置 (通过稳定唯一 ID 索引)
+        if (this.isEditingEmployee && this.editingEmpIdx >= 0) {
+          this.settings.employees[this.editingEmpIdx] = JSON.parse(JSON.stringify(this.editingEmp));
+        } else {
+          this.settings.employees.push(JSON.parse(JSON.stringify(this.editingEmp)));
+        }
       }
 
       this.showEmpEditModal = false;
     },
 
     deleteEmployee(idx) {
-      if (confirm(`确定要删除员工 [${this.settings.employees[idx].name}] 吗？`)) {
+      const targetEmp = this.settings.employees[idx];
+      if (confirm(`确定要删除员工角色 [${targetEmp.name}] 吗？`)) {
         this.settings.employees.splice(idx, 1);
+        // 如果当前会话里有该 ID，自动清理
+        if (this.currentSession?.employee_ids) {
+          this.currentSession.employee_ids = this.currentSession.employee_ids.filter(id => id !== targetEmp.id);
+          this.saveSessionEmployees();
+        }
       }
     },
 

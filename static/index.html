@@ -100,7 +100,6 @@
       <div class="px-5 py-3 border-b border-gray-100 flex items-center justify-between bg-white shrink-0">
         <div class="flex items-center gap-3 truncate">
           <h2 class="font-bold text-gray-900 text-base truncate">{{ currentSession?.title || '未选择会议' }}</h2>
-          <!-- 阶段标识 -->
           <span v-if="currentSession?.status === 'concluded'" class="px-2 py-0.5 text-xs font-semibold rounded-full bg-green-100 text-green-800 shrink-0">
             ✅ 结案定稿
           </span>
@@ -150,7 +149,6 @@
                 class="rounded text-blue-600 focus:ring-blue-500 h-3.5 w-3.5"
               >
               <span>{{ emp.name }}</span>
-              <span v-if="emp.id === currentSession.moderator_id" class="text-[10px] bg-amber-100 text-amber-800 px-1 rounded font-bold">主持人</span>
             </label>
           </div>
         </div>
@@ -159,18 +157,7 @@
         </div>
       </div>
 
-      <!-- 暂停状态警告介入提示条 -->
-      <div v-if="currentSession?.status === 'paused'" class="mx-5 mt-2 p-2.5 rounded-lg bg-amber-50 border border-amber-200 text-xs text-amber-900 flex items-center justify-between shrink-0 shadow-sm">
-        <div class="flex items-center gap-2">
-          <span class="text-base">⚠️</span>
-          <span>当前会议处于<strong>暂停挂起</strong>状态。你可以直接在下方输入指令纠偏，或点击右侧恢复讨论。</span>
-        </div>
-        <button @click="resumeMeeting" class="px-2.5 py-1 bg-amber-200 hover:bg-amber-300 text-amber-900 rounded font-semibold transition text-xs shrink-0">
-          ▶️ 恢复讨论
-        </button>
-      </div>
-
-      <!-- 聊天消息流 -->
+      <!-- 聊天消息流 (已移除顶部警告条) -->
       <div ref="chatContainer" class="flex-1 overflow-y-auto p-5 space-y-4">
         <div v-if="!currentSession?.messages?.length" class="text-center py-16 text-gray-400">
           <span class="text-4xl">💡</span>
@@ -199,7 +186,7 @@
               'max-w-[85%] rounded-2xl px-4 py-3 shadow-sm text-sm leading-relaxed border',
               msg.sender === 'user' ? 'bg-blue-600 text-white border-blue-600 rounded-tr-none' : 
               msg.sender === 'system' ? 'bg-amber-50 text-amber-900 border-amber-200 w-full text-center' :
-              msg.sender === currentSession?.moderator_id ? 'bg-amber-50/40 border-amber-200 text-gray-900 rounded-tl-none' :
+              isModerator(msg.sender) ? 'bg-amber-50/40 border-amber-200 text-gray-900 rounded-tl-none' :
               'bg-white border-gray-200 text-gray-800 rounded-tl-none'
             ]"
           >
@@ -207,8 +194,8 @@
             <div v-if="msg.sender !== 'system'" class="flex items-center justify-between gap-3 mb-1 text-xs opacity-80">
               <div class="flex items-center gap-1.5">
                 <span class="font-semibold">{{ msg.sender_name }}</span>
-                <!-- 主持人独特金色标志 -->
-                <span v-if="msg.sender === currentSession?.moderator_id" class="px-1.5 py-0.2 rounded bg-amber-200 text-amber-900 font-bold text-[10px] flex items-center gap-0.5">
+                <!-- 主持人专属金色标志 -->
+                <span v-if="isModerator(msg.sender)" class="px-1.5 py-0.2 rounded bg-amber-200 text-amber-900 font-bold text-[10px] flex items-center gap-0.5">
                   👑 主持人
                 </span>
               </div>
@@ -251,14 +238,19 @@
         <!-- 快捷 @ 菜单 -->
         <div class="flex items-center gap-1.5 mb-2 overflow-x-auto pb-1">
           <span class="text-xs text-gray-400 shrink-0">快捷@:</span>
-          <!-- @所有人 -->
           <button 
             @click="insertMention('所有人')"
             class="text-xs px-2 py-0.5 rounded bg-blue-50 text-blue-700 hover:bg-blue-100 border border-blue-200 transition font-medium shrink-0"
           >
             @所有人
           </button>
-          <!-- 各员工 -->
+          <button 
+            v-if="settings.moderator"
+            @click="insertMention(settings.moderator.name)"
+            class="text-xs px-2 py-0.5 rounded bg-amber-50 text-amber-800 hover:bg-amber-100 border border-amber-200 transition font-semibold shrink-0"
+          >
+            👑 @{{ settings.moderator.name }}
+          </button>
           <button 
             v-for="emp in availableEmployees" 
             :key="emp.id"
@@ -290,7 +282,6 @@
 
     <!-- 3. 右侧栏：两个 Tab (会议记录 vs 工作目录) -->
     <div class="w-[440px] bg-gray-50 flex flex-col shrink-0 border-l border-gray-200">
-      <!-- 顶部 Tab 切换 -->
       <div class="flex border-b border-gray-200 bg-white text-xs font-semibold text-gray-600 shrink-0">
         <button 
           @click="rightTab = 'doc'" 
@@ -306,7 +297,7 @@
         </button>
       </div>
 
-      <!-- Tab 1: 会议方案草案 (纯渲染) -->
+      <!-- Tab 1: 会议方案草案 -->
       <div v-show="rightTab === 'doc'" class="flex-1 overflow-y-auto p-4">
         <div 
           v-html="renderedDoc" 
@@ -316,7 +307,6 @@
 
       <!-- Tab 2: 工作目录文件浏览器 -->
       <div v-show="rightTab === 'workspace'" class="flex-1 flex flex-col min-h-0 bg-white">
-        <!-- 目录路径与刷新 -->
         <div class="px-4 py-2.5 bg-gray-50 border-b border-gray-200 flex items-center justify-between text-xs text-gray-500 shrink-0">
           <div class="truncate flex items-center gap-1 font-mono text-[11px]" :title="currentSession?.workspace_dir">
             <span>📂</span>
@@ -386,20 +376,24 @@
             >
           </div>
 
-          <div>
-            <label class="block text-xs font-semibold text-gray-600 mb-1">指定会议主持人:</label>
-            <select 
-              v-model="newSessionForm.moderator_id"
-              class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-blue-500"
-            >
-              <option v-for="emp in availableEmployees" :key="emp.id" :value="emp.id">
-                👑 {{ emp.name }} ({{ emp.title }})
-              </option>
-            </select>
+          <!-- 主持人展示 -->
+          <div class="p-3 rounded-xl bg-amber-50/60 border border-amber-200/80 flex items-center justify-between">
+            <div class="flex items-center gap-2.5">
+              <span class="text-2xl">{{ settings.moderator?.avatar || '👑' }}</span>
+              <div>
+                <div class="font-bold text-xs text-amber-950 flex items-center gap-1">
+                  <span>{{ settings.moderator?.name }}</span>
+                  <span class="px-1.5 py-0.2 bg-amber-200 text-amber-900 text-[10px] rounded font-bold">总架构师</span>
+                </div>
+                <div class="text-[11px] text-amber-800/80">{{ settings.moderator?.title }}</div>
+              </div>
+            </div>
+            <span class="text-xs text-amber-700 font-medium">负责综合立论与结案定稿</span>
           </div>
 
+          <!-- 参会打工仔选择 -->
           <div>
-            <label class="block text-xs font-semibold text-gray-600 mb-1.5">勾选参会 AI 成员:</label>
+            <label class="block text-xs font-semibold text-gray-600 mb-1.5">勾选参会员工角色:</label>
             <div class="grid grid-cols-2 gap-2">
               <label 
                 v-for="emp in availableEmployees" 
@@ -429,9 +423,9 @@
       </div>
     </div>
 
-    <!-- 5. 员工设置模态弹窗 -->
+    <!-- 5. 员工设置模态弹窗 (单独主持人配置 + 员工角色列表) -->
     <div v-if="showSettingsModal" class="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
-      <div class="bg-white rounded-2xl shadow-xl w-full max-w-xl max-h-[85vh] flex flex-col overflow-hidden">
+      <div class="bg-white rounded-2xl shadow-xl w-full max-w-xl max-h-[90vh] flex flex-col overflow-hidden">
         <div class="p-4 border-b border-gray-100 flex items-center justify-between">
           <h3 class="font-bold text-gray-900 text-base flex items-center gap-2">
             <span>⚙️</span> 员工与模型配置
@@ -439,46 +433,70 @@
           <button @click="showSettingsModal = false" class="text-gray-400 hover:text-gray-600 text-xl font-bold">×</button>
         </div>
 
-        <div class="px-5 py-3 bg-gray-50 border-b border-gray-100 flex items-center justify-between">
-          <div class="flex items-center gap-2 text-xs">
-            <span class="font-semibold text-gray-600">默认会议主持人:</span>
-            <select v-model="settings.default_moderator_id" class="border border-gray-300 rounded px-2 py-1 text-xs bg-white">
-              <option v-for="emp in settings.employees" :key="emp.id" :value="emp.id">
-                👑 {{ emp.name }}
-              </option>
-            </select>
-          </div>
-          <button @click="openAddEmployeeModal" class="px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white text-xs font-medium rounded-lg flex items-center gap-1 shadow-sm">
-            <span>➕</span> 添加员工
-          </button>
-        </div>
-
-        <div class="p-5 overflow-y-auto flex-1 space-y-2">
-          <div 
-            v-for="(emp, idx) in settings.employees" 
-            :key="emp.id"
-            class="flex items-center justify-between p-3 border border-gray-200 rounded-xl hover:border-gray-300 transition bg-white"
-          >
-            <div class="flex items-center gap-3 truncate">
-              <div :style="{ backgroundColor: emp.avatar_color || '#3b82f6' }" class="w-9 h-9 rounded-full flex items-center justify-center text-white text-lg shrink-0 shadow-sm">
-                {{ emp.avatar || '🤖' }}
+        <div class="p-5 overflow-y-auto flex-1 space-y-6">
+          <!-- 区块 1: 单独的主持人配置 -->
+          <div>
+            <div class="flex items-center justify-between mb-2">
+              <div class="flex items-center gap-1.5">
+                <span class="text-base">👑</span>
+                <span class="font-bold text-sm text-gray-900">会议主持人专属配置</span>
               </div>
-              <div class="truncate">
-                <div class="flex items-center gap-1.5">
-                  <span class="font-bold text-sm text-gray-900 truncate">{{ emp.name }}</span>
-                  <span v-if="emp.id === settings.default_moderator_id" class="text-[10px] bg-amber-100 text-amber-800 px-1 rounded font-bold">默认主持</span>
+              <button @click="openEditModeratorModal" class="text-xs text-blue-600 hover:underline flex items-center gap-0.5">
+                <span>✏️</span> 修改主持人模型与人设
+              </button>
+            </div>
+            
+            <div class="p-3.5 rounded-xl border border-amber-200 bg-amber-50/50 flex items-center justify-between">
+              <div class="flex items-center gap-3 truncate">
+                <div :style="{ backgroundColor: settings.moderator?.avatar_color || '#d97706' }" class="w-10 h-10 rounded-full flex items-center justify-center text-white text-xl shrink-0 shadow-sm">
+                  {{ settings.moderator?.avatar || '👑' }}
                 </div>
-                <div class="text-xs text-gray-500 truncate">{{ emp.title || 'AI 工程师' }}</div>
+                <div class="truncate">
+                  <div class="font-bold text-sm text-gray-900 truncate">{{ settings.moderator?.name }}</div>
+                  <div class="text-xs text-amber-800 font-medium truncate">{{ settings.moderator?.title }}</div>
+                  <div class="text-[11px] text-gray-500 truncate font-mono mt-0.5">{{ settings.moderator?.cli_cmd }}</div>
+                </div>
               </div>
             </div>
+          </div>
 
-            <div class="flex items-center gap-3 shrink-0">
-              <label class="flex items-center gap-1 text-xs text-gray-600 cursor-pointer">
-                <input type="checkbox" v-model="emp.enabled" class="rounded text-blue-600">
-                <span>启用</span>
-              </label>
-              <button @click="openEditEmployeeModal(emp, idx)" class="text-xs text-blue-600 hover:underline">编辑</button>
-              <button @click="deleteEmployee(idx)" class="text-xs text-red-500 hover:underline">删除</button>
+          <!-- 区块 2: 参会员工角色列表 (一个模型可设多个角色) -->
+          <div>
+            <div class="flex items-center justify-between mb-1.5">
+              <div>
+                <div class="font-bold text-sm text-gray-900">参会员工角色列表</div>
+                <div class="text-[11px] text-gray-400">支持同一底层模型创建多个不同职责人设的员工</div>
+              </div>
+              <button @click="openAddEmployeeModal" class="px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white text-xs font-medium rounded-lg flex items-center gap-1 shadow-sm">
+                <span>➕</span> 添加员工角色
+              </button>
+            </div>
+
+            <div class="space-y-2 mt-2">
+              <div 
+                v-for="(emp, idx) in settings.employees" 
+                :key="emp.id"
+                class="flex items-center justify-between p-3 border border-gray-200 rounded-xl hover:border-gray-300 transition bg-white"
+              >
+                <div class="flex items-center gap-3 truncate">
+                  <div :style="{ backgroundColor: emp.avatar_color || '#3b82f6' }" class="w-9 h-9 rounded-full flex items-center justify-center text-white text-lg shrink-0 shadow-sm">
+                    {{ emp.avatar || '🤖' }}
+                  </div>
+                  <div class="truncate">
+                    <div class="font-bold text-sm text-gray-900 truncate">{{ emp.name }}</div>
+                    <div class="text-xs text-gray-500 truncate">{{ emp.title || 'AI 工程师' }}</div>
+                  </div>
+                </div>
+
+                <div class="flex items-center gap-3 shrink-0">
+                  <label class="flex items-center gap-1 text-xs text-gray-600 cursor-pointer">
+                    <input type="checkbox" v-model="emp.enabled" class="rounded text-blue-600">
+                    <span>启用</span>
+                  </label>
+                  <button @click="openEditEmployeeModal(emp, idx)" class="text-xs text-blue-600 hover:underline">编辑</button>
+                  <button @click="deleteEmployee(idx)" class="text-xs text-red-500 hover:underline">删除</button>
+                </div>
+              </div>
             </div>
           </div>
         </div>
@@ -491,12 +509,12 @@
       </div>
     </div>
 
-    <!-- 6. 添加/编辑员工子弹窗 Modal -->
+    <!-- 6. 添加/编辑 员工或主持人 子弹窗 Modal -->
     <div v-if="showEmpEditModal" class="fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4">
       <div class="bg-white rounded-2xl shadow-2xl w-full max-w-lg overflow-hidden flex flex-col">
         <div class="p-4 border-b border-gray-100 flex items-center justify-between">
           <h4 class="font-bold text-gray-900 text-sm">
-            {{ isEditingEmployee ? '编辑员工' : '添加新员工' }}
+            {{ isEditingModerator ? '配置会议主持人' : (isEditingEmployee ? '编辑员工角色' : '添加新员工角色') }}
           </h4>
           <button @click="showEmpEditModal = false" class="text-gray-400 hover:text-gray-600 text-lg font-bold">×</button>
         </div>
@@ -523,7 +541,7 @@
 
           <div class="grid grid-cols-2 gap-3">
             <div>
-              <label class="block font-semibold text-gray-600 mb-1">员工姓名:</label>
+              <label class="block font-semibold text-gray-600 mb-1">角色姓名:</label>
               <input type="text" v-model="editingEmp.name" placeholder="例如: 混元-4" class="w-full border border-gray-300 rounded-lg px-2.5 py-1.5 text-xs">
             </div>
             <div>
@@ -583,7 +601,6 @@
           <button @click="showInspectModal = false" class="text-gray-400 hover:text-gray-600 text-lg font-bold">×</button>
         </div>
 
-        <!-- 审查选项卡: 发送的 Prompt vs 模型原始输出 -->
         <div class="flex border-b border-gray-200 bg-gray-50 text-xs font-semibold text-gray-600 shrink-0">
           <button 
             @click="inspectTab = 'prompt'" 
@@ -600,7 +617,6 @@
         </div>
 
         <div class="flex-1 overflow-y-auto p-4 bg-gray-50/50">
-          <!-- Prompt 内容 -->
           <div v-if="inspectTab === 'prompt'" class="relative">
             <button @click="copyText(inspectingMsg?.sent_prompt)" class="absolute right-2 top-2 px-2 py-1 text-[11px] bg-white border border-gray-300 rounded shadow-sm hover:bg-gray-50 transition">
               📋 复制 Prompt
@@ -608,7 +624,6 @@
             <pre class="text-xs font-mono bg-white p-4 border border-gray-200 rounded-xl whitespace-pre-wrap select-text leading-relaxed text-gray-800">{{ inspectingMsg?.sent_prompt || '(无 Prompt 记录)' }}</pre>
           </div>
 
-          <!-- 模型输出 -->
           <div v-else class="relative">
             <button @click="copyText(inspectingMsg?.raw_response || inspectingMsg?.content)" class="absolute right-2 top-2 px-2 py-1 text-[11px] bg-white border border-gray-300 rounded shadow-sm hover:bg-gray-50 transition">
               📋 复制回复

@@ -9,44 +9,44 @@ DATA_DIR = os.path.join(BASE_DIR, "data")
 SESSIONS_DIR = os.path.join(DATA_DIR, "sessions")
 SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
 
-# 确保目录存在
 os.makedirs(SESSIONS_DIR, exist_ok=True)
 
 DEFAULT_SETTINGS = {
-    "default_moderator_id": "antigravity",
+    "moderator": {
+        "id": "moderator",
+        "name": "Antigravity (首席主持)",
+        "title": "会议主持人兼总架构师",
+        "avatar": "👑",
+        "avatar_color": "#d97706",
+        "type": "cli",
+        "cli_cmd": 'agy -p "{prompt}"',
+        "system_prompt": "你是会议主持人兼全局首席架构师。注重工程规范、模块解耦、长远扩展性与高可靠性。负责综合各方立论生成方案草案、协调分歧并在结案时输出权威定稿。",
+        "timeout": 180
+    },
     "employees": [
         {
-            "id": "antigravity",
-            "name": "Antigravity",
-            "title": "全局首席架构师",
-            "avatar": "🏛️",
-            "avatar_color": "#2563eb",  # 蓝
-            "type": "cli",
-            "cli_cmd": 'agy -p "{prompt}"',
-            "system_prompt": "你是 Google Antigravity，技术评审团的全局首席架构师。注重工程规范、模块解耦、长远扩展性与高可靠性。",
-            "enabled": True
-        },
-        {
-            "id": "codebuddy-ds4",
-            "name": "DeepSeek-V4 (DS4)",
+            "id": "emp_ds4",
+            "name": "DeepSeek-V4 (代码挑刺官)",
             "title": "底层算法与代码挑刺官",
             "avatar": "🧠",
-            "avatar_color": "#9333ea",  # 紫
+            "avatar_color": "#9333ea",
             "type": "cli",
             "cli_cmd": 'codebuddy --model deepseek-v4-pro --tools "" -p "{prompt}"',
-            "system_prompt": "你是 DeepSeek V4，技术评审团的代码与性能挑刺官。敏锐寻找高并发死锁、内存隐患、边界漏洞与安全陷阱，严禁客套。",
-            "enabled": True
+            "system_prompt": "你是技术评审团的代码与性能挑刺官。敏锐寻找高并发死锁、内存隐患、边界漏洞与安全陷阱，严禁客套。",
+            "enabled": True,
+            "timeout": 180
         },
         {
-            "id": "codebuddy-hy4",
-            "name": "混元-4 (HY4)",
+            "id": "emp_hy4",
+            "name": "混元-4 (业务落地专家)",
             "title": "业务落地与工程效率专家",
             "avatar": "⚡",
-            "avatar_color": "#059669",  # 绿
+            "avatar_color": "#059669",
             "type": "cli",
             "cli_cmd": 'codebuddy --model hy4std --tools "" -p "{prompt}"',
-            "system_prompt": "你是腾讯混元4，技术评审团的业务落地与效率专家。注重开发周期、团队维护成本、中文业务适配度与工程可行性。",
-            "enabled": True
+            "system_prompt": "你是技术评审团的业务落地与效率专家。注重开发周期、团队维护成本、中文业务适配度与工程可行性。",
+            "enabled": True,
+            "timeout": 120
         }
     ]
 }
@@ -58,9 +58,10 @@ def load_settings() -> Dict[str, Any]:
     try:
         with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-            # 兼容旧版本缺少的字段
-            if "default_moderator_id" not in data:
-                data["default_moderator_id"] = "antigravity"
+            # 自动迁移旧版结构：若无单独 moderator 配置，从旧数据提取或使用默认
+            if "moderator" not in data or not isinstance(data["moderator"], dict):
+                data["moderator"] = DEFAULT_SETTINGS["moderator"]
+                save_settings(data)
             return data
     except Exception:
         return DEFAULT_SETTINGS
@@ -88,12 +89,10 @@ def list_sessions() -> List[Dict[str, Any]]:
                         "status": data.get("status", "idle"),
                         "phase": data.get("phase", 1),
                         "employee_ids": data.get("employee_ids", []),
-                        "moderator_id": data.get("moderator_id", "antigravity"),
                         "workspace_dir": data.get("workspace_dir", "")
                     })
             except Exception:
                 continue
-    # 收藏置顶，其次按更新时间倒序
     sessions.sort(key=lambda s: (not s.get("is_favorite", False), -s.get("updated_at", 0)))
     return sessions
 
@@ -118,10 +117,7 @@ def create_session(
     settings = load_settings()
 
     if not employee_ids:
-        employee_ids = [e["id"] for e in settings["employees"] if e.get("enabled", True)]
-
-    if not moderator_id:
-        moderator_id = settings.get("default_moderator_id", employee_ids[0] if employee_ids else "antigravity")
+        employee_ids = [e["id"] for e in settings.get("employees", []) if e.get("enabled", True)]
 
     # 默认工作目录
     if not workspace_dir:
@@ -136,9 +132,8 @@ def create_session(
         "created_at": now,
         "updated_at": now,
         "status": "idle",  # idle | running | paused | concluded
-        "phase": 1,        # 1: 自由立论与出谋划策; 2: 严格审查与重大阻断
+        "phase": 1,        # 1: 自由立论; 2: 严格审查
         "employee_ids": employee_ids,
-        "moderator_id": moderator_id,
         "workspace_dir": os.path.abspath(workspace_dir),
         "current_speaker": None,
         "document": "# 会议技术方案草案\n\n*(等待各参会专家发表初步立论中...)*\n",

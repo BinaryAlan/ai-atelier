@@ -6,18 +6,43 @@ from core.storage import load_settings, save_session
 
 class MeetingEngine:
     @staticmethod
+    def get_moderator(settings: Dict[str, Any]) -> Dict[str, Any]:
+        return settings.get("moderator", {
+            "id": "moderator",
+            "name": "首席主持 (Antigravity)",
+            "title": "会议主持人兼总架构师",
+            "avatar": "👑",
+            "avatar_color": "#d97706",
+            "type": "cli",
+            "cli_cmd": 'agy -p "{prompt}"',
+            "system_prompt": "你是会议主持人兼全局首席架构师。注重工程规范、模块解耦与可靠性。负责综合立论生成方案草案、协调分歧并出具最终定稿。",
+            "timeout": 180
+        })
+
+    @staticmethod
     def get_employee(settings: Dict[str, Any], emp_id: str) -> Optional[Dict[str, Any]]:
+        # 优先匹配普通员工
         for e in settings.get("employees", []):
             if e["id"] == emp_id:
                 return e
+        # 匹配主持人
+        moderator = MeetingEngine.get_moderator(settings)
+        if moderator.get("id") == emp_id:
+            return moderator
         return None
 
     @staticmethod
-    def detect_mention(content: str, employees: List[Dict[str, Any]]) -> Tuple[bool, Optional[str]]:
+    def detect_mention(content: str, settings: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
         if "@所有人" in content or "@all" in content.lower() or "@All" in content:
             return True, None
 
-        for emp in employees:
+        # 检查主持人
+        mod = MeetingEngine.get_moderator(settings)
+        if f"@{mod['name']}" in content or "@主持人" in content:
+            return False, mod["id"]
+
+        # 检查普通员工角色
+        for emp in settings.get("employees", []):
             if f"@{emp['name']}" in content or f"@{emp['id']}" in content:
                 return False, emp["id"]
 
@@ -27,7 +52,6 @@ class MeetingEngine:
     def user_inject(session: Dict[str, Any], content: str):
         now = int(time.time())
         settings = load_settings()
-        all_emps = settings.get("employees", [])
 
         msg = {
             "id": f"msg_{now}_{len(session['messages'])}",
@@ -43,7 +67,7 @@ class MeetingEngine:
         }
         session["messages"].append(msg)
 
-        is_all, specific_emp_id = MeetingEngine.detect_mention(content, all_emps)
+        is_all, specific_emp_id = MeetingEngine.detect_mention(content, settings)
 
         if specific_emp_id:
             session["target_direct_mention"] = specific_emp_id
@@ -72,19 +96,18 @@ class MeetingEngine:
             return False, f"会议处于 {session.get('status')} 状态，无需推进"
 
         settings = load_settings()
-        employee_ids = session.get("employee_ids", [])
-        if not employee_ids:
+        moderator = MeetingEngine.get_moderator(settings)
+        workers = session.get("employee_ids", [])
+        if not workers:
             session["status"] = "concluded"
             save_session(session)
             return False, "没有选定参会成员"
 
-        moderator_id = session.get("moderator_id") or settings.get("default_moderator_id", employee_ids[0])
-        moderator = MeetingEngine.get_employee(settings, moderator_id) or MeetingEngine.get_employee(settings, employee_ids[0])
         session_id = session.get("id", "default")
         workspace_dir = session.get("workspace_dir", "")
 
         # -------------------------------------------------------------
-        # 1. 针对特定员工的点名直接应答 (定向呼叫，完成后即停)
+        # 1. 针对特定员工/主持人的点名直接应答 (单挑问答，完成后即停)
         # -------------------------------------------------------------
         direct_target = session.get("target_direct_mention")
         if direct_target:
@@ -114,7 +137,6 @@ class MeetingEngine:
 
                 is_timeout = "【超时未能及时回复" in reply
                 is_error = "【CLI 执行报错" in reply or "【执行异常" in reply
-
                 verdict = "TIMEOUT" if is_timeout else ("ERROR" if is_error else "DIRECT")
 
                 session["messages"].append({
@@ -134,13 +156,8 @@ class MeetingEngine:
 
         phase = session.get("phase", 1)
 
-        # 确定普通打工仔列表（主持人不参与普通劳作，除非全群只有主持人一人）
-        workers = [eid for eid in employee_ids if eid != moderator_id]
-        if not workers:
-            workers = employee_ids
-
         # -------------------------------------------------------------
-        # 2. 阶段一：自由立论与出谋划策 (Brainstorm / Opening)
+        # 2. 阶段一：参会员工自由立论 (Brainstorm / Opening)
         # -------------------------------------------------------------
         if phase == 1:
             spoken_in_p1 = set()
@@ -202,7 +219,6 @@ class MeetingEngine:
                     "raw_response": reply
                 })
 
-                # 超时或报错处理：主持人介入，不阻断后续其他成员立论
                 if is_timeout or is_error:
                     now = int(time.time())
                     session["messages"].append({
@@ -252,7 +268,7 @@ class MeetingEngine:
                     "id": f"msg_{int(time.time())}_{len(session['messages'])}",
                     "sender": moderator["id"],
                     "sender_name": f"{moderator['name']} (主持人)",
-                    "content": f"📋 主持人已综合大家意见合成首版方案草案（已更新在右侧面板）。现正式进入【阶段二：严格审查与重大阻断质询】！",
+                    "content": f"📋 主持人已综合大家立论合成首版方案草案（已更新在右侧面板）。现正式进入【阶段二：严格审查与重大阻断质询】！",
                     "phase": 2,
                     "verdict": "SYNTHESIS",
                     "elapsed_time": elapsed,
@@ -312,7 +328,6 @@ class MeetingEngine:
                 is_error = "【CLI 执行报错" in verify_reply or "【执行异常" in verify_reply
 
                 if is_timeout or is_error:
-                    # 验收超时/报错，主持人介入兜底
                     session["messages"].append({
                         "id": f"msg_{int(time.time())}_{len(session['messages'])}",
                         "sender": raiser_emp["id"],
@@ -419,7 +434,6 @@ class MeetingEngine:
             is_error = "【CLI 执行报错" in reply or "【执行异常" in reply
 
             if is_timeout or is_error:
-                # 修复核心 Bug: 超时或报错绝不能标记为 PASS！
                 verdict = "TIMEOUT" if is_timeout else "ERROR"
                 session["messages"].append({
                     "id": f"msg_{int(time.time())}_{len(session['messages'])}",
@@ -434,7 +448,6 @@ class MeetingEngine:
                     "raw_response": reply
                 })
 
-                # 主持人介入兜底：跳过此人，不阻塞会议，让会议继续下去
                 now = int(time.time())
                 session["messages"].append({
                     "id": f"msg_mod_review_fallback_{now}",
@@ -448,7 +461,6 @@ class MeetingEngine:
                     "sent_prompt": "",
                     "raw_response": ""
                 })
-                # 标记通过以继续下一个专家的审查
                 passed.add(reviewer_id)
                 session["passed_employees"] = list(passed)
 
@@ -470,7 +482,6 @@ class MeetingEngine:
                 save_session(session)
                 return True, f"[{reviewer_emp['name']}] 审查超时，主持人已接管继续"
 
-            # 正常回复的判断
             first_line = reply.strip().split("\n")[0]
             if "[BLOCKER" in first_line or "BLOCKER:" in reply[:30]:
                 match = re.search(r"\[?BLOCKER:?\s*([^\]\n]+)\]?", reply)
