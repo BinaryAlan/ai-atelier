@@ -118,7 +118,7 @@
             v-if="currentSession?.status === 'running'"
             @click="pauseMeeting" 
             class="px-3 py-1.5 text-xs font-medium rounded-lg bg-red-50 text-red-700 hover:bg-red-100 border border-red-200 transition flex items-center gap-1.5 shadow-sm"
-            title="立即终止当前所有 AI 任务"
+            title="立即强制掐死当前所有正在跑的 AI 任务"
           >
             <span>🛑</span> 暂停会议
           </button>
@@ -157,6 +157,17 @@
         <div class="text-[11px] text-gray-400 shrink-0 truncate ml-2">
           📁 {{ currentSession?.workspace_dir ? currentSession.workspace_dir.split('/').slice(-2).join('/') : '默认工作区' }}
         </div>
+      </div>
+
+      <!-- 暂停状态警告介入提示条 -->
+      <div v-if="currentSession?.status === 'paused'" class="mx-5 mt-2 p-2.5 rounded-lg bg-amber-50 border border-amber-200 text-xs text-amber-900 flex items-center justify-between shrink-0 shadow-sm">
+        <div class="flex items-center gap-2">
+          <span class="text-base">⚠️</span>
+          <span>当前会议处于<strong>暂停挂起</strong>状态。你可以直接在下方输入指令纠偏，或点击右侧恢复讨论。</span>
+        </div>
+        <button @click="resumeMeeting" class="px-2.5 py-1 bg-amber-200 hover:bg-amber-300 text-amber-900 rounded font-semibold transition text-xs shrink-0">
+          ▶️ 恢复讨论
+        </button>
       </div>
 
       <!-- 聊天消息流 -->
@@ -202,10 +213,24 @@
                 </span>
               </div>
               <div class="flex items-center gap-2">
+                <!-- 状态徽章 -->
                 <span v-if="msg.verdict === 'PASS'" class="px-1.5 py-0.2 rounded bg-green-100 text-green-700 font-bold text-[10px]">PASS 通过</span>
                 <span v-else-if="msg.verdict === 'BLOCKER'" class="px-1.5 py-0.2 rounded bg-red-100 text-red-700 font-bold text-[10px]">⚠️ BLOCKER 阻断</span>
+                <span v-else-if="msg.verdict === 'TIMEOUT'" class="px-1.5 py-0.2 rounded bg-orange-100 text-orange-700 font-bold text-[10px]">⚠️ 响应超时</span>
+                <span v-else-if="msg.verdict === 'ERROR'" class="px-1.5 py-0.2 rounded bg-red-100 text-red-700 font-bold text-[10px]">❌ 执行报错</span>
+                <span v-else-if="msg.verdict === 'FALLBACK'" class="px-1.5 py-0.2 rounded bg-amber-100 text-amber-800 font-bold text-[10px]">🛡️ 主持人接管</span>
                 <span v-else-if="msg.verdict === 'ACCEPT'" class="px-1.5 py-0.2 rounded bg-emerald-100 text-emerald-700 font-bold text-[10px]">ACCEPT 验收</span>
                 <span v-if="msg.elapsed_time > 0" class="text-[11px] opacity-75">⏱️ {{ msg.elapsed_time }}s</span>
+
+                <!-- ℹ️ 审查图标：查看该条消息发送的 Prompt 与原始输出 -->
+                <button 
+                  v-if="msg.sender !== 'user'" 
+                  @click.stop="openInspectModal(msg)" 
+                  class="text-xs hover:scale-125 opacity-40 hover:opacity-100 transition p-0.5 rounded hover:bg-gray-200/50" 
+                  title="查看发送给模型的 Prompt 与模型原始输出"
+                >
+                  ℹ️
+                </button>
               </div>
             </div>
 
@@ -301,7 +326,6 @@
         </div>
 
         <div class="flex-1 flex flex-col min-h-0 overflow-hidden">
-          <!-- 上半部: 文件树列表 (若已选文件则折叠或占小半) -->
           <div :class="['overflow-y-auto border-b border-gray-200 p-2 text-xs divide-y divide-gray-50 shrink-0', selectedWorkspaceFile ? 'max-h-40' : 'flex-1']">
             <div 
               v-for="item in workspaceItems" 
@@ -318,7 +342,6 @@
             <div v-if="workspaceItems.length === 0" class="text-xs text-gray-400 text-center py-6">此目录下暂无文件</div>
           </div>
 
-          <!-- 下半部: 选中文件详情预览 -->
           <div v-if="selectedWorkspaceFile" class="flex-1 flex flex-col min-h-0 bg-gray-50">
             <div class="px-3 py-1.5 bg-gray-100 border-b border-gray-200 flex items-center justify-between text-xs text-gray-700 shrink-0 font-medium">
               <span class="truncate">📄 {{ selectedWorkspaceFile.name }}</span>
@@ -343,7 +366,6 @@
         </div>
 
         <div class="p-5 space-y-4 text-sm">
-          <!-- 议题名称 -->
           <div>
             <label class="block text-xs font-semibold text-gray-600 mb-1">议题名称 / 任务主题:</label>
             <input 
@@ -354,7 +376,6 @@
             >
           </div>
 
-          <!-- 本地工作目录 -->
           <div>
             <label class="block text-xs font-semibold text-gray-600 mb-1">本地工作目录 (读取资料与交付物所在路径):</label>
             <input 
@@ -365,7 +386,6 @@
             >
           </div>
 
-          <!-- 指定主持人 -->
           <div>
             <label class="block text-xs font-semibold text-gray-600 mb-1">指定会议主持人:</label>
             <select 
@@ -378,7 +398,6 @@
             </select>
           </div>
 
-          <!-- 参会打工仔选择 -->
           <div>
             <label class="block text-xs font-semibold text-gray-600 mb-1.5">勾选参会 AI 成员:</label>
             <div class="grid grid-cols-2 gap-2">
@@ -410,10 +429,9 @@
       </div>
     </div>
 
-    <!-- 5. 员工设置模态弹窗 (员工列表 + 添加/编辑子弹窗) -->
+    <!-- 5. 员工设置模态弹窗 -->
     <div v-if="showSettingsModal" class="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
       <div class="bg-white rounded-2xl shadow-xl w-full max-w-xl max-h-[85vh] flex flex-col overflow-hidden">
-        <!-- 弹窗头部 -->
         <div class="p-4 border-b border-gray-100 flex items-center justify-between">
           <h3 class="font-bold text-gray-900 text-base flex items-center gap-2">
             <span>⚙️</span> 员工与模型配置
@@ -421,7 +439,6 @@
           <button @click="showSettingsModal = false" class="text-gray-400 hover:text-gray-600 text-xl font-bold">×</button>
         </div>
 
-        <!-- 默认主持人设置 + 添加员工按钮 -->
         <div class="px-5 py-3 bg-gray-50 border-b border-gray-100 flex items-center justify-between">
           <div class="flex items-center gap-2 text-xs">
             <span class="font-semibold text-gray-600">默认会议主持人:</span>
@@ -436,7 +453,6 @@
           </button>
         </div>
 
-        <!-- 员工精炼列表 -->
         <div class="p-5 overflow-y-auto flex-1 space-y-2">
           <div 
             v-for="(emp, idx) in settings.employees" 
@@ -444,7 +460,6 @@
             class="flex items-center justify-between p-3 border border-gray-200 rounded-xl hover:border-gray-300 transition bg-white"
           >
             <div class="flex items-center gap-3 truncate">
-              <!-- 头像 -->
               <div :style="{ backgroundColor: emp.avatar_color || '#3b82f6' }" class="w-9 h-9 rounded-full flex items-center justify-center text-white text-lg shrink-0 shadow-sm">
                 {{ emp.avatar || '🤖' }}
               </div>
@@ -487,7 +502,6 @@
         </div>
 
         <div class="p-5 space-y-4 text-xs">
-          <!-- 本地模型选择与刷新 -->
           <div>
             <div class="flex items-center justify-between mb-1">
               <label class="font-semibold text-gray-600">选择本地已安装的 AI 模型:</label>
@@ -507,7 +521,6 @@
             </select>
           </div>
 
-          <!-- 员工姓名与头衔 -->
           <div class="grid grid-cols-2 gap-3">
             <div>
               <label class="block font-semibold text-gray-600 mb-1">员工姓名:</label>
@@ -519,7 +532,6 @@
             </div>
           </div>
 
-          <!-- 头像选择 -->
           <div>
             <label class="block font-semibold text-gray-600 mb-1">内置头像选择:</label>
             <div class="flex flex-wrap gap-2">
@@ -535,7 +547,6 @@
             </div>
           </div>
 
-          <!-- 预置 Prompt (选填) -->
           <div>
             <label class="block font-semibold text-gray-600 mb-1">预置人设 Prompt (选填):</label>
             <textarea 
@@ -546,7 +557,6 @@
             ></textarea>
           </div>
 
-          <!-- 底层 CLI 指令 (自动生成，可手动微调) -->
           <div>
             <label class="block font-semibold text-gray-500 mb-1">CLI 执行模板 (自动生成，保留 {prompt}):</label>
             <input type="text" v-model="editingEmp.cli_cmd" class="w-full border border-gray-200 bg-gray-50 rounded px-2 py-1 text-[11px] font-mono text-gray-600">
@@ -556,6 +566,59 @@
         <div class="p-3 border-t border-gray-100 bg-gray-50 flex justify-end gap-2">
           <button @click="showEmpEditModal = false" class="px-3 py-1.5 text-xs text-gray-600 hover:bg-gray-200 rounded">取消</button>
           <button @click="saveEmployeeItem" class="px-4 py-1.5 text-xs bg-blue-600 hover:bg-blue-700 text-white rounded font-medium shadow-sm">确定</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 7. 消息审查与 Prompt 详情弹窗 (ℹ️ 点击打开) -->
+    <div v-if="showInspectModal" class="fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4">
+      <div class="bg-white rounded-2xl shadow-2xl w-full max-w-2xl max-h-[85vh] flex flex-col overflow-hidden">
+        <div class="p-4 border-b border-gray-100 flex items-center justify-between">
+          <div class="flex items-center gap-2">
+            <span class="text-base">ℹ️</span>
+            <h4 class="font-bold text-gray-900 text-sm">
+              交互详情审查: [{{ inspectingMsg?.sender_name }}]
+            </h4>
+          </div>
+          <button @click="showInspectModal = false" class="text-gray-400 hover:text-gray-600 text-lg font-bold">×</button>
+        </div>
+
+        <!-- 审查选项卡: 发送的 Prompt vs 模型原始输出 -->
+        <div class="flex border-b border-gray-200 bg-gray-50 text-xs font-semibold text-gray-600 shrink-0">
+          <button 
+            @click="inspectTab = 'prompt'" 
+            :class="['flex-1 py-2.5 text-center transition border-b-2', inspectTab === 'prompt' ? 'text-blue-600 border-blue-600 bg-white' : 'border-transparent hover:text-gray-900']"
+          >
+            📥 发送给模型的完整 Prompt
+          </button>
+          <button 
+            @click="inspectTab = 'response'" 
+            :class="['flex-1 py-2.5 text-center transition border-b-2', inspectTab === 'response' ? 'text-blue-600 border-blue-600 bg-white' : 'border-transparent hover:text-gray-900']"
+          >
+            📤 模型原始回复输出
+          </button>
+        </div>
+
+        <div class="flex-1 overflow-y-auto p-4 bg-gray-50/50">
+          <!-- Prompt 内容 -->
+          <div v-if="inspectTab === 'prompt'" class="relative">
+            <button @click="copyText(inspectingMsg?.sent_prompt)" class="absolute right-2 top-2 px-2 py-1 text-[11px] bg-white border border-gray-300 rounded shadow-sm hover:bg-gray-50 transition">
+              📋 复制 Prompt
+            </button>
+            <pre class="text-xs font-mono bg-white p-4 border border-gray-200 rounded-xl whitespace-pre-wrap select-text leading-relaxed text-gray-800">{{ inspectingMsg?.sent_prompt || '(无 Prompt 记录)' }}</pre>
+          </div>
+
+          <!-- 模型输出 -->
+          <div v-else class="relative">
+            <button @click="copyText(inspectingMsg?.raw_response || inspectingMsg?.content)" class="absolute right-2 top-2 px-2 py-1 text-[11px] bg-white border border-gray-300 rounded shadow-sm hover:bg-gray-50 transition">
+              📋 复制回复
+            </button>
+            <pre class="text-xs font-mono bg-white p-4 border border-gray-200 rounded-xl whitespace-pre-wrap select-text leading-relaxed text-gray-800">{{ inspectingMsg?.raw_response || inspectingMsg?.content || '(无原始回复)' }}</pre>
+          </div>
+        </div>
+
+        <div class="p-3 border-t border-gray-100 bg-gray-50 flex justify-end">
+          <button @click="showInspectModal = false" class="px-4 py-1.5 text-xs bg-gray-200 hover:bg-gray-300 text-gray-700 rounded font-medium">关闭</button>
         </div>
       </div>
     </div>

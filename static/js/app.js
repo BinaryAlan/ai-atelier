@@ -57,6 +57,11 @@ createApp({
       },
       presetAvatars: ["🤖", "🧠", "⚡", "🦉", "🛡️", "🚀", "💻", "🔬", "🎯", "🎨", "👑", "🕵️", "🔧", "💡", "⚖️", "📊"],
 
+      // 消息审查详情弹窗
+      showInspectModal: false,
+      inspectTab: "prompt", // 'prompt' | 'response'
+      inspectingMsg: null,
+
       pollInterval: null
     };
   },
@@ -262,10 +267,8 @@ createApp({
       try {
         const res = await fetch(`/api/sessions/${this.currentSessionId}/pause`, { method: "POST" });
         if (res.ok) {
-          const data = await res.json();
           this.currentSession.status = "paused";
           this.currentSession.current_speaker = null;
-          // 重新拉取最新记录
           const sRes = await fetch(`/api/sessions/${this.currentSessionId}`);
           this.currentSession = await sRes.json();
           this.$nextTick(this.scrollToBottom);
@@ -335,7 +338,6 @@ createApp({
 
     async onWorkspaceItemClick(item) {
       if (item.is_dir) {
-        // 进入子目录
         try {
           const res = await fetch(`/api/workspace/files?path=${encodeURIComponent(item.path)}`);
           const data = await res.json();
@@ -344,7 +346,6 @@ createApp({
           console.error("展开目录失败:", e);
         }
       } else {
-        // 读取文件内容
         try {
           const res = await fetch(`/api/workspace/file?path=${encodeURIComponent(item.path)}`);
           const data = await res.json();
@@ -362,6 +363,20 @@ createApp({
       const sizes = ["B", "KB", "MB", "GB"];
       const i = Math.floor(Math.log(bytes) / Math.log(k));
       return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + " " + sizes[i];
+    },
+
+    // ----------------- 消息 Prompt 审查详情 (ℹ️) -----------------
+    openInspectModal(msg) {
+      this.inspectingMsg = msg;
+      this.inspectTab = "prompt";
+      this.showInspectModal = true;
+    },
+
+    copyText(text) {
+      if (!text) return;
+      navigator.clipboard.writeText(text).then(() => {
+        alert("已复制到剪贴板！");
+      });
     },
 
     // ----------------- 员工与模型扫描设置 -----------------
@@ -401,7 +416,6 @@ createApp({
       this.isEditingEmployee = true;
       this.editingEmpIdx = idx;
       this.editingEmp = JSON.parse(JSON.stringify(emp));
-      // 匹配模型
       const match = this.scannedModels.find(m => m.cli_cmd === emp.cli_cmd);
       this.selectedModelId = match ? match.model_id : "";
       this.showEmpEditModal = true;

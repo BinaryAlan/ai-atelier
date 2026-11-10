@@ -25,6 +25,41 @@ def background_runner(session_id: str):
         
         time.sleep(0.5)
 
+def sanitize_sessions_on_startup():
+    """服务器启动时自愈：清除上次异常崩溃或 Ctrl+C 残留的僵尸等待状态"""
+    try:
+        sessions = list_sessions()
+        now = int(time.time())
+        for s in sessions:
+            full_s = get_session(s["id"])
+            if full_s:
+                changed = False
+                if full_s.get("current_speaker"):
+                    full_s["current_speaker"] = None
+                    changed = True
+                if full_s.get("status") == "running":
+                    full_s["status"] = "paused"
+                    full_s["messages"].append({
+                        "id": f"msg_sys_recover_{now}",
+                        "sender": "system",
+                        "sender_name": "系统复位",
+                        "content": "⚠️ 服务端已重启，系统已自动复位挂起的发言状态，会议转为暂停，等待群主人工恢复。",
+                        "phase": full_s.get("phase", 1),
+                        "verdict": "RECOVER",
+                        "elapsed_time": 0,
+                        "created_at": now,
+                        "sent_prompt": "",
+                        "raw_response": ""
+                    })
+                    changed = True
+                if changed:
+                    save_session(full_s)
+    except Exception as e:
+        print("启动复位清理异常:", e)
+
+# 服务启动时立即执行一次复位自愈
+sanitize_sessions_on_startup()
+
 @app.route("/")
 def index():
     return send_from_directory("static", "index.html")
@@ -109,7 +144,6 @@ def api_delete_session(session_id):
 # ----------------- Workspace Explorer API -----------------
 @app.route("/api/workspace/files", methods=["GET"])
 def api_workspace_files():
-    """列出工作目录下的文件列表"""
     path = request.args.get("path", "").strip()
     if not path or not os.path.exists(path):
         return jsonify({"error": "路径不存在", "files": []})
@@ -117,7 +151,6 @@ def api_workspace_files():
     items = []
     try:
         for entry in os.scandir(path):
-            # 过滤隐藏文件与巨型目录
             if entry.name.startswith(".") or entry.name in ["node_modules", ".git", "__pycache__", "venv"]:
                 continue
             items.append({
@@ -133,12 +166,10 @@ def api_workspace_files():
 
 @app.route("/api/workspace/file", methods=["GET"])
 def api_workspace_file_content():
-    """读取指定文件内容"""
     fpath = request.args.get("path", "").strip()
     if not fpath or not os.path.exists(fpath) or not os.path.isfile(fpath):
         return jsonify({"error": "文件不存在"}), 404
     
-    # 防止读取超大二进制文件 (限制最大 500KB)
     if os.path.getsize(fpath) > 500 * 1024:
         return jsonify({"content": "【文件过大 (>500KB)，不支持在线快速预览】", "path": fpath})
     
@@ -163,7 +194,6 @@ def api_send_message(session_id):
     
     MeetingEngine.user_inject(session, content)
     
-    # 启动后台线程推进
     thread = threading.Thread(target=background_runner, args=(session_id,), daemon=True)
     thread.start()
     
@@ -171,7 +201,6 @@ def api_send_message(session_id):
 
 @app.route("/api/sessions/<session_id>/pause", methods=["POST"])
 def api_pause(session_id):
-    """强行暂停会议并立即中断正在跑的 CLI 进程"""
     session = get_session(session_id)
     if not session:
         return jsonify({"error": "会话不存在"}), 404
@@ -180,10 +209,8 @@ def api_pause(session_id):
     session["current_speaker"] = None
     save_session(session)
 
-    # 毫秒级干掉正在运行的子进程树
     killed = Executor.kill_session_process(session_id)
     
-    # 添加系统广播
     now = int(time.time())
     session["messages"].append({
         "id": f"msg_sys_{now}",
@@ -193,7 +220,9 @@ def api_pause(session_id):
         "phase": session.get("phase", 1),
         "verdict": "PAUSE",
         "elapsed_time": 0,
-        "created_at": now
+        "created_at": now,
+        "sent_prompt": "",
+        "raw_response": ""
     })
     save_session(session)
     
@@ -201,7 +230,6 @@ def api_pause(session_id):
 
 @app.route("/api/sessions/<session_id>/resume", methods=["POST"])
 def api_resume(session_id):
-    """恢复会议继续运行"""
     session = get_session(session_id)
     if not session:
         return jsonify({"error": "会话不存在"}), 404
