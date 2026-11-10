@@ -1,4 +1,5 @@
 import os
+import re
 import signal
 import subprocess
 import time
@@ -16,6 +17,35 @@ ALLOWED_BINARIES = {"agy", "codebuddy"}
 MAX_PROMPT_CHARS = 100_000
 MIN_TIMEOUT = 10
 MAX_TIMEOUT = 3600
+
+# 模型把「工具调用」当正文吐出来时的产物（CodeBuddy 在 --tools "" 下尤其明显）。
+# 这些不是回答内容，必须剥掉，否则会被当成发言正文入库、甚至干扰结论解析。
+_TOOL_TAGS = (
+    "tool_calls", "system_calls", "function_calls", "tool_use",
+    "tool_reminder", "system_reminder", "system_prompt",
+    "invoke", "parameter", "result",
+)
+
+
+def sanitize_model_output(text: str) -> str:
+    """
+    剥除残留的工具调用 XML / 系统提醒块，返回干净正文。
+
+    只在「整块」出现时剥离；未闭合的标签视为尾部垃圾一并截断
+    （模型在工具不可用时经常先吐半个 <tool_calls> 就结束本轮）。
+    """
+    if not text:
+        return ""
+
+    cleaned = text
+    for tag in _TOOL_TAGS:
+        cleaned = re.sub(rf"<{tag}\b[^>]*>.*?</{tag}>", "", cleaned, flags=re.S | re.I)
+        cleaned = re.sub(rf"<{tag}\b[^>]*>.*\Z", "", cleaned, flags=re.S | re.I)
+        cleaned = re.sub(rf"</?{tag}\b[^>]*>", "", cleaned, flags=re.I)
+
+    cleaned = re.sub(r"[ \t]+\n", "\n", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
 
 
 @dataclass
@@ -161,6 +191,11 @@ class Executor:
             )
 
         result.elapsed = round(time.time() - start_time, 2)
+
+        # 清洗「工具调用被当成正文」的残留。raw_output 保留原样供排查。
+        if result.status == "success" and result.output:
+            result.output = sanitize_model_output(result.output)
+
         return result
 
     @staticmethod

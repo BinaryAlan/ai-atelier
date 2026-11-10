@@ -14,7 +14,7 @@
     {
       "avatar": "🧠",
       "avatar_color": "#9333ea",
-      "cli_cmd": "codebuddy --model deepseek-v4-pro --tools \"\" -p \"{prompt}\"",
+      "cli_cmd": "codebuddy --model deepseek-v4-pro --tools \"Read,Glob,Grep\" -p \"{prompt}\"",
       "enabled": true,
       "id": "codebuddy-ds4",
       "name": "DeepSeek-V4 (DS4)",
@@ -25,7 +25,7 @@
     {
       "avatar": "⚡",
       "avatar_color": "#059669",
-      "cli_cmd": "codebuddy --model hy4std --tools \"\" -p \"{prompt}\"",
+      "cli_cmd": "codebuddy --model hy4std --tools \"Read,Glob,Grep\" -p \"{prompt}\"",
       "enabled": true,
       "id": "codebuddy-hy4",
       "name": "混元-4 (HY4)",

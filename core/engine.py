@@ -2,7 +2,7 @@ import re
 import time
 import uuid
 from typing import Dict, Any, Optional, Tuple, List
-from core.executor import Executor, ExecutionResult
+from core.executor import Executor, ExecutionResult, sanitize_model_output
 from core.storage import load_settings, save_session, get_session, is_valid_session_id
 
 def generate_msg_id() -> str:
@@ -97,6 +97,113 @@ def _strip_verdict_marker(text: str) -> str:
     rest = text[m.end():].lstrip()
     rest = re.sub(r"^[\s\-:：–—]+", "", rest).strip()
     return rest or text
+
+
+# ---------------------------------------------------------------------------
+# 模型能力适配：不同 CLI 的参数不同（有的禁用了全部工具），prompt 必须如实交代，
+# 否则模型会去“调用工具”，然后只吐一句「我先读取…」或一堆 <tool_calls> 标记就交卷。
+# ---------------------------------------------------------------------------
+_TOOLS_FLAG_PAT = re.compile(r"--tools\s+(\"[^\"]*\"|'[^']*'|\S+)")
+_MAX_ANSWER_CHARS = 500        # 单轮回答的字数上限（放宽后的要求）
+_RETRY_HINT = (
+    "\n\n【上一次回答没有给出实质内容】你可能只描述了计划、或输出了工具调用标记。\n"
+    "请立刻直接输出完整正文：不要描述你打算做什么，不要输出任何 <tool_calls> / <invoke> 标记，"
+    "也不要反问，直接给结论。"
+)
+# 只说了“我准备去读文件/看原型”这类计划句，等于没答
+_PREAMBLE_PAT = re.compile(
+    r"^(好的|收到|明白|没问题)?[，,。!！\s]*"
+    r"我(先|来|去|将|会|马上|现在)?"
+    r"[^。！？\n]{0,40}?"
+    r"(读取|读一下|查看|看看|阅读|了解|确认|检查|翻一下|打开)"
+    r"[^。！？\n]{0,40}?"
+    r"(文件|目录|原型|计划|资料|代码|仓库|工作区|文档|内容|材料)"
+    r"[^。！？\n]{0,20}[。！!]?$"
+)
+
+
+def employee_has_tools(employee: Dict[str, Any]) -> bool:
+    """根据 CLI 模板判断该角色是否还有工具可用（--tools "" 即全部禁用）。"""
+    cmd = str(employee.get("cli_cmd") or "")
+    m = _TOOLS_FLAG_PAT.search(cmd)
+    if not m:
+        return True     # 未显式限制 => 沿用 CLI 默认（有工具）
+    val = m.group(1).strip("\"'").strip()
+    return bool(val) and val.lower() not in ("none", "false", "0")
+
+
+def capability_block(employee: Dict[str, Any]) -> str:
+    """把「你到底能不能读文件」如实写进 prompt——这是 DS/HY 答不完的直接诱因。"""
+    if employee_has_tools(employee):
+        return (
+            "\n【能力说明】你可以使用只读工具（Read / Glob / Grep）查看当前工作目录内的文件；\n"
+            "但必须在**同一次回答里**给出完整结论，不要只描述你打算读取什么。\n"
+            "单轮读取建议不超过 5 个文件，读不到的文件不要反复重试。\n"
+        )
+    return (
+        "\n【能力说明】本次调用**没有**任何工具：不能读取文件、不能联网。\n"
+        "严禁输出 <tool_calls> / <invoke> 之类的工具标记，也严禁只回复「我先去读取…」这类计划句——\n"
+        "那会拿不到任何内容，本轮回答会被直接作废。请基于上文已给出的信息输出完整正文；\n"
+        "确实需要某个文件时，在回答末尾单独一行写「需要群主提供：<路径>」。\n"
+    )
+
+
+def looks_like_incomplete(text: str) -> bool:
+    """判断一次回答是不是「没答完」：空、极短、或只说了要去读文件。"""
+    t = (text or "").strip()
+    if not t or len(t) < 6:
+        return True
+    # 带协议标记的回答（[PASS]/[ACCEPT] 等）本身就可以很短，不算残缺
+    if re.match(r"^\s*[\[【]\s*(PASS|BLOCKER|ACCEPT|REJECT|COMMENT)\b", t, re.IGNORECASE):
+        return False
+    if len(t) < 120 and _PREAMBLE_PAT.match(t):
+        return True
+    return False
+
+
+def run_with_retry(
+    employee: Dict[str, Any],
+    prompt: str,
+    session_id: str,
+    workspace_dir: Optional[str] = None
+) -> "ExecutionResult":
+    """
+    调用一次；若回答明显残缺（空 / 只有计划句 / 只剩工具标记），带上强指令重试一次。
+
+    工具被禁用的模型经常先回一句「我先读取…」就结束本轮，直接入库会让会议带着空发言推进，
+    所以这里重试一次；仍失败才升级为 error 让上层暂停并明确告知群主原因。
+    """
+    res = Executor.run_employee(employee, prompt, session_id=session_id, workspace_dir=workspace_dir)
+
+    # 执行器已清洗过一次；这里再兜一层，保证「判定是否残缺」永远针对干净正文，
+    # 不依赖调用方是否走了同一条清洗路径。
+    if res.status == "success":
+        res.output = sanitize_model_output(res.output)
+
+    if res.status != "success" or not looks_like_incomplete(res.output):
+        return res
+
+    print(f"[Executor] {employee.get('name', employee.get('id'))} 回答疑似未完成（{len(res.output)} 字），重试一次")
+    res2 = Executor.run_employee(
+        employee, prompt + _RETRY_HINT, session_id=session_id, workspace_dir=workspace_dir
+    )
+    res2.elapsed += res.elapsed
+    if res2.status == "success":
+        res2.output = sanitize_model_output(res2.output)
+
+    if res2.status == "success" and not looks_like_incomplete(res2.output):
+        res2.raw_output = f"{res.raw_output}\n--- retry ---\n{res2.raw_output}"
+        return res2
+
+    return ExecutionResult(
+        status="error",
+        output="【模型两次都未给出实质回答：可能只描述了计划，或把工具调用当成了正文输出】\n"
+               "请检查该角色的 CLI 参数——若模板里写了 --tools \"\"，它就没有读文件能力，"
+               "需要改成 --tools \"Read,Glob,Grep\"，或把资料直接贴进议题里。",
+        raw_output=f"{res.raw_output}\n--- retry ---\n{res2.raw_output}",
+        elapsed=res2.elapsed,
+        error_msg="empty answer after retry"
+    )
 
 
 def format_round_feedback(
@@ -455,6 +562,7 @@ class MeetingEngine:
 
                 p1_context = [f"[{m['sender_name']}]: {m['content']}" for m in relevant_msgs if m.get("phase") == 1]
                 context_str = "\n".join(p1_context) if p1_context else "(你是第一个发言人)"
+                capability = capability_block(emp)
 
                 prompt = f"""【会议议题】: {user_topic}
 本地工作目录: {workspace_dir}
@@ -467,13 +575,15 @@ class MeetingEngine:
 【你的任务】:
 请基于你的专业视角，直接给出你对该议题的核心见解、关键思路与落地建议。
 要求：
-1. 语言精炼，务实客观，控制在 100~200 字左右；
-2. 提出有建设性的方案要点，不讲客套话。"""
+1. 务实客观，正文控制在 300~500 字（上限 500 字），宁可有信息密度也不要空话；
+2. 提出有建设性的方案要点，不讲客套话；
+3. 信息不足时直接说明你的假设，不要反问、也不要把问题抛回来。
+{capability}"""
 
                 session["current_speaker"] = emp["name"]
                 save_session(session, merge=True)
 
-                res = Executor.run_employee(emp, prompt, session_id=session_id, workspace_dir=workspace_dir)
+                res = run_with_retry(emp, prompt, session_id, workspace_dir)
 
                 # 检查暂停中断
                 stop = MeetingEngine._stop_if_interrupted(session, session_id, res.status)
@@ -531,6 +641,7 @@ class MeetingEngine:
 
 你是【{moderator['name']}】。
 请综合各方建议与共识，输出一份标准的《方案草案与工作纪要 (初稿)》。
+{capability_block(moderator)}
 要求：
 - 结构清晰、条理规整，涵盖核心结论、执行要点与待办细节；
 - 输出纯 Markdown 格式。"""
@@ -641,7 +752,7 @@ class MeetingEngine:
 回答第一行必须严格为以下两者之一：
 [ACCEPT] - 核心问题已解决，接受修改
 [REJECT: 仍有问题简述] - 仍存在严重漏洞
-随后用 50~100 字阐述依据。严禁发散引入不相关的新议题！"""
+随后用 100~300 字阐述依据（上限 500 字）。严禁发散引入不相关的新议题！"""
 
                 session["current_speaker"] = f"{raiser_emp['name']} (正在验收方案修改)"
                 save_session(session, merge=True)
@@ -748,6 +859,7 @@ class MeetingEngine:
             owner_block = f"\n【群主最新指令（必须遵守，优先级最高）】: {owner_note}\n" if owner_note else ""
 
             feedback = _feedback_block(session, exclude_id=reviewer_id)
+            capability = capability_block(reviewer_emp)
 
             review_prompt = f"""【方案客观审阅】
 你是【{reviewer_emp['name']}】。
@@ -758,19 +870,19 @@ class MeetingEngine:
 ----- 方案正文开始 -----
 {session['document']}
 ----- 方案正文结束 -----
-{feedback}{owner_block}
+{feedback}{owner_block}{capability}
 【审阅原则】:
 1. 保持客观理性与专业严谨。细微修辞或非原则性小建议不作为阻断项；
 2. 只有发现存在严重逻辑漏洞、重大硬伤或不可行隐患，才允许标注为 BLOCKER；
 3. 你的回答首行必须严格为以下二者之一，不得省略方括号标记：
    [PASS] - 方案整体可行、无严重漏洞，同意通过
    [BLOCKER: 问题简述] - 发现不可接受的严重问题
-4. 随后用 100 字左右客观阐述理由与改进建议。"""
+4. 随后用 200~500 字客观阐述理由与改进建议（上限 500 字）。"""
 
             session["current_speaker"] = reviewer_emp["name"]
             save_session(session, merge=True)
 
-            res = Executor.run_employee(reviewer_emp, review_prompt, session_id=session_id, workspace_dir=workspace_dir)
+            res = run_with_retry(reviewer_emp, review_prompt, session_id, workspace_dir)
 
             stop = MeetingEngine._stop_if_interrupted(session, session_id, res.status)
             if stop:

@@ -91,7 +91,9 @@ def scan_local_models(force_refresh: bool = False) -> List[Dict[str, Any]]:
                         "cli": "codebuddy",
                         "model_id": mid,
                         "display_name": display,
-                        "cli_cmd": f'codebuddy --model {mid} --tools "" -p "{{prompt}}"',
+                        # 只读工具：模型要能看工作目录里的方案/原型，否则会只回一句
+                        # 「我先去读取…」就结束本轮（--tools "" 会把工具全禁掉）
+                        "cli_cmd": f'codebuddy --model {mid} --tools "Read,Glob,Grep" -p "{{prompt}}"',
                         "default_prompt": ""
                     })
         except Exception as e:
