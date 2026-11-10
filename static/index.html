@@ -31,6 +31,16 @@
 <body class="bg-gray-50 text-gray-800 antialiased h-screen overflow-hidden">
   <div id="app" class="flex h-full w-full">
 
+    <!-- 顶部轻提示：恢复结果 / 自动暂缓了谁，几秒后自动消失 -->
+    <div
+      v-if="toastText"
+      class="fixed bottom-6 right-6 z-[1000] max-w-[min(80vw,460px)] px-4 py-2.5 rounded-xl bg-gray-900/90 text-white text-sm shadow-lg flex items-start gap-2"
+    >
+      <span class="shrink-0">ℹ️</span>
+      <span class="leading-relaxed">{{ toastText }}</span>
+      <button @click="toastText = ''" class="shrink-0 ml-1 opacity-70 hover:opacity-100">✕</button>
+    </div>
+
     <!-- 1. 左侧边栏：会话管理与设置 -->
     <div class="w-64 bg-white border-r border-gray-200 flex flex-col shrink-0">
       <div id="service-menu-wrap" class="relative p-4 border-b border-gray-100 flex items-center justify-between">
@@ -247,9 +257,11 @@
           <button 
             v-else-if="currentSession?.status === 'paused'"
             @click="resumeMeeting" 
-            class="px-3 py-1.5 text-xs font-medium rounded-lg bg-emerald-50 text-emerald-700 hover:bg-emerald-100 border border-emerald-200 transition flex items-center gap-1.5 shadow-sm"
+            :disabled="resumeBusy"
+            class="px-3 py-1.5 text-xs font-medium rounded-lg bg-emerald-50 text-emerald-700 hover:bg-emerald-100 border border-emerald-200 transition flex items-center gap-1.5 shadow-sm disabled:opacity-60 disabled:cursor-wait"
+            title="让会议从上次中断的地方继续；连续两次停在同一人会自动暂缓它"
           >
-            <span>▶️</span> 恢复讨论
+            <span>{{ resumeBusy ? '⏳' : '▶️' }}</span> {{ resumeBusy ? '恢复中…' : '恢复讨论' }}
           </button>
         </div>
       </div>
@@ -331,6 +343,20 @@
 
             <!-- 正文内容 -->
             <div class="whitespace-pre-wrap select-text">{{ msg.content }}</div>
+
+            <!-- 系统提示「服务被打断 / 已复位」时，把「怎么恢复」直接做成按钮。
+                 否则用户只能盯着「等待群主人工恢复」这句话猜操作入口。 -->
+            <div
+              v-if="msg.sender === 'system' && msg.verdict === 'RECOVER' && currentSession?.status === 'paused'"
+              class="mt-2 flex items-center gap-2 flex-wrap"
+            >
+              <button
+                @click.stop="resumeMeeting"
+                :disabled="resumeBusy"
+                class="text-[11px] px-2.5 py-1 rounded-lg bg-emerald-600 text-white hover:bg-emerald-700 transition disabled:opacity-60 disabled:cursor-wait"
+              >{{ resumeBusy ? '⏳ 恢复中…' : '▶️ 继续会议' }}</button>
+              <span class="text-[10px] opacity-70">连续两次停在同一人，会自动暂缓它让其他人先走</span>
+            </div>
           </div>
         </div>
 

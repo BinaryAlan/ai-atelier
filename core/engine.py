@@ -97,6 +97,28 @@ _FEEDBACK_LABELS = {
 }
 
 
+def mark_stuck(session: Dict[str, Any], employee_id: str, reason: str = "") -> None:
+    """
+    记下「这次是被谁卡住的」。
+
+    只有记了人，用户点「恢复讨论」时才可能做出正确决策：第一次原地重试它，
+    第二次仍停在同一人身上就自动暂缓它 —— 否则点多少次恢复都是在同一面墙上撞。
+    """
+    if not employee_id:
+        return
+    session["stuck"] = {
+        "employee_id": str(employee_id),
+        "reason": (reason or "未给出明确结论")[:120],
+        "at": int(time.time()),
+    }
+
+
+def clear_stuck(session: Dict[str, Any]) -> None:
+    """流程真的往前走了，之前的卡点与恢复计数一并作废。"""
+    session.pop("stuck", None)
+    session.pop("stuck_resume_attempts", None)
+
+
 def bump_document_revision(session: Dict[str, Any]) -> int:
     """
     文档正文被改写时调用，递增版本号。
@@ -457,12 +479,22 @@ class MeetingEngine:
         }
 
     @staticmethod
-    def _create_concluded_message(moderator_id: str, moderator_name: str) -> Dict[str, Any]:
+    def _create_concluded_message(moderator_id: str, moderator_name: str,
+                                  absent_names: Optional[List[str]] = None) -> Dict[str, Any]:
+        # 有人被跳过/暂缓时不能写「全员已审阅完成」——那等于凭空宣称一个不存在的共识
+        absent = [n for n in (absent_names or []) if n]
+        if absent:
+            content = (
+                f"📋 本轮审阅结束：其余成员均已通过，但 {'、'.join(absent)} 本轮未给出结论（已暂缓/跳过），"
+                "所以这**不是**全员共识。需要它的意见时，在「👥 参会成员」面板点「↩️ 恢复」后再继续。"
+            )
+        else:
+            content = "📋 本轮讨论方案全员已审阅完成，最新共识已整理在右侧面板。群主如有新想法或要调整方向，可随时输入新消息继续讨论。"
         return {
             "id": generate_msg_id(),
             "sender": moderator_id,
             "sender_name": f"{moderator_name} (主持人)",
-            "content": "📋 本轮讨论方案全员已审阅完成，最新共识已整理在右侧面板。群主如有新想法或要调整方向，可随时输入新消息继续讨论。",
+            "content": content,
             "phase": 2,
             "verdict": "CONCLUDED",
             "elapsed_time": 0,
@@ -490,6 +522,42 @@ class MeetingEngine:
         return False, "执行已被用户手动暂停中断"
 
     @staticmethod
+    def active_workers(session: Dict[str, Any], settings: Dict[str, Any]) -> List[str]:
+        """
+        本场会议真正能发言的成员：去掉主持人、已停用/未配置 CLI 的角色、以及被群主跳过的成员。
+
+        抽成公共方法是因为 app 层判断「这次恢复能不能推进」时必须用完全相同的口径，
+        否则会出现「UI 以为还有别人可问、引擎却认为没人了」的分歧。
+        """
+        moderator = MeetingEngine.get_moderator(settings)
+        skipped = {eid for eid in (session.get("skipped_employees") or []) if isinstance(eid, str)}
+        workers: List[str] = []
+        for eid in session.get("employee_ids") or []:
+            if not isinstance(eid, str) or eid in workers:
+                continue
+            emp = MeetingEngine.get_employee(settings, eid)
+            if emp.get("id") == moderator.get("id"):
+                continue
+            if not emp.get("enabled", True) or not emp.get("cli_cmd"):
+                continue
+            if eid in skipped:
+                continue
+            workers.append(eid)
+        return workers
+
+    @staticmethod
+    def absent_names(session: Dict[str, Any], settings: Dict[str, Any], skipped) -> List[str]:
+        """本轮被跳过/暂缓、因而没有表态的成员名字（用于结案时如实说明）。"""
+        names: List[str] = []
+        for eid in session.get("employee_ids") or []:
+            if isinstance(eid, str) and eid in skipped:
+                emp = MeetingEngine.get_employee(settings, eid)
+                name = emp.get("name") or eid
+                if name not in names:
+                    names.append(name)
+        return names
+
+    @staticmethod
     def step(session: Dict[str, Any]) -> Tuple[bool, str]:
         session_id = session.get("id")
 
@@ -512,22 +580,9 @@ class MeetingEngine:
         settings = load_settings()
         moderator = MeetingEngine.get_moderator(settings)
 
-        # 参会成员去重 + 过滤（已删除/已停用/未配置 CLI 的角色不再占用发言位）
-        # 另外剔除被群主「跳过」的成员：某个 CLI 挂了不该拖住整场会议，
-        # 跳过只影响本会话的发言席位，配置与历史发言都保留，随时可恢复。
+        # 参会成员去重 + 过滤（已删除/已停用/未配置 CLI/被跳过的角色不再占用发言位）
         skipped = {eid for eid in (session.get("skipped_employees") or []) if isinstance(eid, str)}
-        workers: List[str] = []
-        for eid in session.get("employee_ids") or []:
-            if not isinstance(eid, str) or eid in workers:
-                continue
-            emp = MeetingEngine.get_employee(settings, eid)
-            if emp.get("id") == moderator.get("id"):
-                continue
-            if not emp.get("enabled", True) or not emp.get("cli_cmd"):
-                continue
-            if eid in skipped:
-                continue
-            workers.append(eid)
+        workers: List[str] = MeetingEngine.active_workers(session, settings)
 
         if not workers:
             session["status"] = "idle"
@@ -695,6 +750,7 @@ class MeetingEngine:
                 if res.status in ["timeout", "error"]:
                     session["status"] = "paused"
                     err_desc = "响应超时未回复" if res.status == "timeout" else "执行报错"
+                    mark_stuck(session, emp["id"], err_desc)
                     session["messages"].append(
                         MeetingEngine._create_pause_message(
                             moderator["id"], moderator["name"], 1,
@@ -704,6 +760,7 @@ class MeetingEngine:
                     save_session(session, merge=True)
                     return True, f"[{emp['name']}] 阶段一立论异常，已挂起"
 
+                clear_stuck(session)
                 save_session(session, merge=True)
                 return True, f"[{emp['name']}] 阶段一发言完毕"
 
@@ -759,6 +816,7 @@ class MeetingEngine:
 
                 if res.status != "success" or len(res.output.strip()) < 20:
                     session["status"] = "paused"
+                    mark_stuck(session, moderator["id"], f"主持人整理初稿失败 ({res.status})")
                     session["messages"].append(
                         MeetingEngine._create_pause_message(
                             moderator["id"], moderator["name"], 1,
@@ -783,6 +841,7 @@ class MeetingEngine:
                 session["phase"] = 2
                 session["passed_employees"] = []
                 session["blocker_retry_count"] = 0
+                clear_stuck(session)
 
                 session["messages"].append({
                     "id": generate_msg_id(),
@@ -854,6 +913,7 @@ class MeetingEngine:
                 else:
                     session["status"] = "paused"
                     session["current_speaker"] = None
+                    mark_stuck(session, moderator["id"], f"主持人修订方案失败 ({res_fix.status})")
                     session["messages"].append(
                         MeetingEngine._create_pause_message(
                             moderator["id"], moderator["name"], 2,
@@ -893,6 +953,7 @@ class MeetingEngine:
 
                 if res_verify.status in ["timeout", "error"]:
                     verdict = "TIMEOUT" if res_verify.status == "timeout" else "ERROR"
+                    mark_stuck(session, raiser_emp["id"], "验收回复超时或报错")
                     session["messages"].append({
                         "id": generate_msg_id(),
                         "sender": raiser_emp["id"],
@@ -941,6 +1002,7 @@ class MeetingEngine:
                     session["blocker_under_review"] = None
                     session["passed_employees"] = [raiser_id]
                     session["blocker_retry_count"] = 0
+                    clear_stuck(session)
                     save_session(session, merge=True)
                     return True, f"[{raiser_emp['name']}] 验收通过了修订方案"
                 else:
@@ -950,6 +1012,7 @@ class MeetingEngine:
 
                     if retry_count >= 3:
                         session["status"] = "paused"
+                        mark_stuck(session, moderator["id"], f"同一阻断已修订 {retry_count} 轮仍未达成一致")
                         session["messages"].append(
                             MeetingEngine._create_pause_message(
                                 moderator["id"], moderator["name"], 2,
@@ -973,8 +1036,12 @@ class MeetingEngine:
 
             if not unpassed_ids:
                 session["status"] = "idle"
+                clear_stuck(session)
                 session["messages"].append(
-                    MeetingEngine._create_concluded_message(moderator["id"], moderator["name"])
+                    MeetingEngine._create_concluded_message(
+                        moderator["id"], moderator["name"],
+                        MeetingEngine.absent_names(session, settings, skipped),
+                    )
                 )
                 save_session(session, merge=True)
                 return True, "全体审阅完成，转为空闲等待"
@@ -1018,6 +1085,7 @@ class MeetingEngine:
 
             if res.status in ["timeout", "error"]:
                 verdict = "TIMEOUT" if res.status == "timeout" else "ERROR"
+                mark_stuck(session, reviewer_id, "审阅超时或报错")
                 session["messages"].append({
                     "id": generate_msg_id(),
                     "sender": reviewer_emp["id"],
@@ -1088,12 +1156,17 @@ class MeetingEngine:
 
             if verdict == "PASS" and set(workers).issubset(set(session["passed_employees"])):
                 session["status"] = "idle"
+                clear_stuck(session)
                 session["messages"].append(
-                    MeetingEngine._create_concluded_message(moderator["id"], moderator["name"])
+                    MeetingEngine._create_concluded_message(
+                        moderator["id"], moderator["name"],
+                        MeetingEngine.absent_names(session, settings, skipped),
+                    )
                 )
             elif verdict == "COMMENT" and int(retries.get(reviewer_id, 0)) >= 2:
                 # 收敛保护：同一人连续两次给不出明确结论，暂停而不是无限重问
                 session["status"] = "paused"
+                mark_stuck(session, reviewer_id, "连续两次未给出 [PASS] / [BLOCKER] 结论")
                 session["messages"].append(
                     MeetingEngine._create_pause_message(
                         moderator["id"], moderator["name"], 2,

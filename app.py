@@ -210,16 +210,22 @@ def sanitize_sessions_on_startup():
             full_s = get_session(s["id"])
             if full_s:
                 changed = False
+                speaker = (full_s.get("current_speaker") or "").strip()
                 if full_s.get("current_speaker"):
                     full_s["current_speaker"] = None
                     changed = True
                 if full_s.get("status") == "running":
                     full_s["status"] = "paused"
+                    where = f"（当时停在【{speaker}】发言中途）" if speaker else ""
                     full_s["messages"].append({
                         "id": generate_msg_id(),
                         "sender": "system",
                         "sender_name": "系统复位",
-                        "content": "⚠️ 服务端已重启，系统已复位挂起的发言状态，会议转为暂停，等待群主人工恢复。",
+                        "content": (
+                            f"⚠️ 服务端已重启，后台进程被终止，会议转为暂停{where}。\n"
+                            "点右上角「▶️ 恢复讨论」即可继续（也可以直接点这条消息下方的「继续会议」）。\n"
+                            "如果连续两次都停在同一人身上，系统会自动暂缓它、让余下成员先走。"
+                        ),
                         "phase": full_s.get("phase", 1),
                         "verdict": "RECOVER",
                         "elapsed_time": 0,
@@ -613,17 +619,98 @@ def api_resume(session_id):
     if not is_valid_session_id(session_id):
         return jsonify({"error": "非法 session_id"}), 400
 
+    auto_skipped_name = None
+    stuck_reason = None
+    retried_same = False
+
     with session_lock(session_id):
         session = get_session(session_id)
         if not session:
             return jsonify({"error": "会话不存在"}), 404
+
+        settings = load_settings()
+        workers = MeetingEngine.active_workers(session, settings)
+        if not workers:
+            return jsonify({
+                "error": "本场已经没有能发言的成员（都被跳过，或未配置可用的 CLI）。"
+                         "请先到「👥 参会成员」面板恢复成员，再点「恢复讨论」。"
+            }), 409
+
+        # ---- 「恢复」不等于「原地再撞一次墙」----
+        # 上次是因为某位成员卡住才暂停的，就记着它：
+        #   第一次恢复 -> 给它一次新的机会（同时把这个判断链上的计数清零）；
+        #   仍停在同一人 -> 自动暂缓它，让余下成员继续，否则点多少次都一样。
+        stuck = session.get("stuck") or {}
+        stuck_id = stuck.get("employee_id")
+        stuck_reason = stuck.get("reason") or "未给出明确结论"
+        attempts = int(session.get("stuck_resume_attempts") or 0)
+
+        if not stuck_id:
+            # 旧版本数据没有 stuck 字段，但失败次数还留在 review_comment_retries 里：
+            # 已经用光两次机会的人不该因为缺一个字段就再撞一遍。
+            exhausted = [
+                eid for eid, n in (session.get("review_comment_retries") or {}).items()
+                if isinstance(n, int) and n >= 2 and eid in workers
+            ]
+            if exhausted:
+                stuck_id = exhausted[0]
+                stuck_reason = "已连续 2 次未给出明确结论"
+                attempts = 1    # 视为「已经给过机会」，本次恢复直接放行余下成员
+
+        if stuck_id and stuck_id in workers:
+            # 已经为这个卡点恢复过一次、结果还是停在同一个人 -> 不再让它挡路
+            if attempts >= 1:
+                if len(workers) <= 1:
+                    return jsonify({
+                        "error": f"能发言的只剩 [{MeetingEngine.get_employee(settings, stuck_id).get('name')}] 一个，"
+                                 f"它上一次没给出结论（{stuck_reason}）。再暂缓就没人可审了："
+                                 "请先给它换一个可用的模型/CLI，或直接发消息给出新指令。"
+                    }), 409
+                skipped = list(session.get("skipped_employees") or [])
+                if stuck_id not in skipped:
+                    skipped.append(stuck_id)
+                session["skipped_employees"] = skipped
+                emp = MeetingEngine.get_employee(settings, stuck_id)
+                auto_skipped_name = emp.get("name") or stuck_id
+                session.pop("stuck", None)
+                session.pop("stuck_resume_attempts", None)
+                _append_system_message(
+                    session,
+                    f"⏭ [{auto_skipped_name}] 连续未能给出结论（{stuck_reason}）。"
+                    "本次恢复不再重复问它，自动把它移出发言位，会议改由余下成员继续。"
+                    "需要它的意见时，到「👥 参会成员」面板点「↩️ 恢复」即可把它拉回来。",
+                )
+            else:
+                session["stuck_resume_attempts"] = 1
+                retried_same = True
+        else:
+            # 上次不是卡在某个人身上（例如群主手动暂停）：本次恢复同样算「给了它一次机会」
+            session["stuck_resume_attempts"] = 1
+
+        # 收敛计数必须清零。不清的话，恢复后引擎会拿上一轮的旧计数立刻再次判定
+        # 「连续 2 次无结论」并暂停 —— 用户看到的就是「点了恢复，几秒后又暂停」。
+        session["review_comment_retries"] = {}
+        session["blocker_retry_count"] = 0
 
         session["status"] = "running"
         session["current_speaker"] = None
         save_session(session)
 
     request_resume(session_id)
-    return jsonify({"success": True, "status": "running"})
+
+    if auto_skipped_name:
+        message = f"已自动暂缓 {auto_skipped_name}，余下成员继续。"
+    elif retried_same:
+        message = f"已让上一次停下的成员重新表态（上次原因：{stuck_reason}）。若仍停在同一人，再点一次会自动暂缓它。"
+    else:
+        message = "会议已继续。"
+
+    return jsonify({
+        "success": True,
+        "status": "running",
+        "auto_skipped": auto_skipped_name,
+        "message": message,
+    })
 
 
 # ----------------- 单个成员的异常恢复（重试 / 跳过） -----------------
@@ -885,9 +972,11 @@ def _prepare_shutdown(action: str = "shutdown") -> int:
     except Exception as e:
         print("[Service] 终止 CLI 子进程失败:", e)
 
-    notice = ("🔄 服务已重启，本次发言被打断，会议转为暂停。点「恢复讨论」可继续。"
-              if action == "restart" else
-              "⏻ 服务已停止，本次发言被打断。重新启动服务后点「恢复讨论」可继续。")
+    notice_tpl = ("🔄 服务已重启，本次发言被打断，会议转为暂停{where}。\n"
+                  "点「▶️ 恢复讨论」继续即可；若连续两次都停在同一人，系统会自动暂缓它。"
+                  if action == "restart" else
+                  "⏻ 服务已停止，本次发言被打断{where}。\n"
+                  "重新启动服务后点「▶️ 恢复讨论」继续；若连续两次都停在同一人，系统会自动暂缓它。")
     try:
         for item in list_sessions():
             sid = item.get("id")
@@ -896,13 +985,14 @@ def _prepare_shutdown(action: str = "shutdown") -> int:
             with session_lock(sid):
                 s = get_session(sid)
                 if s and s.get("status") == "running":
+                    speaker = (s.get("current_speaker") or "").strip()
                     s["status"] = "paused"
                     s["current_speaker"] = None
                     s.setdefault("messages", []).append({
                         "id": generate_msg_id(),
                         "sender": "system",
                         "sender_name": "系统广播",
-                        "content": notice,
+                        "content": notice_tpl.format(where=f"（停在【{speaker}】发言中途）" if speaker else ""),
                         "phase": s.get("phase", 1),
                         "verdict": "RECOVER",
                         "elapsed_time": 0,

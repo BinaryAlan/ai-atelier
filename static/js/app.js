@@ -98,7 +98,9 @@ createApp({
       showServiceMenu: false,
       systemStatus: null,
       serviceBusy: false,
-      serviceDown: false
+      serviceDown: false,
+      resumeBusy: false,  // 恢复请求在途：按钮保持「恢复中…」，避免连点变成暂停
+      toastText: ""       // 顶部轻提示（恢复结果/自动暂缓等）
     };
   },
   computed: {
@@ -477,13 +479,51 @@ createApp({
     },
 
     async resumeMeeting() {
-      if (!this.currentSessionId) return;
+      if (!this.currentSessionId || this.resumeBusy) return;
+      const targetId = this.currentSessionId;
+      this.resumeBusy = true;
       try {
-        await fetch(`/api/sessions/${this.currentSessionId}/resume`, { method: "POST" });
-        this.currentSession.status = "running";
+        const res = await fetch(`/api/sessions/${targetId}/resume`, { method: "POST" });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          // 常见：全员已被跳过、或只剩一个已被判定卡住的成员。
+          // 过去这里不检查 ok，界面照样切成「进行中」，用户只能反复点、看不到任何原因。
+          alert(data.error || `恢复失败（HTTP ${res.status}），请稍后再试。`);
+          return;
+        }
+
+        // 用服务端真实状态覆盖本地，而不是先乐观改成 running：
+        // 否则按钮会立刻变成「暂停会议」，用户再点一下就把刚恢复的会议又暂停了。
+        if (targetId === this.currentSessionId) {
+          try {
+            const sRes = await fetch(`/api/sessions/${targetId}`, { cache: "no-store" });
+            if (sRes.ok) {
+              const latest = await sRes.json();
+              if (latest.id === this.currentSessionId) this.currentSession = latest;
+            }
+          } catch (e) {
+            /* 状态拉取失败不影响恢复本身 */
+          }
+        }
+        if (data.message) this.showToast(data.message);
+        this.$nextTick(this.scrollToBottom);
       } catch (e) {
-        console.error("恢复失败:", e);
+        // 服务刚重启时请求会直接失败：一定要说出来，不能只写 console
+        alert(
+          "恢复请求没有送达服务端：\n" + e +
+          "\n\n如果服务刚刚重启，请等 1~2 秒后再点一次。"
+        );
+      } finally {
+        this.resumeBusy = false;
       }
+    },
+
+    // 轻量提示条：不打断操作，也不需要用户点掉
+    showToast(text) {
+      if (!text) return;
+      this.toastText = text;
+      clearTimeout(this._toastTimer);
+      this._toastTimer = setTimeout(() => { this.toastText = ""; }, 4000);
     },
 
     // ---------------- 单个成员的异常恢复（重试 / 跳过 / 恢复） ----------------
