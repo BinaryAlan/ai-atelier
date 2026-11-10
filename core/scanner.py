@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import time
 import shutil
 import subprocess
 from typing import List, Dict, Any
@@ -8,6 +9,7 @@ from typing import List, Dict, Any
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(BASE_DIR, "data")
 CACHE_FILE = os.path.join(DATA_DIR, "scanned_models.json")
+CACHE_TTL_SECONDS = 24 * 3600
 
 MODEL_ALIASES = {
     "hy4std": "腾讯混元 4 (标准版 hy4std)",
@@ -29,21 +31,41 @@ MODEL_ALIASES = {
     "mimo-v2.6-pro": "Mimo V2.6 Pro"
 }
 
+def _load_cache() -> List[Dict[str, Any]]:
+    """读取缓存；超过 TTL 或格式不合法则视为无缓存。"""
+    try:
+        with open(CACHE_FILE, "r", encoding="utf-8") as f:
+            cached = json.load(f)
+    except Exception:
+        return []
+
+    # 兼容旧的「纯列表」缓存格式
+    if isinstance(cached, list):
+        models = cached
+    elif isinstance(cached, dict):
+        if time.time() - float(cached.get("ts") or 0) > CACHE_TTL_SECONDS:
+            return []
+        models = cached.get("models") or []
+    else:
+        return []
+
+    if not isinstance(models, list):
+        return []
+    return [m for m in models if isinstance(m, dict) and m.get("cli_cmd")]
+
+
 def scan_local_models(force_refresh: bool = False) -> List[Dict[str, Any]]:
-    if not force_refresh and os.path.exists(CACHE_FILE):
-        try:
-            with open(CACHE_FILE, "r", encoding="utf-8") as f:
-                cached = json.load(f)
-                if cached:
-                    return cached
-        except Exception:
-            pass
+    if not force_refresh:
+        cached = _load_cache()
+        if cached:
+            return cached
 
     models = []
 
     # 1. Antigravity CLI
     if shutil.which("agy"):
         models.append({
+            "key": "agy:default",
             "cli": "agy",
             "model_id": "default",
             "display_name": "Google Antigravity (Gemini)",
@@ -54,13 +76,18 @@ def scan_local_models(force_refresh: bool = False) -> List[Dict[str, Any]]:
     # 2. CodeBuddy CLI
     if shutil.which("codebuddy"):
         try:
-            out = subprocess.run(["codebuddy", "--help"], capture_output=True, text=True, timeout=5).stdout
+            out = subprocess.run(
+                ["codebuddy", "--help"], capture_output=True, text=True, timeout=5
+            ).stdout
             match = re.search(r"Currently supported:\s*\((.*?)\)", out)
             if match:
                 raw_models = [m.strip() for m in match.group(1).split(",")]
                 for mid in raw_models:
+                    if not mid:
+                        continue
                     display = MODEL_ALIASES.get(mid, f"CodeBuddy ({mid})")
                     models.append({
+                        "key": f"codebuddy:{mid}",
                         "cli": "codebuddy",
                         "model_id": mid,
                         "display_name": display,
@@ -73,7 +100,7 @@ def scan_local_models(force_refresh: bool = False) -> List[Dict[str, Any]]:
     try:
         os.makedirs(DATA_DIR, exist_ok=True)
         with open(CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump(models, f, ensure_ascii=False, indent=2)
+            json.dump({"ts": int(time.time()), "models": models}, f, ensure_ascii=False, indent=2)
     except Exception as e:
         print("保存模型扫描缓存失败:", e)
 

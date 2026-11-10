@@ -7,7 +7,16 @@ import threading
 from typing import Dict, Any, Tuple, Optional, List
 from dataclasses import dataclass
 
-ALLOWED_BINARIES = {"agy", "codebuddy", "python", "python3"}
+# 白名单只允许「AI CLI 客户端」。
+# 严禁加入 python/python3/bash/sh 等通用解释器：它们带 -c/-m 参数即可执行任意代码，
+# 会让 validate_cli_template 与路径校验形同虚设（等价于本地 RCE）。
+ALLOWED_BINARIES = {"agy", "codebuddy"}
+
+# 单条 prompt 的长度上限：prompt 通过 argv 传递，超长会触发 E2BIG 并让 CLI 直接失败
+MAX_PROMPT_CHARS = 100_000
+MIN_TIMEOUT = 10
+MAX_TIMEOUT = 3600
+
 
 @dataclass
 class ExecutionResult:
@@ -17,13 +26,15 @@ class ExecutionResult:
     elapsed: float    # Elapsed seconds
     error_msg: Optional[str] = None
 
+
 _PROCESS_LOCK = threading.Lock()
 ACTIVE_PROCESSES: Dict[str, List[subprocess.Popen]] = {}
+
 
 def validate_cli_template(cmd_template: str) -> Tuple[bool, str]:
     """
     安全校验 CLI 执行模板：
-    1. 必须以白名单命令开头 (agy, codebuddy, python3 等)
+    1. 必须以白名单命令开头 (agy, codebuddy)
     2. 必须包含 {prompt} 占位符
     3. 严禁包含危险的 Shell 管道、重定向、分号及命令拼接符
     """
@@ -54,6 +65,14 @@ def validate_cli_template(cmd_template: str) -> Tuple[bool, str]:
     return True, "验证通过"
 
 
+def _coerce_timeout(value: Any, fallback: int = 180) -> int:
+    try:
+        timeout = int(float(value))
+    except (TypeError, ValueError):
+        timeout = fallback
+    return max(MIN_TIMEOUT, min(MAX_TIMEOUT, timeout))
+
+
 class Executor:
     @staticmethod
     def kill_session_process(session_id: str) -> bool:
@@ -66,18 +85,28 @@ class Executor:
 
         for p in procs:
             if p and p.poll() is None:
+                # 打上显式中断标记，供 _run_cli 区分「用户暂停」与「程序自身非零退出」
                 try:
-                    # 终止进程组中的所有子进程
-                    pgid = os.getpgid(p.pid)
-                    os.killpg(pgid, signal.SIGTERM)
+                    p.wb_interrupted = True  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+                try:
+                    if os.name == "posix":
+                        pgid = os.getpgid(p.pid)
+                        os.killpg(pgid, signal.SIGTERM)
+                    else:
+                        p.terminate()
                     try:
-                        p.wait(timeout=0.2)
+                        p.wait(timeout=0.3)
                     except subprocess.TimeoutExpired:
-                        os.killpg(pgid, signal.SIGKILL)
-                        p.wait(timeout=0.5)
+                        if os.name == "posix":
+                            os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+                        else:
+                            p.kill()
+                        p.wait(timeout=1.0)
                     killed_any = True
                 except ProcessLookupError:
-                    pass
+                    killed_any = True
                 except Exception as e:
                     print(f"终止进程组异常 (PID: {p.pid}):", e)
         return killed_any
@@ -95,10 +124,18 @@ class Executor:
         """
         start_time = time.time()
         emp_type = employee.get("type", "cli")
-        emp_timeout = employee.get("timeout", timeout)
+        emp_timeout = _coerce_timeout(employee.get("timeout", timeout), timeout)
 
         if emp_type == "cli":
-            cmd_template = employee.get("cli_cmd", 'agy -p "{prompt}"')
+            cmd_template = employee.get("cli_cmd", "")
+            if not cmd_template:
+                return ExecutionResult(
+                    status="error",
+                    output="【该角色未配置 CLI 命令模板，无法发言】",
+                    raw_output="",
+                    elapsed=0.0,
+                    error_msg="missing cli_cmd"
+                )
             result = Executor._run_cli(
                 cmd_template=cmd_template,
                 prompt=prompt,
@@ -148,6 +185,15 @@ class Executor:
                 error_msg=err_msg
             )
 
+        if len(prompt) > MAX_PROMPT_CHARS:
+            return ExecutionResult(
+                status="error",
+                output=f"【Prompt 过长（{len(prompt)} 字符，上限 {MAX_PROMPT_CHARS}），已中止本次调用】",
+                raw_output="",
+                elapsed=0.0,
+                error_msg="prompt too large for argv"
+            )
+
         tokens = shlex.split(cmd_template)
         final_args = []
         replaced = False
@@ -162,7 +208,7 @@ class Executor:
         if not replaced:
             final_args.append(prompt)
 
-        # 校验工作目录
+        # 校验工作目录（必须是真实存在的目录）
         cwd = None
         if workspace_dir and os.path.isdir(workspace_dir):
             cwd = os.path.abspath(workspace_dir)
@@ -171,33 +217,37 @@ class Executor:
 
         p = None
         try:
-            p = subprocess.Popen(
-                final_args,
+            popen_kwargs = dict(
                 cwd=cwd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                preexec_fn=os.setsid
+                encoding="utf-8",
+                errors="replace",
             )
+            if os.name == "posix":
+                # 独立进程组，便于整组回收子进程
+                popen_kwargs["preexec_fn"] = os.setsid
+
+            p = subprocess.Popen(final_args, **popen_kwargs)
             with _PROCESS_LOCK:
-                if session_id not in ACTIVE_PROCESSES:
-                    ACTIVE_PROCESSES[session_id] = []
-                ACTIVE_PROCESSES[session_id].append(p)
+                ACTIVE_PROCESSES.setdefault(session_id, []).append(p)
 
             stdout, stderr = p.communicate(timeout=timeout)
 
-            # 检查是否是被用户手动 SIGTERM / SIGKILL 中断
-            if p.returncode in [-signal.SIGTERM, -signal.SIGKILL, 15, 9]:
+            # 只有被 kill_session_process 显式标记过的才算「用户暂停」
+            # （否则 CLI 自己 exit(9)/exit(15) 会被误判为用户中断）
+            if getattr(p, "wb_interrupted", False):
                 return ExecutionResult(
                     status="interrupted",
                     output="【任务已被用户手动暂停中断】",
-                    raw_output=stderr.strip() or stdout.strip(),
+                    raw_output=(stderr or "").strip() or (stdout or "").strip(),
                     elapsed=0.0,
                     error_msg="Process interrupted by user pause"
                 )
 
             if p.returncode != 0:
-                err_text = stderr.strip() or stdout.strip() or f"Process exited with code {p.returncode}"
+                err_text = (stderr or "").strip() or (stdout or "").strip() or f"Process exited with code {p.returncode}"
                 return ExecutionResult(
                     status="error",
                     output=f"【CLI 执行报错: {err_text}】",
@@ -208,16 +258,19 @@ class Executor:
 
             return ExecutionResult(
                 status="success",
-                output=stdout.strip(),
-                raw_output=stdout,
+                output=(stdout or "").strip(),
+                raw_output=stdout or "",
                 elapsed=0.0
             )
 
         except subprocess.TimeoutExpired:
             if p:
                 try:
-                    os.killpg(os.getpgid(p.pid), signal.SIGKILL)
-                    p.wait(timeout=0.5)
+                    if os.name == "posix":
+                        os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+                    else:
+                        p.kill()
+                    p.wait(timeout=1.0)
                 except Exception:
                     pass
             return ExecutionResult(
@@ -238,7 +291,8 @@ class Executor:
         finally:
             if p:
                 with _PROCESS_LOCK:
-                    if session_id in ACTIVE_PROCESSES and p in ACTIVE_PROCESSES[session_id]:
-                        ACTIVE_PROCESSES[session_id].remove(p)
-                        if not ACTIVE_PROCESSES[session_id]:
+                    procs = ACTIVE_PROCESSES.get(session_id)
+                    if procs and p in procs:
+                        procs.remove(p)
+                        if not procs:
                             ACTIVE_PROCESSES.pop(session_id, None)

@@ -5,3 +5,4 @@ data/sessions/*.json
 !data/sessions/.gitkeep
 data/scanned_models.json
 data/*.tmp*
+.workbuddy/
