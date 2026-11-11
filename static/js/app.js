@@ -341,9 +341,6 @@ createApp({
       this.showSettings = true;
       if (tab === "service") this.fetchSystemStatus();
     },
-    openServiceSettings() {
-      this.openSettings("service");
-    },
     // 批量开关写权限：只改内存里的配置，仍需点「保存配置」才落盘
     setAllWriteAccess(enabled) {
       (this.settings.employees || []).forEach(emp => { emp.write_access = !!enabled; });
@@ -488,7 +485,6 @@ createApp({
       }
       await this.loadSessions();
       await this.triggerScanModels(false);
-      this.fetchSystemStatus(); // 仅用于点亮服务入口，不阻塞首屏
 
       if (this.sessions.length > 0) {
         // 刷新页面（尤其是「正在回答」时刷新）要回到刚才那场会，而不是列表第一场：

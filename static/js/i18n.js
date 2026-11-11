@@ -5,7 +5,6 @@ window.AIM_I18N = {
   en: {
     "拖动调整侧栏宽度": "Drag to resize the sidebar",
     "多 AI 协同圆桌讨论中枢": "Multi-AI roundtable",
-    "服务状态 · 重启 · 停止": "Service status · Restart · Stop",
     "系统设置": "Settings",
     "发起新议题": "New meeting",
     "全部": "All",
