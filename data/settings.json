@@ -43,5 +43,11 @@
     "system_prompt": "你是会议主持人。负责中立客观地主持会议进程、梳理记录各方发言要点、综合整理方案纪要，并在全员达成共识时出具定稿报告。",
     "timeout": 0,
     "type": "cli"
+  },
+  "ui_language": "zh",
+  "default_mode": "roundtable",
+  "collab": {
+    "max_rounds": 4,
+    "allow_agent_mentions": true
   }
 }

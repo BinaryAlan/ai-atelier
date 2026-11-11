@@ -9,3 +9,8 @@ data/scanned_models.json
 data/*.tmp*
 .workbuddy/
 .run/
+
+# 前端依赖随项目一起提供（断网可用），必须入库。
+# 全局 gitignore 里有通用的 `vendor/`，不加例外会把 static/vendor/ 整个排除掉。
+!static/vendor/
+!static/vendor/*.js

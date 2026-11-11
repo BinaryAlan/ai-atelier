@@ -20,13 +20,14 @@ from core.engine import (
 from core.executor import Executor, validate_cli_template
 from core.streaming import get_stream
 from core.scanner import scan_local_models
+from core.i18n import L, system_label
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 
 # 启动时刻与运行模式（供 /api/system/status 展示，也让「重启/停止」知道该走哪条路）
 _STARTED_AT = time.time()
-_DEBUG_ENV = os.environ.get("FLASK_DEBUG", "1") in ["1", "true"]
+_DEBUG_ENV = os.environ.get("FLASK_DEBUG", "0") in ["1", "true"]
 # werkzeug reloader 会用它自己启动子进程并置位该变量；据此判断当前是「reloader 子进程」
 _UNDER_RELOADER = os.environ.get("WERKZEUG_RUN_MAIN") == "true"
 
@@ -47,6 +48,25 @@ def _guard_host():
     if hostname and hostname not in _ALLOWED_HOSTNAMES:
         return jsonify({"error": "forbidden host"}), 403
     return None
+
+
+@app.after_request
+def _cache_policy(resp):
+    """静态资源全部本地化后的缓存策略。
+
+    - static/vendor/*：第三方库固定版本且 URL 带 ?v=，可长期强缓存（immutable）。
+    - 其余 static/*：交给 ETag / Last-Modified 走 304 协商缓存，改完刷新即生效，
+      不会像长 TTL 那样把开发中的改动卡在浏览器里。
+    - 页面与所有 /api/*：一律不缓存，避免轮询拿到旧状态。
+    """
+    path = request.path or ""
+    if path.startswith("/static/vendor/"):
+        resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+    elif path.startswith("/static/"):
+        resp.headers["Cache-Control"] = "no-cache"
+    elif path == "/" or path.startswith("/api/"):
+        resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 
 def _json_body() -> dict:
@@ -110,8 +130,12 @@ def start_background_runner(session_id: str):
                         curr_s.setdefault("messages", []).append({
                             "id": generate_msg_id(),
                             "sender": "system",
-                            "sender_name": "系统异常捕获",
-                            "content": f"⚠️ 会议推进遇到内部异常: {str(ex)}。已自动暂停，可点击恢复继续。",
+                            "sender_name": system_label("系统异常捕获"),
+                            "content": L(
+                                f"⚠️ 会议推进遇到内部异常: {str(ex)}。已自动暂停，可点击恢复继续。",
+                                f"⚠️ Internal error while advancing the meeting: {str(ex)}. "
+                                "Paused automatically; click Resume to continue.",
+                            ),
                             "phase": curr_s.get("phase", 1),
                             "verdict": "ERROR",
                             "elapsed_time": 0,
@@ -221,15 +245,22 @@ def sanitize_sessions_on_startup():
                     changed = True
                 if full_s.get("status") == "running":
                     full_s["status"] = "paused"
-                    where = f"（当时停在【{speaker}】发言中途）" if speaker else ""
+                    where = L(
+                        f"（当时停在【{speaker}】发言中途）" if speaker else "",
+                        f" (interrupted while [{speaker}] was speaking)" if speaker else "",
+                    )
                     full_s["messages"].append({
                         "id": generate_msg_id(),
                         "sender": "system",
-                        "sender_name": "系统复位",
-                        "content": (
+                        "sender_name": system_label("系统复位"),
+                        "content": L(
                             f"⚠️ 服务端已重启，后台进程被终止，会议转为暂停{where}。\n"
                             "点右上角「▶️ 恢复讨论」即可继续（也可以直接点这条消息下方的「继续会议」）。\n"
-                            "如果连续两次都停在同一人身上，系统会自动暂缓它、让余下成员先走。"
+                            "如果连续两次都停在同一人身上，系统会自动暂缓它、让余下成员先走。",
+                            f"⚠️ The service restarted and the background runner was terminated. "
+                            f"The meeting is paused{where}.\n"
+                            "Click Resume (or Continue meeting under this message) to carry on.\n"
+                            "If it stalls on the same member twice, that member is deferred so the others go first.",
                         ),
                         "phase": full_s.get("phase", 1),
                         "verdict": "RECOVER",
@@ -309,6 +340,9 @@ def _sanitize_agent(raw, label: str, default_id: str) -> "tuple":
         "system_prompt": str(raw.get("system_prompt") or "")[:8000],
         "enabled": bool(raw.get("enabled", True)),
         "timeout": timeout,
+        # 写权限由服务端按 CLI 类型注入对应开关（见 core.executor.apply_access_mode）：
+        # 模板里手写 --dangerously-skip-permissions 也能生效，但 UI 开关是唯一可审计的入口。
+        "write_access": bool(raw.get("write_access", False)),
     }, None
 
 
@@ -340,6 +374,21 @@ def api_save_settings():
     payload["moderator"] = moderator
     payload["employees"] = employees
 
+    # 顶层偏好：非法值一律落回默认，不让前端一个手滑把界面切成看不懂的语言
+    lang = str(payload.get("ui_language") or "zh").lower()
+    payload["ui_language"] = lang if lang in ("zh", "en") else "zh"
+    mode = str(payload.get("default_mode") or "roundtable")
+    payload["default_mode"] = mode if mode in ("roundtable", "task") else "roundtable"
+    collab = payload.get("collab") if isinstance(payload.get("collab"), dict) else {}
+    try:
+        max_rounds = int(collab.get("max_rounds", 4))
+    except (TypeError, ValueError):
+        max_rounds = 4
+    payload["collab"] = {
+        "max_rounds": max(1, min(20, max_rounds)),
+        "allow_agent_mentions": bool(collab.get("allow_agent_mentions", True)),
+    }
+
     save_settings(payload)
     return jsonify({"success": True, "settings": payload})
 
@@ -364,7 +413,8 @@ def api_create_session():
     session = create_session(
         title=title,
         employee_ids=employee_ids,
-        workspace_dir=workspace_dir
+        workspace_dir=workspace_dir,
+        mode=str(data.get("mode") or "roundtable")
     )
     return jsonify(session)
 
@@ -422,16 +472,19 @@ def api_update_session(session_id):
                 parts = []
                 if added_ids:
                     added_names = [MeetingEngine.get_employee(settings, eid).get("name", eid) for eid in added_ids]
-                    parts.append(f"加入了 [{', '.join(added_names)}]")
+                    parts.append(L(f"加入了 [{', '.join(added_names)}]", f"added [{', '.join(added_names)}]"))
                 if removed_ids:
                     removed_names = [MeetingEngine.get_employee(settings, eid).get("name", eid) for eid in removed_ids]
-                    parts.append(f"移出了 [{', '.join(removed_names)}]")
+                    parts.append(L(f"移出了 [{', '.join(removed_names)}]", f"removed [{', '.join(removed_names)}]"))
 
-                notice_text = f"📢 参会人员变动：{'；'.join(parts)}"
+                notice_text = L(
+                    f"📢 参会人员变动：{'；'.join(parts)}",
+                    "📢 Participants changed: " + "; ".join(parts),
+                )
                 session.setdefault("messages", []).append({
                     "id": generate_msg_id(),
                     "sender": "system",
-                    "sender_name": "系统广播",
+                    "sender_name": system_label(),
                     "content": notice_text,
                     "phase": session.get("phase", 1),
                     "verdict": "MEMBER_CHANGE",
@@ -445,6 +498,39 @@ def api_update_session(session_id):
                 session["skipped_employees"] = [
                     e for e in (session.get("skipped_employees") or []) if e in new_ids
                 ]
+
+        if "mode" in data:
+            mode = str(data.get("mode") or "").strip()
+            if mode not in ("roundtable", "task"):
+                return jsonify({"error": "mode 只能是 roundtable 或 task"}), 400
+            if session.get("status") == "running":
+                return jsonify({"error": "会议正在推进中，先暂停再切换模式"}), 409
+            if mode != (session.get("mode") or "roundtable"):
+                session["mode"] = mode
+                # 切换模式时清掉进行中的任务状态，避免「圆桌会议里挂着一个任务横幅」
+                session["collab"] = None
+                session["target_direct_mention"] = None
+                session["messages"].append({
+                    "id": generate_msg_id(),
+                    "sender": "system",
+                    "sender_name": system_label(),
+                    "content": L(
+                        "🔀 会议模式已切换为「自主协作」：用 @ 指定负责人，它会独立把活做完，"
+                        "中途可自己 @ 同事协助。"
+                        if mode == "task" else
+                        "🔀 会议模式已切换为「圆桌讨论」：成员依次发言，主持人汇总纪要。",
+                        "🔀 Switched to Autonomous task: @ one owner to do the work independently; "
+                        "it can @ teammates for help along the way."
+                        if mode == "task" else
+                        "🔀 Switched to Roundtable: members speak in turn and the moderator writes the minutes.",
+                    ),
+                    "phase": session.get("phase", 1),
+                    "verdict": "MODE_CHANGE",
+                    "elapsed_time": 0,
+                    "created_at": int(time.time()),
+                    "sent_prompt": "",
+                    "raw_response": ""
+                })
 
         if "workspace_dir" in data:
             raw_dir = str(data.get("workspace_dir") or "").strip()
@@ -472,8 +558,11 @@ def api_update_session(session_id):
                 session.setdefault("messages", []).append({
                     "id": generate_msg_id(),
                     "sender": "system",
-                    "sender_name": "系统广播",
-                    "content": "📝 群主改写了方案正文，审阅轮次已重置，所有成员将基于新版重新审阅。",
+                    "sender_name": system_label(),
+                    "content": L(
+                        "📝 群主改写了方案正文，审阅轮次已重置，所有成员将基于新版重新审阅。",
+                        "📝 The owner rewrote the proposal. The review round is reset and everyone will review the new version.",
+                    ),
                     "phase": session.get("phase", 1),
                     "verdict": "DOC_EDIT",
                     "elapsed_time": 0,
@@ -641,8 +730,11 @@ def api_pause(session_id):
         session.setdefault("messages", []).append({
             "id": generate_msg_id(),
             "sender": "system",
-            "sender_name": "系统广播",
-            "content": "🛑 会议已被群主手动暂停，正在运行的 AI 任务已立即终止中断。",
+            "sender_name": system_label(),
+            "content": L(
+                "🛑 会议已被群主手动暂停，正在运行的 AI 任务已立即终止中断。",
+                "🛑 The owner paused the meeting. Running AI tasks were stopped immediately.",
+            ),
             "phase": session.get("phase", 1),
             "verdict": "PAUSE",
             "elapsed_time": 0,
@@ -656,6 +748,35 @@ def api_pause(session_id):
     killed = Executor.kill_session_process(session_id)
 
     return jsonify({"success": True, "killed": killed, "status": "paused"})
+
+
+@app.route("/api/sessions/<session_id>/task/stop", methods=["POST"])
+def api_stop_task(session_id):
+    """
+    结束本场正在进行的自主任务（@ 某人一直干活的那条线）。
+
+    与「暂停会议」的区别：暂停是整场停住、恢复后从原地继续；
+    结束任务是把这条任务线收掉，负责人不再自动往下跑，之后可以重新 @ 它开新任务。
+    """
+    if not is_valid_session_id(session_id):
+        return jsonify({"error": "非法 session_id"}), 400
+    if not _require_action_header():
+        return jsonify({"error": "缺少操作确认头"}), 400
+
+    with session_lock(session_id):
+        session = get_session(session_id)
+        if not session:
+            return jsonify({"error": "会话不存在"}), 404
+        collab = session.get("collab")
+        if not isinstance(collab, dict) or not collab.get("active"):
+            return jsonify({"error": "当前没有正在进行的自主任务"}), 409
+        MeetingEngine.finish_task(session, "cancelled")
+        save_session(session)
+        snapshot = session
+
+    # 进程在锁外终止：正在跑的那一轮结果会被引擎丢弃（它落盘前发现任务已结束）
+    Executor.kill_session_process(session_id)
+    return jsonify({"success": True, "session": snapshot})
 
 
 @app.route("/api/sessions/<session_id>/interrupt", methods=["POST"])
@@ -759,9 +880,14 @@ def api_resume(session_id):
                 session.pop("stuck_resume_attempts", None)
                 _append_system_message(
                     session,
-                    f"⏭ [{auto_skipped_name}] 连续未能给出结论（{stuck_reason}）。"
-                    "本次恢复不再重复问它，自动把它移出发言位，会议改由余下成员继续。"
-                    "需要它的意见时，到「👥 参会成员」面板点「↩️ 恢复」即可把它拉回来。",
+                    L(
+                        f"⏭ [{auto_skipped_name}] 连续未能给出结论（{stuck_reason}）。"
+                        "本次恢复不再重复问它，自动把它移出发言位，会议改由余下成员继续。"
+                        "需要它的意见时，到「👥 参会成员」面板点「↩️ 恢复」即可把它拉回来。",
+                        f"⏭ [{auto_skipped_name}] repeatedly failed to conclude ({stuck_reason}). "
+                        "It is removed from the speaking queue for this resume; the others continue. "
+                        "Use Restore in Participants when you need its input again.",
+                    ),
                 )
             else:
                 session["stuck_resume_attempts"] = 1
@@ -843,7 +969,7 @@ def _append_system_message(session: dict, text: str, verdict: str = "RECOVER") -
     session.setdefault("messages", []).append({
         "id": generate_msg_id(),
         "sender": "system",
-        "sender_name": "系统广播",
+        "sender_name": system_label(),
         "content": text,
         "phase": session.get("phase", 1),
         "verdict": verdict,
@@ -925,6 +1051,9 @@ def api_retry_message(session_id, msg_id):
                     exclude_msg_id=msg_id,
                     is_retry=True,
                     quoted=quoted,
+                    # 自主任务里的失败轮次要按任务口径重问（要它动手、要完成标记），
+                    # 否则重试出来的是一段「问答腔」，接不上后面的轮次
+                    task_mode=bool(msg.get("collab_role") == "owner"),
                 )
                 msg["sent_prompt"] = prompt
                 msg["prompt_rebuilt_at"] = int(time.time())
@@ -965,20 +1094,30 @@ def api_retry_message(session_id, msg_id):
                         resume = curr["status"] == "running"
                         _append_system_message(
                             curr,
-                            f"🔄 已重新应答 [{emp_name}]，新结果已替换这一条。会议状态保持原样。"
+                            L(
+                                f"🔄 已重新应答 [{emp_name}]，新结果已替换这一条。会议状态保持原样。",
+                                f"🔄 [{emp_name}] answered again; this message was replaced. Meeting state unchanged.",
+                            )
                         )
                     else:
                         curr["status"] = "running"
                         _append_system_message(
                             curr,
-                            f"🔄 已单独重试 [{emp_name}]，这一条发言用新结果替换（其他人不受影响）。会议继续。"
+                            L(
+                                f"🔄 已单独重试 [{emp_name}]，这一条发言用新结果替换（其他人不受影响）。会议继续。",
+                                f"🔄 Retried [{emp_name}]; this message was replaced (others unaffected). The meeting continues.",
+                            )
                         )
                         resume = True
                 elif res.status in ("stopped", "interrupted"):
                     target["verdict"] = "TIMEOUT" if msg.get("verdict") == "TIMEOUT" else "ERROR"
                     curr["status"] = (prev_status if prev_status in ("running", "paused") else "idle") \
                         if is_direct else "paused"
-                    _append_system_message(curr, f"⏸️ 单独重试 [{emp_name}] 已被用户手动暂停中断。")
+                    _append_system_message(
+                        curr,
+                        L(f"⏸️ 单独重试 [{emp_name}] 已被用户手动暂停中断。",
+                          f"⏸️ The retry for [{emp_name}] was interrupted by the owner."),
+                    )
                 else:
                     target["verdict"] = "TIMEOUT" if res.status == "timeout" else "ERROR"
                     curr["status"] = (prev_status if prev_status in ("running", "paused") else "idle") \
@@ -986,16 +1125,26 @@ def api_retry_message(session_id, msg_id):
                     if is_direct:
                         _append_system_message(
                             curr,
-                            f"⚠️ [{emp_name}] 这次点名应答仍然失败（{res.status}）。"
-                            "它不是会议流程的一部分，会议状态没有改变；"
-                            "可以再点一次「🔄 重试」，或先修好它的 CLI 参数。"
+                            L(
+                                f"⚠️ [{emp_name}] 这次点名应答仍然失败（{res.status}）。"
+                                "它不是会议流程的一部分，会议状态没有改变；"
+                                "可以再点一次「🔄 重试」，或先修好它的 CLI 参数。",
+                                f"⚠️ [{emp_name}] still failed to answer the direct question ({res.status}). "
+                                "It is not part of the meeting flow, so the meeting state is unchanged. "
+                                "Click Retry again, or fix its CLI parameters first.",
+                            )
                         )
                     else:
                         _append_system_message(
                             curr,
-                            f"⚠️ [{emp_name}] 重试仍然失败（{res.status}）。"
-                            "可以点该条发言旁的「跳过此人」继续推进，或先修好它的 CLI"
-                            "（例如 --tools 参数）再重试。"
+                            L(
+                                f"⚠️ [{emp_name}] 重试仍然失败（{res.status}）。"
+                                "可以点该条发言旁的「跳过此人」继续推进，或先修好它的 CLI"
+                                "（例如 --tools 参数）再重试。",
+                                f"⚠️ The retry for [{emp_name}] failed again ({res.status}). "
+                                "Click Skip on that message to move on, or fix its CLI "
+                                "(e.g. --tools) and retry.",
+                            )
                         )
                 save_session(curr)
         except Exception as ex:
@@ -1006,7 +1155,10 @@ def api_retry_message(session_id, msg_id):
                     if curr:
                         curr["current_speaker"] = None
                         curr["status"] = "paused"
-                        _append_system_message(curr, f"⚠️ 重试过程出现异常: {ex}")
+                        _append_system_message(
+                            curr,
+                            L(f"⚠️ 重试过程出现异常: {ex}", f"⚠️ Unexpected error during retry: {ex}"),
+                        )
                         save_session(curr)
             except Exception as e2:
                 print("[Retry] 异常状态落盘失败:", e2)
@@ -1069,8 +1221,12 @@ def api_skip_message(session_id, msg_id):
         session["status"] = "running"
         _append_system_message(
             session,
-            f"⏭ 已将 [{emp_name}] 跳过：它不再占用本次会议的发言位，余下成员照常推进。\n"
-            "配置与历史发言都保留，在「参会成员」面板点「恢复」即可把它拉回来。"
+            L(
+                f"⏭ 已将 [{emp_name}] 跳过：它不再占用本次会议的发言位，余下成员照常推进。\n"
+                "配置与历史发言都保留，在「参会成员」面板点「恢复」即可把它拉回来。",
+                f"⏭ Skipped [{emp_name}]: it no longer takes a speaking slot and the others continue.\n"
+                "Its settings and past messages are kept; use Restore in Participants to bring it back.",
+            )
         )
         save_session(session)
 
@@ -1096,7 +1252,11 @@ def api_restore_member(session_id, emp_id):
         restored = MeetingEngine.get_employee(load_settings(), emp_id)
         _append_system_message(
             session,
-            f"↩️ 已把 [{restored.get('name') or emp_id}] 恢复到发言位，会在下一次点名时参与。",
+            L(
+                f"↩️ 已把 [{restored.get('name') or emp_id}] 恢复到发言位，会在下一次点名时参与。",
+                f"↩️ Restored [{restored.get('name') or emp_id}] to the speaking queue; "
+                "it will take part in the next round.",
+            ),
         )
         save_session(session)
 
@@ -1148,8 +1308,14 @@ def _prepare_shutdown(action: str = "shutdown") -> int:
                     s.setdefault("messages", []).append({
                         "id": generate_msg_id(),
                         "sender": "system",
-                        "sender_name": "系统广播",
-                        "content": notice_tpl.format(where=f"（停在【{speaker}】发言中途）" if speaker else ""),
+                        "sender_name": system_label(),
+                        "content": L(
+                            notice_tpl.format(where=f"（停在【{speaker}】发言中途）" if speaker else ""),
+                            ("⏻ Service stopped, the current answer was interrupted"
+                             + (f" (while [{speaker}] was speaking)" if speaker else "") + ".\n"
+                             "After restarting, click Resume to continue. If it stalls on the same member twice, "
+                             "that member is deferred automatically."),
+                        ),
                         "phase": s.get("phase", 1),
                         "verdict": "RECOVER",
                         "elapsed_time": 0,
@@ -1266,12 +1432,14 @@ def api_system_shutdown():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5050))
     host = os.environ.get("HOST", "127.0.0.1")  # 默认仅绑定本地，杜绝局域网调试器暴露
-    is_debug = os.environ.get("FLASK_DEBUG", "1") in ["1", "true"]
+    is_debug = os.environ.get("FLASK_DEBUG", "0") in ["1", "true"]
 
     print(f"\n🚀 AI-Meeting (AI 圆桌会议室) 启动中...")
     print(f"👉 访问地址: http://127.0.0.1:{port}")
     if is_debug:
-        print(f"⚡ 代码热重载已启用 (无交互调试器暴露，安全模式)")
+        print(f"⚡ 开发模式：代码热重载已启用 (无交互调试器暴露，安全模式)")
+    else:
+        print(f"ℹ️  正常使用模式：改 .py 后执行 ./run.sh restart；开发时可用 ./run.sh dev 开启热重载")
 
     # use_debugger=False 彻底禁止外部或局域网访问 Werkzeug Debugger PIN 执行任意代码
     app.run(host=host, port=port, debug=is_debug, use_reloader=is_debug, use_debugger=False)

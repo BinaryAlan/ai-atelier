@@ -14,13 +14,14 @@
 [![Python](https://img.shields.io/badge/Python-3.8%2B-3776AB?style=flat-square&logo=python&logoColor=white)](https://python.org)
 [![License](https://img.shields.io/badge/License-MIT-emerald?style=flat-square)](LICENSE)
 [![Execution](https://img.shields.io/badge/Execution-%E6%9C%AC%E5%9C%B0%20CLI-blueviolet?style=flat-square)](#config)
+[![UI](https://img.shields.io/badge/UI-%E4%B8%AD%E6%96%87%20%2F%20EN-blue?style=flat-square)](#modes)
 [![Security](https://img.shields.io/badge/Security-Local--First-green?style=flat-square)](#security)
 
 <br/>
 
 <img src="docs/demo.gif" alt="AI-Meeting 演示：三栏工作台、左侧讨论流、右侧实时生长的方案纪要、Prompt 审计" width="880">
 
-<sub>演示使用完全虚构的数据（一个杜撰的「周报工具」议题），不含任何真实聊天内容。</sub>
+<sub>演示使用完全虚构的数据（一个杜撰的「周报工具」议题），不含任何真实聊天内容。英文版 README 配有独立的英文界面动图。</sub>
 
 </div>
 
@@ -31,11 +32,10 @@
 - [为什么需要 AI-Meeting](#why)
 - [核心运行机制](#how)
 - [特性亮点](#features)
+- [协作模式与系统设置](#modes)
 - [快速启动](#start)
 - [虚拟员工配置](#config)
 - [安全边界](#security)
-- [已知限制与取舍](#limits)
-- [故障排查](#trouble)
 - [目录架构](#layout)
 
 ---
@@ -96,7 +96,7 @@ flowchart TD
 > [!IMPORTANT]
 > **结论是解析出来的，不是猜出来的。** 引擎只认回答首行明确的标记，绝不会从散文里「推测」它同意了 —— 所以「这样不行」这类否定句不会被误判成通过。
 >
-> **纪只写真实发生的事。** 成员超时、返回空内容、或吐出裸工具调用时，主持人被明令禁止替它编造立场；草案末尾会附一份《数据完整性说明》，列明缺席成员，记录保持可审计。
+> **纪要只写真实发生的事。** 成员超时、返回空内容、或吐出裸工具调用时，主持人被明令禁止替它编造立场；草案末尾会附一份《数据完整性说明》，列明缺席成员，记录保持可审计。
 
 ---
 
@@ -142,6 +142,53 @@ flowchart TD
 
 ---
 
+<a id="modes"></a>
+## 🎛️ 协作模式与系统设置
+
+### 两种协作方式
+
+新建会议时选择，之后也可以在「编辑会议」里切换（需先暂停）：
+
+| 模式 | 行为 |
+| :--- | :--- |
+| **🗣️ 圆桌讨论** | 成员依次发言，走阶段一立论与阶段二审阅；主持人汇总并维护右侧方案纪要。 |
+| **🎯 自主协作** | 用 `@` 把任务交给一位负责人，它自己一直干下去，直到写出完成标记或到达轮次上限；过程中它可以再 `@` 同事要意见或做辅助。顶部任务横幅显示当前轮次，并提供「结束任务」。 |
+
+自主协作的规则在 **设置 → 会议行为**：单个任务的最大轮次（默认 4，可设 1~20）以及是否允许 AI 在执行中拉同事协助。每一轮就是一次完整模型调用，轮次上限同时也是成本上限；关掉协助后负责人只自己干。
+
+### 写权限（让 AI 真的能动手）
+
+只读角色只能查资料。在 **设置 → 执行权限** 里可以逐人开启写权限，也可以「全部开启 / 全部关闭」，然后点「保存配置」：
+
+- `agy` 自动补 `--dangerously-skip-permissions`；
+- `codebuddy` 自动补 `-y`，并把 `Write,Edit,Bash` 加进 `--tools`（与 `Read,Glob,Grep` 一起）。
+
+参数由服务端按设置注入，不用手改命令模板，权限也集中在一处可审计。**写权限默认关闭** —— 开启后该角色能直接改工作目录里的文件、执行命令，请只在本机、目录可信时启用。
+
+### 中英双语界面
+
+界面内置 **简体中文 / English**。在 **设置 → 通用与语言** 里切换，立即生效；选择写入 `data/settings.json`（同一台机器上的所有浏览器共用），本地再缓存一份避免首屏闪中文。后端生成的系统广播、主持人流程播报也跟随同一设置。模型 Prompt 与 AI 发言保持原样 —— 它们是输入输出，不是界面文案。
+
+### 按功能分类的设置中心
+
+设置不再挤在一个长弹窗里，而是分成五页：
+
+| 页面 | 内容 |
+| :--- | :--- |
+| **通用与语言** | 界面语言、前端依赖状态 |
+| **成员与主持人** | 主持人、成员人设、启停、增删角色 |
+| **执行权限** | 写权限、单次超时、批量开关 |
+| **会议行为** | 新会议默认模式、自主协作规则 |
+| **服务进程** | PID / 运行时长 / 在跑会议、**重启服务**、**停止服务** |
+
+原来悬浮在左上角的「重启 / 停止」已并入 **设置 → 服务进程**，和它影响的状态信息放在一起。侧栏的 ⏻ 按钮是这一页的快捷入口。
+
+### 不走 CDN，断网可用
+
+Vue 3、Tailwind、marked、DOMPurify 全部随项目放在 `static/vendor/`，页面**不发起任何外部请求**：内网或完全离线的机器上，Markdown 渲染与安全消毒一样正常。第三方库走长期不可变缓存，项目自己的 JS/CSS 用 ETag 协商缓存（304），改完刷新即生效、不用强刷。模型调用仍由本机 CLI 完成。
+
+---
+
 <a id="start"></a>
 ## 🚀 快速启动
 
@@ -149,7 +196,7 @@ flowchart TD
 
 - **Python 3.8+**（开发与验证环境为 3.12）
 - 至少一个**能在命令行接收 prompt 的本地 AI CLI** —— 默认按 `agy` 与 `codebuddy` 配置，其他客户端用命令模板接即可；
-- 首次打开界面需要联网：Vue 3、Tailwind、marked、DOMPurify 来自 CDN。**离线也能跑**，但 Markdown 会退化成转义纯文本，样式也会简化。
+- **界面不需要联网**：前端依赖全部随项目提供。只有 AI CLI 自身可能按它的正常需要访问网络。
 
 ### 安装与启动
 
@@ -165,20 +212,21 @@ cd ai-meeting
 
 ```bash
 ./run.sh start      # 启动（前台运行，Ctrl+C 优雅退出）
-./run.sh status     # 查看 PID、运行时长、热重载状态、在跑会议
+./run.sh status     # 查看 PID、运行时长、在跑会议
 ./run.sh restart    # 优雅重启（中断在跑的 CLI 任务并把会议转为暂停）
 ./run.sh stop       # 优雅停止
+./run.sh dev        # 仅开发时用：开启热重载
 ```
 
 > [!TIP]
-> 界面左上角的 **⏻ 电源菜单** 能看到同样的状态，并支持一键重启 / 停机。
+> **设置 → 服务进程** 能看到同样的状态，并支持在网页里一键重启 / 停机。
 
 ### 第一场会议
 
 1. 打开 **⚙️ 设置**，确认至少一个员工的 `cli_cmd` 在本机真能跑（先在终端里试一次），需要的话改人设；
-2. 点 **＋ 发起新议题**，选参会成员和工作目录（模型可以读这个目录里的文件）；
-3. 发送议题，观察阶段一 → 阶段二，右侧文档会持续生长；
-4. 全员 `PASS` 后会议自动结案，那份文档就是交付物。
+2. 点 **＋ 发起新议题**，选**圆桌讨论**还是**自主协作**，再选参会成员和工作目录（模型可以读这个目录里的文件）；
+3. 发送议题；或者用 `@` 把一件完整的活直接交给某位负责人；
+4. 观察讨论推进，右侧文档持续生长。圆桌模式下全员 `PASS` 后会议自动结案，那份文档就是交付物。
 
 ---
 
@@ -196,7 +244,9 @@ cd ai-meeting
       "avatar": "🦉",
       "avatar_color": "#2563eb",
       "cli_cmd": "agy -p \"{prompt}\"",
-      "enabled": true
+      "enabled": true,
+      "write_access": false,
+      "timeout": 0
     },
     {
       "id": "codebuddy-ds4",
@@ -205,11 +255,15 @@ cd ai-meeting
       "avatar_color": "#9333ea",
       "cli_cmd": "codebuddy --model deepseek-v4-pro --tools \"Read,Glob,Grep\" -p \"{prompt}\"",
       "system_prompt": "注重架构边界与潜在隐患推演",
-      "enabled": true
+      "enabled": true,
+      "write_access": false,
+      "timeout": 0
     }
   ]
 }
 ```
+
+`write_access` 默认 `false`；为 `true` 时由服务端自动补对应的 CLI 参数。`timeout` 是单次回答超时秒数，`0` 表示不限时。
 
 > [!WARNING]
 > **CodeBuddy CLI 配置建议** —— 建议挂只读工具 `--tools "Read,Glob,Grep"`。若用 `--tools ""` 而议题又要求读本地文件，模型可能只回一句「我先读取……」就结束。系统会剥离异常 XML 标签、并在回答明显残缺时自动重试一次，但没法凭空补出模型没产出的内容。
@@ -224,39 +278,10 @@ cd ai-meeting
 - **网络** —— 只监听 `127.0.0.1`，校验 `Host` 头以削弱 DNS Rebinding，并关闭 Werkzeug 调试器；
 - **命令白名单** —— 执行模板限定为已知 AI CLI 二进制，`bash` / `python` 之类会被拒绝，模板无法变成任意代码执行；
 - **路径限制** —— 工作目录浏览限定在项目与用户目录内，`.` 开头的敏感文件（`.ssh`、`.gitconfig` 等）一律屏蔽；
-- **XSS** —— 模型输出经 DOMPurify 消毒后才进 DOM。
+- **写权限默认关闭** —— 成员默认只读；开启后该角色可以改动工作目录里的文件、执行命令，请只在可信目录上启用；
+- **XSS** —— 模型输出经本地 DOMPurify 消毒后才进 DOM；依赖缺失时界面降级为转义纯文本，不会把原始 HTML 注进页面。
 
-**没有做登录鉴权。** 谁能访问这个端口，谁就能操作会议。请只在本机使用，不要原样暴露到局域网或公网。
-
----
-
-<a id="limits"></a>
-## ⚠️ 已知限制与取舍
-
-这些是明确的取舍，不是藏起来的坑：
-
-| 限制 | 原因 / 影响 |
-| :--- | :--- |
-| **进程内状态**（`_ACTIVE_SESSIONS`、`_PENDING_RESUME`、`_SKIP_REQUESTS`、流式暂存区） | 单进程 dev server 下没问题；多 worker 部署会让跳过/恢复/流式跨进程失效，要换成共享存储（Redis）。 |
-| **会话整文件读写** | 每场会议的记录是一个 JSON，改动即整体重写，开销随记录增长。几十轮的会议够用，不适合当长期聊天库。 |
-| **1.5 秒轮询** | 会议进行中前端轮询整个会话。简单可靠，但复杂度随消息数近似 O(n²)；换 SSE / WebSocket 是明确的升级方向。 |
-| **流式依赖 CLI** | 若 CLI 直到退出才 flush（`agy` 就是这样），就没有中间输出可放，只能看到最终结果。 |
-| **前端走 CDN** | Vue / Tailwind / marked / DOMPurify 来自 CDN；离线时退化为纯文本 + 无样式。 |
-| **多场会议可并行** | 每场会议一个后台线程，两场会同时跑就会同时起两个 CLI 进程。没有全局调度或限流，机器负载（以及本地模型的并发能力）需要自己承担。 |
-
----
-
-<a id="trouble"></a>
-## 🩺 故障排查
-
-| 现象 | 原因与处理 |
-| :--- | :--- |
-| 改了代码后会议变成**暂停** | dev server 热重载重启了进程，运行中的会议按设计转为暂停。在提示条或 ⏸️/▶️ 按钮上恢复即可。 |
-| 重启后立刻显示**服务不可用** | Flask 重启的一两秒内轮询会失败。刷新页面，或等 `./run.sh status` 恢复正常。 |
-| 某成员只回「我先读取一下文件……」 | 这个 Prompt 没有工具权限。给它 `--tools "Read,Glob,Grep"`，或换个不需要读文件的问题。 |
-| `Port 5050 already in use` | `./run.sh stop`（会退化为 `lsof` + `SIGTERM`），或 `PORT=5051 ./run.sh`。 |
-| 中断后找不到按钮 | 中断 `@` 应答只是取消这一次回答，人还在会上；对它点的消息用「🔄 重试」，或重新 `@` 一次。 |
-| Markdown 显示成纯文本 | CDN 脚本没加载（离线或被拦）。界面是故意降级成转义文本，而不是把原始 HTML 注进 DOM。 |
+**没有做登录鉴权。** 谁能访问这个端口，谁就能操作会议（包括打开写权限）。请只在本机使用，不要原样暴露到局域网或公网。
 
 ---
 
@@ -265,22 +290,27 @@ cd ai-meeting
 
 ```text
 ai-meeting/
-├── app.py                # Flask 服务：路由、并发锁、Host 守卫
+├── app.py                # Flask 服务：路由、并发锁、Host 守卫、缓存策略
 ├── core/
-│   ├── engine.py         # 会议状态机（阶段、结论、Prompt 构建）
-│   ├── executor.py       # CLI 执行器：进程组、流式读取、超时
+│   ├── engine.py         # 会议状态机（阶段、结论、Prompt、自主任务）
+│   ├── executor.py       # CLI 执行器：进程组、流式读取、超时、写权限
 │   ├── streaming.py      # 生成中输出的内存暂存区
-│   ├── storage.py        # 会话与员工配置的原子持久化
+│   ├── storage.py        # 会话与配置的原子持久化
+│   ├── i18n.py           # 后端系统播报的语言选择
 │   └── scanner.py        # 本地 AI CLI / 模型探测
 ├── data/
-│   ├── settings.json     # 员工、主持人、默认值
+│   ├── settings.json     # 员工、主持人、界面语言、模式、协作规则
 │   └── sessions/         # 会议记录与最终文档（已 git 忽略）
 ├── static/
 │   ├── index.html        # 单页界面
-│   └── js/app.js         # Vue 3 应用（渲染、滚动、输入法防误触）
-├── docs/demo.gif         # 上面那张演示动图
+│   ├── js/app.js         # Vue 3 应用（渲染、滚动、输入法防误触）
+│   ├── js/i18n.js        # 英文界面词典
+│   └── vendor/           # Vue / Tailwind / marked / DOMPurify（离线、无 CDN）
+├── docs/
+│   ├── demo.gif          # 演示动图（中文界面）
+│   └── demo-en.gif       # 演示动图（英文界面）
 ├── requirements.txt      # Flask
-├── run.sh                # start / stop / restart / status
+├── run.sh                # start / dev / stop / restart / status
 └── LICENSE               # MIT
 ```
 

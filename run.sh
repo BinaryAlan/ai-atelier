@@ -3,9 +3,10 @@
 # AI-Meeting 服务管理脚本
 #
 #   ./run.sh            同 ./run.sh start
-#   ./run.sh start      前台启动（Ctrl+C 退出）
+#   ./run.sh start      前台启动（正常使用，默认不开热重载）
+#   ./run.sh dev        开发模式启动（FLASK_DEBUG=1，改 .py 自动重载）
 #   ./run.sh stop       优雅停止（先走 API，失败再按端口 / PID 兜底）
-#   ./run.sh restart    重启（热重载开启时子进程被重拉，前台终端不用管）
+#   ./run.sh restart    重启（会终止在跑的 AI 任务并把会议转为暂停）
 #   ./run.sh status     查看服务状态
 # -------------------------------------------------------------
 
@@ -226,6 +227,11 @@ case "$CMD" in
     start)
         do_start
         ;;
+    dev)
+        # 仅开发时使用：正常启动默认 FLASK_DEBUG=0，改 .py 需要 ./run.sh restart
+        export FLASK_DEBUG=1
+        do_start
+        ;;
     stop)
         do_stop
         ;;
@@ -240,7 +246,7 @@ case "$CMD" in
         ;;
     *)
         echo "未知命令: $CMD"
-        echo "用法: ./run.sh [start|stop|restart|status]"
+        echo "用法: ./run.sh [start|dev|stop|restart|status]"
         exit 2
         ;;
 esac

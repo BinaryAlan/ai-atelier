@@ -44,6 +44,12 @@ def session_lock(session_id: str) -> threading.RLock:
 
 
 DEFAULT_SETTINGS = {
+    # 界面语言：zh | en（系统设置 → 通用 里可切换）
+    "ui_language": "zh",
+    # 新会议默认模式：roundtable 圆桌讨论 | task 自主协作（@ 某人一直干活）
+    "default_mode": "roundtable",
+    # 自主协作：单个任务最多几轮（含求助后继续），避免模型自己绕圈烧 token
+    "collab": {"max_rounds": 4, "allow_agent_mentions": True},
     "moderator": {
         "id": "moderator",
         "name": "Antigravity",
@@ -65,7 +71,8 @@ DEFAULT_SETTINGS = {
             "cli_cmd": 'agy -p "{prompt}"',
             "system_prompt": "",
             "enabled": True,
-            "timeout": 0
+            "timeout": 0,
+            "write_access": False
         },
         {
             "id": "codebuddy-ds4",
@@ -76,7 +83,8 @@ DEFAULT_SETTINGS = {
             "cli_cmd": 'codebuddy --model deepseek-v4-pro --tools "" -p "{prompt}"',
             "system_prompt": "擅长深度逻辑推演、推演潜在隐患与方案边界风险，以客观严谨的态度提出建设性意见。",
             "enabled": True,
-            "timeout": 0
+            "timeout": 0,
+            "write_access": False
         },
         {
             "id": "codebuddy-hy4",
@@ -87,7 +95,8 @@ DEFAULT_SETTINGS = {
             "cli_cmd": 'codebuddy --model hy4std --tools "" -p "{prompt}"',
             "system_prompt": "注重实际落地执行可行性、周期效率与实操适配度，提供稳健务实的路径建议。",
             "enabled": True,
-            "timeout": 0
+            "timeout": 0,
+            "write_access": False
         }
     ]
 }
@@ -120,6 +129,19 @@ def load_settings() -> Dict[str, Any]:
         if not isinstance(data.get("employees"), list):
             data["employees"] = copy.deepcopy(DEFAULT_SETTINGS["employees"])
             changed = True
+        # 新增的顶层偏好项：老配置里没有就补默认值（不回填的话前端拿不到语言/协作设置）
+        for key in ("ui_language", "default_mode"):
+            if not isinstance(data.get(key), str) or not data.get(key):
+                data[key] = DEFAULT_SETTINGS[key]
+                changed = True
+        if not isinstance(data.get("collab"), dict):
+            data["collab"] = copy.deepcopy(DEFAULT_SETTINGS["collab"])
+            changed = True
+        else:
+            for key, val in DEFAULT_SETTINGS["collab"].items():
+                if key not in data["collab"]:
+                    data["collab"][key] = copy.deepcopy(val)
+                    changed = True
         if changed:
             save_settings(data)
         return data
@@ -186,7 +208,8 @@ def get_session(session_id: str) -> Optional[Dict[str, Any]]:
 def create_session(
     title: str = "新方案研讨会议",
     employee_ids: Optional[List[str]] = None,
-    workspace_dir: Optional[str] = None
+    workspace_dir: Optional[str] = None,
+    mode: str = "roundtable"
 ) -> Dict[str, Any]:
     settings = load_settings()
     now = int(time.time())
@@ -216,6 +239,9 @@ def create_session(
         "updated_at": now,
         "status": "idle",  # idle | running | paused
         "phase": 1,        # 1: 自由立论; 2: 方案审阅
+        # roundtable: 圆桌讨论（原流程）；task: 自主协作（@ 某人独立干活，中途可 @ 他人协助）
+        "mode": mode if mode in ("roundtable", "task") else "roundtable",
+        "collab": None,    # 自主协作的进行中状态（见 core.engine.MeetingEngine._collab_step）
         "employee_ids": employee_ids,
         "workspace_dir": os.path.abspath(workspace_dir),
         "current_speaker": None,

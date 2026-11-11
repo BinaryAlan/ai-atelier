@@ -5,6 +5,7 @@ import uuid
 from typing import Dict, Any, Optional, Tuple, List
 from core.executor import Executor, ExecutionResult, sanitize_model_output
 from core.streaming import publish_stream, clear_stream, get_stream
+from core.i18n import L, system_label
 from core.storage import load_settings, save_session, get_session, is_valid_session_id
 
 def generate_msg_id() -> str:
@@ -123,7 +124,7 @@ def resolve_quote(session: Dict[str, Any], user_msg: Optional[Dict[str, Any]]) -
     return {
         "id": (target or {}).get("id") or quote.get("id"),
         "sender": (target or {}).get("sender") or quote.get("sender"),
-        "sender_name": (target or {}).get("sender_name") or quote.get("sender_name") or "成员",
+        "sender_name": (target or {}).get("sender_name") or quote.get("sender_name") or L("成员", "Member"),
         "content": content,
     }
 
@@ -267,9 +268,19 @@ def employee_has_tools(employee: Dict[str, Any]) -> bool:
     return bool(val) and val.lower() not in ("none", "false", "0")
 
 
-def capability_block(employee: Dict[str, Any]) -> str:
+def capability_block(employee: Dict[str, Any], workspace_dir: str = "") -> str:
     """把「你到底能不能读文件」如实写进 prompt——这是 DS/HY 答不完的直接诱因。"""
-    if employee_has_tools(employee):
+    has_tools = employee_has_tools(employee)
+    if has_tools and employee.get("write_access"):
+        where = workspace_dir or "当前工作目录"
+        return (
+            "\n【能力说明】本次调用已开启**写权限**：你可以直接读写 "
+            f"{where} 内的文件，也可以执行命令。\n"
+            "- 要交付的代码/文档/数据请真正写进文件，不要只把内容贴在回答里；\n"
+            "- 改完文件后，在回答里列出「改了哪些文件、各自做了什么」，方便群主验收；\n"
+            "- 只在该工作目录内操作，不要碰目录之外的路径，也不要提交 git、不要删除他人文件。\n"
+        )
+    if has_tools:
         return (
             "\n【能力说明】你可以使用只读工具（Read / Glob / Grep）查看当前工作目录内的文件；\n"
             "但必须在**同一次回答里**给出完整结论，不要只描述你打算读取什么。\n"
@@ -735,6 +746,7 @@ def build_direct_prompt(
     exclude_msg_id: Optional[str] = None,
     is_retry: bool = False,
     quoted: Optional[Dict[str, Any]] = None,
+    task_mode: bool = False,
 ) -> str:
     """
     群主 @ 某位成员时的完整 prompt：会议背景 + 聊天上下文 + 方案纪要 + 本条提问。
@@ -743,6 +755,8 @@ def build_direct_prompt(
     报错/超时占位当成同事发言来读。
     quoted：群主通过「💬 回复」引用某条发言时，把被引用的原话单独摆出来，
             让它明确「现在是在哪一段话的基础上追问」。
+    task_mode：自主协作模式下，这条 @ 是「交办一个任务」而不是「问一个问题」：
+               需要它动手做、可以 @ 同事协助、做完要明确收尾。
     """
     settings = load_settings()
     moderator = MeetingEngine.get_moderator(settings)
@@ -794,11 +808,20 @@ def build_direct_prompt(
     transcript = transcript or "（聊天窗口里还没有可参考的历史消息，这是本场会议的第一轮交流）"
 
     doc_block = build_document_block(session, question=question)
-    role_line = (
-        "你是本场会议的主持人，这条提问是群主单独找你的：直接作答即可，不需要推进会议流程。"
-        if is_moderator else
-        "你是本场会议的参会成员（不是主持人）：这条提问是群主单独问你的，只回答它，不需要推进会议流程，也不需要替别人发言。"
-    )
+    if task_mode:
+        role_line = (
+            "你是本场会议的主持人，这次不是让你主持会议，而是群主把一件具体的事交给了你："
+            "独立把它做完。"
+            if is_moderator else
+            "你是本场会议的参会成员（不是主持人）。群主把这件事单独交给你独立完成，"
+            "由你负责到底，其他人不会接手。"
+        )
+    else:
+        role_line = (
+            "你是本场会议的主持人，这条提问是群主单独找你的：直接作答即可，不需要推进会议流程。"
+            if is_moderator else
+            "你是本场会议的参会成员（不是主持人）：这条提问是群主单独问你的，只回答它，不需要推进会议流程，也不需要替别人发言。"
+        )
     retry_note = (
         "\n（说明：这是群主对同一条提问的重试。上一次调用因超时/报错没有取到结果，"
         "请从头完整作答，不要提及重试本身。）"
@@ -813,6 +836,39 @@ def build_direct_prompt(
             f"[{quote_author}] 的原话：\n"
             f"「{quote_body}」\n"
             "（群主是在上面这条发言的基础上追问，请紧扣它作答；如果不认同其中的说法，直接指出并说明理由。）\n"
+        )
+
+    if task_mode:
+        helper_names = [
+            (MeetingEngine.get_employee(settings, eid).get("name") or eid)
+            for eid in (session.get("employee_ids") or [])
+            if isinstance(eid, str) and eid != target_emp.get("id")
+        ]
+        helper_line = (
+            f"中途需要别人帮忙时（例如补一块专业判断、审一遍你的产物），"
+            f"直接用 `@成员名` 叫他，并写清要他做什么。可叫的人：{'、'.join(helper_names) or '（本场没有其他成员）'}。\n"
+            if helper_names else
+            "本场没有其他成员可以协助你，遇到拿不准的地方直接按你的判断推进并在回答里说明假设。\n"
+        )
+        ask_label = "【群主交办的任务】"
+        requirements = (
+            "【执行要求】\n"
+            "1. 直接动手做，不要反问、不要只描述你打算怎么做；这一轮至少要产出可验收的进展；\n"
+            "2. 产物能落文件就落文件（写进工作目录），并在回答里说明改了哪些文件；\n"
+            f"3. {helper_line}"
+            "4. 全部完成时，**最后一行**单独写 `[任务完成]`；还没做完就不要写这个标记，系统会再给你一轮继续；\n"
+            "5. 上文没有的信息不要编造；缺材料就说缺哪份，不要假装读过。\n"
+            f"{capability_block(target_emp, workspace_dir or session.get('workspace_dir') or '')}"
+        )
+    else:
+        ask_label = "【群主这一次的具体提问】"
+        requirements = (
+            "【回答要求】\n"
+            "1. 直接输出正文回答上面这一个问题，不要反问、不要复述会议流程、不要只描述你打算怎么做；\n"
+            "2. 上文没有的信息不要编造：确实需要工作目录里的具体文件内容时，按下方【能力说明】去读，读不到就明确说明「缺哪份材料」；\n"
+            "3. 引用纪要或聊天里的原话时保持原意，不要替任何成员补全未表达的观点；\n"
+            f"4. {_LENGTH_POLICY}\n"
+            f"{capability_block(target_emp, workspace_dir or session.get('workspace_dir') or '')}"
         )
 
     # 顺序：先放大块且稳定的材料（纪要正文在整个会话里不变，同一位成员被追问多次、
@@ -836,16 +892,113 @@ def build_direct_prompt(
 【聊天窗口最近上下文（按时间顺序，较早的在上）】
 {transcript_note}{transcript}
 {quote_block}
-【群主这一次的具体提问】
+{ask_label}
 {question}
 （群主用 "@{emp_name}" 点名，这只是叫你，不必在回答里复述称呼。）{retry_note}
 
-【回答要求】
-1. 直接输出正文回答上面这一个问题，不要反问、不要复述会议流程、不要只描述你打算怎么做；
-2. 上文没有的信息不要编造：确实需要工作目录里的具体文件内容时，按下方【能力说明】去读，读不到就明确说明「缺哪份材料」；
-3. 引用纪要或聊天里的原话时保持原意，不要替任何成员补全未表达的观点；
-4. {_LENGTH_POLICY}
-{capability_block(target_emp)}"""
+{requirements}"""
+
+
+_TASK_DONE_MARKERS = ("[任务完成]", "【任务完成】", "[TASK_DONE]", "[task_done]", "[Task Done]")
+
+
+def task_is_done(text: str) -> bool:
+    """模型自己声明「这活干完了」。没有标记就继续给轮次，最多到 max_rounds。"""
+    t = str(text or "")
+    return any(m in t for m in _TASK_DONE_MARKERS)
+
+
+def find_agent_mention(text: str, settings: Dict[str, Any],
+                       allowed_ids: List[str], exclude_ids: Optional[set] = None
+                       ) -> Optional[Dict[str, Any]]:
+    """
+    在模型输出里找它 @ 的本场成员。
+
+    只认「本场在席成员」：@ 到已移出会议或不存在的人不该触发任何调用，
+    否则一个手滑的 @ 就会把场外角色拉进任务、还会让流程凭空多跑一轮。
+    同名/前缀重叠时取更长的那个名字（`agy` 与 `agy-2` 同时命中时归 agy-2）。
+    """
+    t = str(text or "")
+    if "@" not in t:
+        return None
+    exclude = exclude_ids or set()
+    best: Optional[tuple] = None
+    for eid in allowed_ids or []:
+        if not isinstance(eid, str) or eid in exclude:
+            continue
+        emp = MeetingEngine.get_employee(settings, eid)
+        names = [emp.get("name") or "", eid]
+        for name in names:
+            if not name:
+                continue
+            idx = t.find(f"@{name}")
+            if idx < 0:
+                continue
+            cand = (idx, -len(name), emp)
+            if best is None or cand < best:
+                best = cand
+    return best[2] if best else None
+
+
+def build_helper_prompt(session: Dict[str, Any], owner: Dict[str, Any], helper: Dict[str, Any],
+                        request_excerpt: str, workspace_dir: str, goal: str,
+                        helper_names: List[str]) -> str:
+    """被同事 @ 到时的「协助」prompt：只处理被点到的那一小块，不接管整个任务。"""
+    return f"""【协作请求（来自 {owner.get('name')}）】
+{owner.get('name')} 正在独立完成群主交办的任务，做到一半需要你帮一下。
+
+【任务目标（群主原话）】
+{_clip_text(goal, 1500)}
+
+【它刚才的原话（其中 @ 了你）】
+{_clip_text(request_excerpt, 3000)}
+
+【你的身份】
+你是【{helper.get('name')}】。
+人设定位: {str(helper.get('system_prompt') or '').strip() or '（该角色未配置人设，按你本身的能力作答）'}
+当前工作目录: {workspace_dir or session.get('workspace_dir') or '(未设置)'}
+
+【要求】
+1. 只处理它请求的这一点（给判断、给方案、给一段代码/清单都可以），不要复述整个任务、不要替它宣布最终成果；
+2. 有把握就直接给结论，不要反问；需要看文件就用工具看，读不到就说明缺哪份；
+3. 篇幅紧凑，控制在 800 字以内，能直接拿来用最好；
+4. 这一条回复会原样转交给 {owner.get('name')}，由它继续推进，你不需要 @ 回去。
+{capability_block(helper, workspace_dir or session.get('workspace_dir') or '')}"""
+
+
+def build_task_continue_prompt(session: Dict[str, Any], owner: Dict[str, Any],
+                               last_output: str, helper: Optional[Dict[str, Any]],
+                               helper_output: str, goal: str,
+                               round_no: int, max_rounds: int,
+                               helper_names: List[str]) -> str:
+    """任务没做完时把球踢回负责人：带上它上一轮的产出与（可能的）同事协助。"""
+    helper_block = ""
+    if helper and helper_output:
+        helper_block = (
+            f"\n【{helper.get('name')} 的协助回复】\n"
+            f"{_clip_text(helper_output, 3000)}\n"
+        )
+    ask_line = (
+        f"需要别人帮忙时，写 `@成员名` 并说清要他做什么（可叫：{'、'.join(helper_names)}）。"
+        if helper_names else
+        "本场没有其他成员可以协助你，拿不准的地方按你的判断推进并写明假设。"
+    )
+    return f"""【自主任务 · 继续执行（第 {round_no} / {max_rounds} 轮）】
+你是【{owner.get('name')}】，这个任务由你负责到底。
+
+【任务目标（群主原话）】
+{_clip_text(goal, 2000)}
+
+【你上一轮的产出】
+{_clip_text(last_output, 4000)}
+{helper_block}
+【现在继续】
+1. 接着上一轮的进度继续做，别从头重来、也别重复已经交付的内容；
+2. {ask_line}
+3. 全部完成（产物已落地、该说明的都说明了）时，**最后一行**单独写 `[任务完成]`；
+   还没完成就不要写这个标记，系统会再给你一轮；
+4. 不要输出「我打算…」这类空计划，这一轮必须有实际进展。
+{capability_block(owner, session.get('workspace_dir') or '')}"""
 
 
 class MeetingEngine:
@@ -941,7 +1094,7 @@ class MeetingEngine:
         msg = {
             "id": generate_msg_id(),
             "sender": "user",
-            "sender_name": "群主 (你)",
+            "sender_name": system_label("群主 (你)"),
             "content": content,
             "phase": session.get("phase", 1),
             "verdict": "USER",
@@ -968,9 +1121,60 @@ class MeetingEngine:
             session["review_comment_retries"] = {}
 
         if specific_emp_id:
-            session["target_direct_mention"] = specific_emp_id
-            session["pre_mention_status"] = session.get("status", "idle")
-            session["status"] = "running"
+            # 自主协作里 @ 人分三种情况：
+            #   - 任务未开始：交办给这个人，由它负责做完；
+            #   - 任务进行中 @ 负责人：追加要求，保留轮次和已有产出；
+            #   - 任务进行中 @ 其他成员：请它协助/给意见，负责人不变。
+            collab_now = session.get("collab") if isinstance(session.get("collab"), dict) else {}
+            task_active = session.get("mode") == "task" and collab_now.get("active")
+            if task_active:
+                if specific_emp_id == collab_now.get("owner_id"):
+                    collab_now["pending_owner"] = True
+                    collab_now["pending_helper"] = None
+                else:
+                    collab_now["pending_helper"] = specific_emp_id
+                    collab_now["helper_task"] = _clip_text(content, 3000)
+                    collab_now["pending_owner"] = False
+                    collab_now["last_helper_output"] = ""
+                    collab_now["last_helper_id"] = None
+                session["collab"] = collab_now
+                session["target_direct_mention"] = None
+                session["status"] = "running"
+            else:
+                session["target_direct_mention"] = specific_emp_id
+                session["pre_mention_status"] = session.get("status", "idle")
+                session["status"] = "running"
+                if session.get("mode") == "task":
+                    owner = MeetingEngine.get_employee(settings, specific_emp_id)
+                    MeetingEngine.start_task(session, owner, content, settings)
+        elif session.get("mode") == "task":
+            session["target_direct_mention"] = None
+            collab = session.get("collab") if isinstance(session.get("collab"), dict) else {}
+            if collab.get("active"):
+                # 任务进行中群主又补了要求：不用重新 @，直接让负责人带着新要求继续
+                collab["pending_owner"] = True
+                collab["pending_helper"] = None
+                session["collab"] = collab
+                session["status"] = "running"
+            else:
+                session["status"] = "idle"
+                session["messages"].append({
+                    "id": generate_msg_id(),
+                    "sender": "system",
+                    "sender_name": system_label(),
+                    "content": L(
+                        "📌 本场是「自主协作」模式：请用 @ 指定一位负责人，"
+                        "把任务交给它独立完成（中途它会自己 @ 同事协助）。",
+                        "📌 This is an Autonomous task meeting: use @ to assign one owner. "
+                        "It works independently and can @ teammates for help along the way.",
+                    ),
+                    "phase": session.get("phase", 1),
+                    "verdict": "HINT",
+                    "elapsed_time": 0,
+                    "created_at": now,
+                    "sent_prompt": "",
+                    "raw_response": ""
+                })
         elif is_all:
             session["target_direct_mention"] = None
             _reset_to_phase_one()
@@ -991,7 +1195,7 @@ class MeetingEngine:
         return {
             "id": generate_msg_id(),
             "sender": moderator_id,
-            "sender_name": f"{moderator_name} (主持人)",
+            "sender_name": L(f"{moderator_name} (主持人)", f"{moderator_name} (Moderator)"),
             "content": text,
             "phase": phase,
             "verdict": "PAUSE",
@@ -1007,16 +1211,23 @@ class MeetingEngine:
         # 有人被跳过/暂缓时不能写「全员已审阅完成」——那等于凭空宣称一个不存在的共识
         absent = [n for n in (absent_names or []) if n]
         if absent:
-            content = (
+            content = L(
                 f"📋 本轮审阅结束：其余成员均已通过，但 {'、'.join(absent)} 本轮未给出结论（已暂缓/跳过），"
-                "所以这**不是**全员共识。需要它的意见时，在「👥 参会成员」面板点「↩️ 恢复」后再继续。"
+                "所以这**不是**全员共识。需要它的意见时，在「👥 参会成员」面板点「↩️ 恢复」后再继续。",
+                f"📋 Review round finished: everyone else passed, but {', '.join(absent)} did not "
+                "conclude (deferred/skipped), so this is **not** full consensus. "
+                "Use Restore in Participants before continuing if you need their input.",
             )
         else:
-            content = "📋 本轮讨论方案全员已审阅完成，最新共识已整理在右侧面板。群主如有新想法或要调整方向，可随时输入新消息继续讨论。"
+            content = L(
+                "📋 本轮讨论方案全员已审阅完成，最新共识已整理在右侧面板。群主如有新想法或要调整方向，可随时输入新消息继续讨论。",
+                "📋 Everyone has reviewed the proposal; the latest consensus is in the right panel. "
+                "The owner can send a new message any time to add ideas or change direction.",
+            )
         return {
             "id": generate_msg_id(),
             "sender": moderator_id,
-            "sender_name": f"{moderator_name} (主持人)",
+            "sender_name": L(f"{moderator_name} (主持人)", f"{moderator_name} (Moderator)"),
             "content": content,
             "phase": 2,
             "verdict": "CONCLUDED",
@@ -1040,6 +1251,24 @@ class MeetingEngine:
         latest = get_session(session_id) or {}
         latest_status = latest.get("status")
 
+        # 自主协作里的「中断」= 结束当前任务，不是把这个人移出发言位：
+        # 负责人被踢出名单后任务就没人干了，用户的本意也不会是这个。
+        collab_now = session.get("collab")
+        if (res_status == "interrupted" and isinstance(collab_now, dict)
+                and collab_now.get("active") and consume_skip_current(session_id)):
+            MeetingEngine.finish_task(session, "cancelled")
+            save_session(session, merge=True)
+            return True, "自主任务已被群主结束"
+
+        # 群主在别的入口（任务横幅的「结束任务」）已经结束了任务：
+        # 这里不能再按「暂停」收尾，否则一个刚结束的任务会被改写成 paused。
+        collab_disk = latest.get("collab") if isinstance(latest.get("collab"), dict) else {}
+        if isinstance(collab_now, dict) and collab_now.get("active") and not collab_disk.get("active"):
+            session["status"] = "idle"
+            session["current_speaker"] = None
+            save_session(session, merge=True)
+            return True, "自主任务已结束"
+
         # 先看这次是不是「跳过当前发言」：它不影响会议状态，只换人继续
         if res_status == "interrupted" and consume_skip_current(session_id):
             session["current_speaker"] = None
@@ -1052,10 +1281,13 @@ class MeetingEngine:
                 session["messages"].append({
                     "id": generate_msg_id(),
                     "sender": "system",
-                    "sender_name": "系统广播",
-                    "content": (
+                    "sender_name": system_label(),
+                    "content": L(
                         f"⏭ 群主中断了 [{speaker_name or '被点名的成员'}] 的点名回答。"
-                        "它没有被移出发言位，会议状态保持不变；需要答案可以再 @ 它一次。"
+                        "它没有被移出发言位，会议状态保持不变；需要答案可以再 @ 它一次。",
+                        f"⏭ The owner cancelled the direct answer from "
+                        f"[{speaker_name or 'the mentioned member'}]. "
+                        "It stays in the speaking queue and the meeting state is unchanged; @ it again if needed.",
                     ),
                     "phase": session.get("phase", 1),
                     "verdict": "RECOVER",
@@ -1100,12 +1332,16 @@ class MeetingEngine:
             session["messages"].append({
                 "id": generate_msg_id(),
                 "sender": "system",
-                "sender_name": "系统广播",
-                "content": (
+                "sender_name": system_label(),
+                "content": L(
                     f"⏭ 群主中断了 [{emp_name}] 正在进行的回答，并把它移出发言位，"
                     "会议直接交由余下成员继续。"
                     + ("\n（它正在提出的阻断问题视为撤回，问题原文仍留在上方可人工判断。）" if withdrawn else "")
-                    + "\n需要它的意见时，在「👥 参会成员」面板点「↩️ 恢复」即可拉回来。"
+                    + "\n需要它的意见时，在「👥 参会成员」面板点「↩️ 恢复」即可拉回来。",
+                    f"⏭ The owner interrupted [{emp_name}]'s answer and removed it from the queue; "
+                    "the remaining members continue."
+                    + ("\n(Any blocker it was raising is withdrawn; the original text is kept above.)" if withdrawn else "")
+                    + "\nUse Restore in Participants when you need its input again.",
                 ),
                 "phase": session.get("phase", 1),
                 "verdict": "RECOVER",
@@ -1166,6 +1402,323 @@ class MeetingEngine:
                     names.append(name)
         return names
 
+    # ------------------------------------------------------------------
+    # 自主协作（session.mode == "task"）
+    #
+    # 与圆桌讨论的区别：圆桌是「每个人说一段，然后主持人收口」；
+    # 自主协作是「群主把活交给一个人，它自己动手做，做不完就继续，
+    # 中途可以 @ 同事要意见/要辅助，最后由它自己宣布完成」。
+    # 每一轮仍是一次独立的 CLI 调用（无状态、可暂停、可中断），状态落在会话文件里。
+    # ------------------------------------------------------------------
+    @staticmethod
+    def task_collab_config(settings: Dict[str, Any]) -> Dict[str, Any]:
+        cfg = settings.get("collab") if isinstance(settings.get("collab"), dict) else {}
+        try:
+            max_rounds = int(cfg.get("max_rounds", 4))
+        except (TypeError, ValueError):
+            max_rounds = 4
+        return {
+            "max_rounds": max(1, min(20, max_rounds)),
+            "allow_agent_mentions": bool(cfg.get("allow_agent_mentions", True)),
+        }
+
+    @staticmethod
+    def start_task(session: Dict[str, Any], owner: Dict[str, Any], goal: str,
+                   settings: Dict[str, Any]) -> Dict[str, Any]:
+        cfg = MeetingEngine.task_collab_config(settings)
+        collab = {
+            "active": True,
+            "owner_id": owner.get("id"),
+            "owner_name": owner.get("name") or owner.get("id"),
+            "goal": _clip_text(str(goal or ""), 4000),
+            "round": 0,                 # 已完成的任务轮数（负责人视角）
+            "max_rounds": cfg["max_rounds"],
+            "pending_helper": None,     # 下一轮要跑的协助者 id
+            "helper_task": "",          # 触发协助的那段原话
+            "pending_owner": False,     # 下一轮该负责人继续
+            "last_helper_id": None,
+            "last_helper_name": None,
+            "last_helper_output": "",
+            "started_at": int(time.time()),
+            "end_reason": None,
+        }
+        session["collab"] = collab
+        return collab
+
+    @staticmethod
+    def finish_task(session: Dict[str, Any], reason: str = "done", note: str = "") -> None:
+        """结束自主任务并播报原因（done / max_rounds / cancelled / error / member_gone）。"""
+        collab = session.get("collab") or {}
+        if not collab.get("active"):
+            return
+        owner_name = collab.get("owner_name") or "负责人"
+        collab["active"] = False
+        collab["end_reason"] = reason
+        collab["ended_at"] = int(time.time())
+        session["collab"] = collab
+        session["current_speaker"] = None
+        session.pop("pre_mention_status", None)
+        session["target_direct_mention"] = None
+        session["status"] = "idle"
+
+        if reason == "done":
+            text = L(
+                f"✅ 自主任务结束：[{owner_name}] 已声明完成（共 {collab.get('round', 0)} 轮）。",
+                f"✅ Task finished: [{owner_name}] declared completion "
+                f"(after {collab.get('round', 0)} rounds).",
+            )
+        elif reason == "max_rounds":
+            text = L(
+                f"⏹ 自主任务到达轮次上限（{collab.get('max_rounds')} 轮），已自动收工。"
+                f"[{owner_name}] 的最新产出见上方；需要继续时重新 @ 它交办下一步。",
+                f"⏹ Round limit reached ({collab.get('max_rounds')} rounds); the task stopped automatically. "
+                f"[{owner_name}]'s latest output is above — @ it again to assign the next step.",
+            )
+        elif reason == "cancelled":
+            text = L(
+                f"🛑 群主结束了 [{owner_name}] 的自主任务，已产出的内容保留。",
+                f"🛑 The owner ended [{owner_name}]'s task. Everything produced is kept.",
+            )
+        elif reason == "member_gone":
+            text = L(
+                f"⚠️ 任务负责人 [{owner_name}] 已不在本场会议（被移出或停用），任务终止。",
+                f"⚠️ Task owner [{owner_name}] is no longer in this meeting "
+                "(removed or disabled); the task is stopped.",
+            )
+        else:
+            text = L(
+                f"⚠️ 自主任务因执行异常中止（负责人：{owner_name}）。",
+                f"⚠️ The task stopped because of an execution error (owner: {owner_name}).",
+            )
+        if note:
+            text = f"{text}\n{note}"
+        session.setdefault("messages", []).append({
+            "id": generate_msg_id(),
+            "sender": "system",
+            "sender_name": system_label(),
+            "content": text,
+            "phase": session.get("phase", 1),
+            "verdict": "TASK_END",
+            "elapsed_time": 0,
+            "created_at": int(time.time()),
+            "sent_prompt": "",
+            "raw_response": ""
+        })
+
+    @staticmethod
+    def _last_collab_output(session: Dict[str, Any], sender_id: str, role: Optional[str] = None) -> str:
+        for m in reversed(session.get("messages") or []):
+            if not isinstance(m, dict):
+                continue
+            if m.get("sender") != sender_id:
+                continue
+            if role and m.get("collab_role") != role:
+                continue
+            return str(m.get("content") or "")
+        return ""
+
+    @staticmethod
+    def _collab_step(session: Dict[str, Any], settings: Dict[str, Any],
+                     workspace_dir: str) -> Optional[Tuple[bool, str]]:
+        """自主协作的推进：先跑被 @ 的协助者，再让负责人继续。返回 None 表示不属于协作流程。"""
+        collab = session.get("collab")
+        if not isinstance(collab, dict) or not collab.get("active"):
+            return None
+        # 第一轮由「定向 @ 应答」自己处理（它要负责把 collab 建立起来后的开场跑完）
+        if session.get("target_direct_mention"):
+            return None
+
+        session_id = session.get("id")
+        owner_id = collab.get("owner_id")
+        owner = MeetingEngine.get_employee(settings, owner_id) if owner_id else {}
+        if not owner_id or not owner.get("cli_cmd") or not owner.get("enabled", True):
+            MeetingEngine.finish_task(session, "member_gone")
+            save_session(session, merge=True)
+            return False, "任务负责人已不可用，任务终止"
+
+        goal = collab.get("goal") or session_topic(session)
+        helper_names = [
+            (MeetingEngine.get_employee(settings, eid).get("name") or eid)
+            for eid in (session.get("employee_ids") or [])
+            if isinstance(eid, str) and eid != owner_id
+            and MeetingEngine.get_employee(settings, eid).get("enabled", True)
+        ]
+
+        # ---------- A. 有被 @ 的同事：先让它出手 ----------
+        helper_id = collab.get("pending_helper")
+        if helper_id:
+            helper = MeetingEngine.get_employee(settings, helper_id)
+            if not helper.get("cli_cmd") or not helper.get("enabled", True):
+                collab["pending_helper"] = None
+                collab["pending_owner"] = True
+                session["collab"] = collab
+                session["status"] = "running"
+                save_session(session, merge=True)
+                return True, "协助者不可用，跳过本轮协助"
+
+            request_text = str(collab.get("helper_task") or "") or MeetingEngine._last_collab_output(session, owner_id)
+            prompt = build_helper_prompt(session, owner, helper, request_text, workspace_dir, goal, helper_names)
+
+            session["current_speaker"] = f"{helper['name']} (协助 {owner.get('name')})"
+            save_session(session, merge=True)
+
+            res = run_with_retry(helper, prompt, session_id, workspace_dir)
+            stop = MeetingEngine._stop_if_interrupted(
+                session, session_id, res.status,
+                speaker_id=helper["id"], speaker_name=helper["name"]
+            )
+            if stop:
+                return stop
+
+            latest = get_session(session_id) or {}
+            if not (latest.get("collab") or {}).get("active"):
+                return False, "任务已被群主结束"
+            session["collab"] = latest.get("collab") or collab
+            collab = session["collab"]
+            session["current_speaker"] = None
+
+            verdict = {"timeout": "TIMEOUT", "error": "ERROR"}.get(res.status, "HELP")
+            session["messages"].append({
+                "id": generate_msg_id(),
+                "sender": helper["id"],
+                "sender_name": helper["name"],
+                "content": res.output,
+                "phase": session.get("phase", 1),
+                "verdict": verdict,
+                "elapsed_time": res.elapsed,
+                "created_at": int(time.time()),
+                "collab_role": "helper",
+                "collab_for": owner_id,
+                "collab_for_name": owner.get("name"),
+                "sent_prompt": prompt,
+                "raw_response": res.raw_output
+            })
+
+            if res.status in ("timeout", "error"):
+                session["status"] = "paused"
+                mark_stuck(session, helper["id"], "协助请求执行失败")
+                MeetingEngine.finish_task(
+                    session, "error",
+                    f"协助者 [{helper['name']}] 执行失败，会议已暂停；恢复后会重新交给负责人继续。"
+                )
+                session["status"] = "paused"   # finish_task 会置 idle，这里以暂停为准
+                save_session(session, merge=True)
+                return True, f"[{helper['name']}] 协助失败，任务暂停"
+
+            collab["pending_helper"] = None
+            collab["pending_owner"] = True
+            collab["last_helper_id"] = helper["id"]
+            collab["last_helper_name"] = helper["name"]
+            collab["last_helper_output"] = res.output
+            session["collab"] = collab
+            session["status"] = "running"
+            save_session(session, merge=True)
+            clear_stuck(session)
+            return True, f"[{helper['name']}] 已协助 [{owner.get('name')}]"
+
+        # ---------- B. 负责人继续推进 ----------
+        last_output = MeetingEngine._last_collab_output(session, owner_id, role="owner")
+        last_helper = None
+        if collab.get("last_helper_id") and collab.get("last_helper_output"):
+            last_helper = MeetingEngine.get_employee(settings, collab["last_helper_id"])
+
+        next_round = int(collab.get("round") or 0) + 1
+        prompt = build_task_continue_prompt(
+            session, owner, last_output, last_helper,
+            str(collab.get("last_helper_output") or ""), goal,
+            next_round, int(collab.get("max_rounds") or 4), helper_names
+        )
+
+        session["current_speaker"] = f"{owner.get('name')} (任务执行中)"
+        save_session(session, merge=True)
+
+        res = run_with_retry(owner, prompt, session_id, workspace_dir)
+        stop = MeetingEngine._stop_if_interrupted(
+            session, session_id, res.status,
+            speaker_id=owner_id, speaker_name=owner.get("name")
+        )
+        if stop:
+            return stop
+
+        latest = get_session(session_id) or {}
+        if not (latest.get("collab") or {}).get("active"):
+            return False, "任务已被群主结束"
+        session["collab"] = latest.get("collab") or collab
+        collab = session["collab"]
+        session["current_speaker"] = None
+
+        verdict = {"timeout": "TIMEOUT", "error": "ERROR"}.get(res.status, "TASK")
+        session["messages"].append({
+            "id": generate_msg_id(),
+            "sender": owner_id,
+            "sender_name": owner.get("name"),
+            "content": res.output,
+            "phase": session.get("phase", 1),
+            "verdict": verdict,
+            "elapsed_time": res.elapsed,
+            "created_at": int(time.time()),
+            "collab_role": "owner",
+            "collab_round": next_round,
+            "sent_prompt": prompt,
+            "raw_response": res.raw_output
+        })
+
+        if res.status in ("timeout", "error"):
+            session["status"] = "paused"
+            mark_stuck(session, owner_id, "任务轮次执行失败")
+            MeetingEngine.finish_task(session, "error", "任务已暂停，点「恢复讨论」可继续这一轮。")
+            session["status"] = "paused"
+            save_session(session, merge=True)
+            return True, f"[{owner.get('name')}] 任务轮次执行失败，已暂停"
+
+        clear_stuck(session)
+        MeetingEngine._advance_task_after_owner(session, owner, res.output, next_round, settings)
+
+        save_session(session, merge=True)
+        if session.get("status") == "running":
+            return True, f"[{owner.get('name')}] 第 {next_round} 轮完成，任务继续"
+        return True, f"[{owner.get('name')}] 任务结束"
+
+    @staticmethod
+    def _advance_task_after_owner(session: Dict[str, Any], owner: Dict[str, Any],
+                                  output: str, round_no: int, settings: Dict[str, Any]) -> None:
+        """
+        负责人刚跑完一轮：决定「宣布完成 / 拉人协助 / 继续下一轮」。
+
+        优先级：完成标记 > @ 到同事 > 轮次上限 > 继续。
+        「继续」是自主协作和普通问答最大的差别——没写完就接着写，不用群主一次次催。
+        """
+        collab = session.get("collab") or {}
+        collab["round"] = round_no
+        session["collab"] = collab
+
+        if task_is_done(output):
+            MeetingEngine.finish_task(session, "done")
+            return
+
+        mention = None
+        if MeetingEngine.task_collab_config(settings)["allow_agent_mentions"]:
+            mention = find_agent_mention(
+                output, settings,
+                allowed_ids=[eid for eid in (session.get("employee_ids") or []) if isinstance(eid, str)],
+                exclude_ids={owner.get("id")},
+            )
+
+        if mention:
+            collab["pending_helper"] = mention.get("id")
+            collab["helper_task"] = _clip_text(output, 3000)
+            collab["pending_owner"] = False
+            collab["last_helper_output"] = ""
+            collab["last_helper_id"] = None
+            session["collab"] = collab
+            session["status"] = "running"
+        elif round_no >= int(collab.get("max_rounds") or 4):
+            MeetingEngine.finish_task(session, "max_rounds")
+        else:
+            collab["pending_owner"] = True
+            session["collab"] = collab
+            session["status"] = "running"
+
     @staticmethod
     def step(session: Dict[str, Any]) -> Tuple[bool, str]:
         session_id = session.get("id")
@@ -1194,6 +1747,9 @@ class MeetingEngine:
         workers: List[str] = MeetingEngine.active_workers(session, settings)
 
         if not workers:
+            # 自主任务没人可跑：留一个「active」的 collab 会让横幅一直转，必须收口
+            if isinstance(session.get("collab"), dict) and session["collab"].get("active"):
+                MeetingEngine.finish_task(session, "member_gone")
             session["status"] = "idle"
             session["current_speaker"] = None
             if skipped:
@@ -1210,6 +1766,13 @@ class MeetingEngine:
         workspace_dir = session.get("workspace_dir", "")
 
         # -------------------------------------------------------------
+        # 0. 自主协作：协助者 / 负责人继续推进（第一轮交给下面的定向应答）
+        # -------------------------------------------------------------
+        collab_result = MeetingEngine._collab_step(session, settings, workspace_dir)
+        if collab_result is not None:
+            return collab_result
+
+        # -------------------------------------------------------------
         # 1. 针对特定成员的点名直接应答 (定向呼叫，保留原会议状态)
         # -------------------------------------------------------------
         direct_target = session.get("target_direct_mention")
@@ -1218,12 +1781,14 @@ class MeetingEngine:
             last_user_obj = latest_user_message_obj(session)
             last_user_msg = str((last_user_obj or {}).get("content") or "")
             quoted = resolve_quote(session, last_user_obj)
+            collab = session.get("collab") if isinstance(session.get("collab"), dict) else {}
+            task_mode = bool(collab.get("active")) and collab.get("owner_id") == target_emp.get("id")
 
             # 定向应答不能只给「问题 + 人设」：CLI 无状态，必须自带会议议题、
             # 聊天上下文与当前纪要，否则模型不知道群主在说什么、也不知道已有的结论。
             prompt = build_direct_prompt(
                 session, target_emp, last_user_msg, workspace_dir=workspace_dir,
-                quoted=quoted,
+                quoted=quoted, task_mode=task_mode,
             )
 
             session["current_speaker"] = target_emp["name"]
@@ -1247,18 +1812,14 @@ class MeetingEngine:
             session["current_speaker"] = None
             session["target_direct_mention"] = None
 
-            # 恢复点名之前的会议状态
-            prev_status = session.pop("pre_mention_status", "idle")
-            session["status"] = prev_status if prev_status in ["running", "paused"] else "idle"
-
             if res.status == "timeout":
                 verdict = "TIMEOUT"
             elif res.status == "error":
                 verdict = "ERROR"
             else:
-                verdict = "DIRECT"
+                verdict = "TASK" if task_mode else "DIRECT"
 
-            session["messages"].append({
+            msg = {
                 "id": generate_msg_id(),
                 "sender": target_emp["id"],
                 "sender_name": target_emp["name"],
@@ -1284,7 +1845,34 @@ class MeetingEngine:
                 ),
                 "sent_prompt": prompt,
                 "raw_response": res.raw_output
-            })
+            }
+            if task_mode:
+                msg["collab_role"] = "owner"
+                msg["collab_round"] = 1
+                msg["collab_task"] = True
+            session["messages"].append(msg)
+
+            if task_mode:
+                # 任务的第一轮：不恢复原状态，交给协作状态机决定「继续 / 求助 / 收工」
+                if res.status in ("timeout", "error"):
+                    session["status"] = "paused"
+                    mark_stuck(session, target_emp["id"], "任务首轮执行失败")
+                    MeetingEngine.finish_task(session, "error", "任务首轮就失败了，点「恢复讨论」可重跑这一轮。")
+                    session["status"] = "paused"
+                    save_session(session, merge=True)
+                    return True, f"[{target_emp['name']}] 任务首轮执行失败"
+                clear_stuck(session)
+                MeetingEngine._advance_task_after_owner(session, target_emp, res.output, 1, settings)
+                save_session(session, merge=True)
+                return True, (
+                    f"[{target_emp['name']}] 任务第 1 轮完成，继续"
+                    if session.get("status") == "running" else f"[{target_emp['name']}] 任务结束"
+                )
+
+            # 恢复点名之前的会议状态
+            prev_status = session.pop("pre_mention_status", "idle")
+            session["status"] = prev_status if prev_status in ["running", "paused"] else "idle"
+
             save_session(session, merge=True)
             return True, f"[{target_emp['name']}] 已完成直接应答"
 
@@ -1478,8 +2066,12 @@ class MeetingEngine:
                 session["messages"].append({
                     "id": generate_msg_id(),
                     "sender": moderator["id"],
-                    "sender_name": f"{moderator['name']} (主持人)",
-                    "content": "📋 主持人已综合整理首版方案纪要（已更新在右侧面板）。现正式进入【阶段二：审阅与隐患质询】！",
+                    "sender_name": L(f"{moderator['name']} (主持人)", f"{moderator['name']} (Moderator)"),
+                    "content": L(
+                        "📋 主持人已综合整理首版方案纪要（已更新在右侧面板）。现正式进入【阶段二：审阅与隐患质询】！",
+                        "📋 The moderator has compiled the first draft of the minutes (see the right panel). "
+                        "Moving on to Phase 2: review & challenges!",
+                    ),
                     "phase": 2,
                     "verdict": "SYNTHESIS",
                     "elapsed_time": res.elapsed,

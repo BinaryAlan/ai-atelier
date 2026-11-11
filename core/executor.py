@@ -97,6 +97,52 @@ def validate_cli_template(cmd_template: str) -> Tuple[bool, str]:
     return True, "验证通过"
 
 
+# 写权限（写文件 / 跑命令）在两家 CLI 上是不同开关：
+#   agy        --dangerously-skip-permissions   自动放行所有工具权限询问
+#   codebuddy  -y / --dangerously-skip-permissions
+# 光加开关还不够：codebuddy 的 --tools 会把可用工具裁成白名单，
+# 只给了 Read,Glob,Grep 时即使放行权限也没有写的能力，必须把写工具补进去。
+_WRITE_FLAGS = {
+    "agy": ["--dangerously-skip-permissions"],
+    "codebuddy": ["-y"],
+}
+# 缺一不可：只给 Write 不给 Edit，模型改现有文件时会退化成「重写整个文件」或直接失败
+_WRITE_TOOLS = ("Read", "Glob", "Grep", "Write", "Edit", "Bash")
+
+
+def apply_access_mode(args: List[str], write_access: bool) -> List[str]:
+    """
+    按角色的写权限给 CLI 参数补上对应开关（对同一份模板可重复调用，不会叠加）。
+
+    write_access=False 时原样返回：只读角色不该因为这次改动突然获得写盘能力。
+    """
+    if not write_access or not args:
+        return list(args)
+
+    base = os.path.basename(args[0]).lower()
+    out = list(args)
+
+    for flag in _WRITE_FLAGS.get(base, []):
+        if flag not in out and not (flag == "-y" and "--dangerously-skip-permissions" in out):
+            out.append(flag)
+
+    if base == "codebuddy" and "--tools" in out:
+        idx = out.index("--tools")
+        if idx + 1 < len(out):
+            current = out[idx + 1].strip()
+            if current == "":
+                # --tools "" 等于把工具全禁掉：要写就得整体放开
+                out[idx + 1] = "default"
+            elif current.lower() not in ("default", "all"):
+                have = [t.strip() for t in current.split(",") if t.strip()]
+                lower = {t.lower() for t in have}
+                for tool in _WRITE_TOOLS:
+                    if tool.lower() not in lower:
+                        have.append(tool)
+                out[idx + 1] = ",".join(have)
+    return out
+
+
 def _coerce_timeout(value: Any, fallback: Optional[int] = None) -> Optional[int]:
     """
     把配置里的超时值规范成「秒数」或「None（不限制）」。
@@ -203,7 +249,8 @@ class Executor:
                 session_id=session_id,
                 workspace_dir=workspace_dir,
                 timeout=emp_timeout,
-                on_chunk=on_chunk
+                on_chunk=on_chunk,
+                write_access=bool(employee.get("write_access"))
             )
         elif emp_type == "api":
             result = ExecutionResult(
@@ -299,7 +346,8 @@ class Executor:
         session_id: str = "default",
         workspace_dir: Optional[str] = None,
         timeout: Optional[int] = None,
-        on_chunk: Optional[Any] = None
+        on_chunk: Optional[Any] = None,
+        write_access: bool = False
     ) -> ExecutionResult:
         """
         智能解析 CLI 命令模板，并在指定工作目录中独立进程组运行。
@@ -337,6 +385,9 @@ class Executor:
 
         if not replaced:
             final_args.append(prompt)
+
+        # 写权限只在真正起进程前的最后一步注入，模板本身保持干净（用户随时可改回只读）
+        final_args = apply_access_mode(final_args, write_access)
 
         # 校验工作目录（必须是真实存在的目录）
         cwd = None

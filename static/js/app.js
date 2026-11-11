@@ -3,6 +3,8 @@ const { createApp } = Vue;
 createApp({
   data() {
     return {
+      // 界面语言：zh | en。存在 settings.json（跨浏览器一致），本地再存一份用于首屏不闪。
+      lang: (window.localStorage.getItem("aim.lang") === "en") ? "en" : "zh",
       sessionTab: "all", // 'all' | 'fav'
       sessions: [],
       currentSessionId: null,
@@ -57,7 +59,8 @@ createApp({
       newSessionForm: {
         title: "",
         workspace_dir: "",
-        employee_ids: []
+        employee_ids: [],
+        mode: "roundtable"
       },
 
       // 编辑当前会议弹窗 (改名、改目录、增减参会人员)
@@ -66,11 +69,23 @@ createApp({
         id: "",
         title: "",
         workspace_dir: "",
-        employee_ids: []
+        employee_ids: [],
+        mode: "roundtable"
       },
 
+      // 设置中心：分类页（通用 / 成员 / 权限 / 会议 / 服务）
+      showSettings: false,
+      settingsTab: "general",
+      settingsTabs: [
+        { key: "general", icon: "🎛️", label: "通用与语言" },
+        { key: "members", icon: "👥", label: "成员与主持人" },
+        { key: "access", icon: "🔐", label: "执行权限" },
+        { key: "meeting", icon: "🧭", label: "会议行为" },
+        { key: "service", icon: "⏻", label: "服务进程" }
+      ],
+      taskBusy: false,
+
       // 员工与主持人配置弹窗
-      showSettingsModal: false,
       showEmpEditModal: false,
       isEditingModerator: false,
       isEditingEmployee: false,
@@ -86,7 +101,8 @@ createApp({
         cli_cmd: "",
         system_prompt: "",
         enabled: true,
-        timeout: 0
+        timeout: 0,
+        write_access: false
       },
       presetAvatars: ["🤖", "🧠", "⚡", "🦉", "🛡️", "🚀", "💻", "🔬", "🎯", "🎨", "👑", "🕵️", "🔧", "💡", "⚖️", "📊"],
 
@@ -116,7 +132,6 @@ createApp({
       pollInterval: null,
 
       // 服务进程控制（状态 / 重启 / 停止）
-      showServiceMenu: false,
       systemStatus: null,
       serviceBusy: false,
       serviceDown: false,
@@ -202,7 +217,7 @@ createApp({
       return (this.settings.employees || []).filter(e => e.enabled);
     },
     renderedDoc() {
-      const doc = this.currentSession?.document || "*(暂无方案文档)*";
+      const doc = this.currentSession?.document || this.t("*(暂无方案文档)*");
       // 任一依赖 CDN 不可用时，绝不把原始 Markdown/HTML 直接交给 v-html（会执行脚本）
       if (!window.marked || !window.DOMPurify) {
         return `<pre style="white-space:pre-wrap">${this.escapeHtml(doc)}</pre>`;
@@ -212,6 +227,33 @@ createApp({
     // 定向 @ 应答进行中：此时的「中断」语义是取消这次提问，而不是把成员移出发言位
     isDirectRunning() {
       return !!this.currentSession?.target_direct_mention;
+    },
+    // 自主协作任务进行中：中断 = 结束这一轮任务，同样不该把人移出发言位
+    isTaskRunning() {
+      return !!(this.currentSession?.collab && this.currentSession.collab.active);
+    },
+    taskStatusText() {
+      const c = this.currentSession?.collab || {};
+      if (!c.active) return "";
+      const round = this.t("第 {round} / {max} 轮", {
+        round: c.round || 0,
+        max: c.max_rounds || 0
+      });
+      if (c.pending_helper) {
+        const helper = (this.settings.employees || []).find(e => e.id === c.pending_helper);
+        return `${round} · ${this.t("等待 {name} 协助", { name: helper?.name || c.pending_helper })}`;
+      }
+      if (this.currentSession?.current_speaker) return `${round} · ${this.currentSession.current_speaker}`;
+      return `${round} · ${this.t("准备继续")}`;
+    },
+    inputPlaceholder() {
+      return this.currentSession?.mode === "task"
+        ? this.t("输入任务，@ 一位负责人交办… (Enter 发送，Shift+Enter 换行)")
+        : this.t("输入议题、提问、补充要求或指令... (Enter 发送，Shift+Enter 换行)");
+    },
+    // @所有人 在后端同时认「所有人」和「all」，英文界面插入 all 才不会看着别扭
+    allMentionToken() {
+      return this.lang === "en" ? "all" : "所有人";
     }
   },
   mounted() {
@@ -238,6 +280,102 @@ createApp({
     window.removeEventListener("keydown", this.onWindowKeydown);
   },
   methods: {
+    // ------------------- 多语言 -------------------
+    // t("中文原文")：中文直接返回原文，英文查 i18n.js 的词典；查不到时退回中文，
+    // 这样漏翻一个词只会显示中文，不会出现空白按钮或 undefined。
+    t(text, params) {
+      if (text === undefined || text === null) return "";
+      const dict = (window.AIM_I18N && window.AIM_I18N.en) || {};
+      let out = this.lang === "en" ? (dict[text] !== undefined ? dict[text] : text) : text;
+      if (params) {
+        for (const key of Object.keys(params)) {
+          out = String(out).split(`{${key}}`).join(params[key]);
+        }
+      }
+      return out;
+    },
+    // 历史消息里的 sender_name 已经落盘，语言切换后也要跟着换；
+    // 成员名 / 模型名不在映射表里，原样保留。
+    displaySender(name) {
+      const s = String(name || "");
+      if (this.lang !== "en") return s;
+      const labels = {
+        "系统广播": "System",
+        "系统复位": "Service Recovery",
+        "系统异常捕获": "Error Handler",
+        "群主 (你)": "Owner (you)"
+      };
+      if (labels[s]) return labels[s];
+      if (s.endsWith(" (主持人)")) return s.slice(0, -6) + " (Moderator)";
+      return s;
+    },
+    applyLanguage() {
+      const en = this.lang === "en";
+      document.documentElement.setAttribute("lang", en ? "en" : "zh-CN");
+      document.title = en ? "AI-Meeting · AI Roundtable" : "AI-Meeting · AI 圆桌会议室";
+      try { localStorage.setItem("aim.lang", this.lang); } catch (e) { /* 隐私模式忽略 */ }
+    },
+    async setLanguage(lang) {
+      const next = lang === "en" ? "en" : "zh";
+      if (next === this.lang) return;
+      this.lang = next;
+      this.applyLanguage();
+      // 语言是系统级偏好：写回 settings.json，其他浏览器打开也是同一种语言
+      try {
+        const res = await fetch("/api/settings", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ ...this.settings, ui_language: next })
+        });
+        if (res.ok) {
+          const data = await res.json();
+          if (data.settings) this.settings = data.settings;
+        }
+      } catch (e) {
+        console.warn("语言设置未能同步到服务端（本机仍已切换）:", e);
+      }
+    },
+
+    // ------------------- 设置中心 -------------------
+    openSettings(tab = "general") {
+      this.settingsTab = tab;
+      this.showSettings = true;
+      if (tab === "service") this.fetchSystemStatus();
+    },
+    openServiceSettings() {
+      this.openSettings("service");
+    },
+    // 批量开关写权限：只改内存里的配置，仍需点「保存配置」才落盘
+    setAllWriteAccess(enabled) {
+      (this.settings.employees || []).forEach(emp => { emp.write_access = !!enabled; });
+      this.showToast(enabled
+        ? this.t("已为所有成员勾选写权限，点「保存配置」后生效。")
+        : this.t("已关闭所有成员的写权限，点「保存配置」后生效。"));
+    },
+
+    // 结束当前的自主任务（负责人不再自动往下跑，已产出的内容都保留）
+    async stopTask() {
+      if (!this.currentSessionId || this.taskBusy) return;
+      this.taskBusy = true;
+      try {
+        const res = await fetch(`/api/sessions/${this.currentSessionId}/task/stop`, {
+          method: "POST",
+          headers: { "X-Meeting-Action": "1" }
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          alert(data.error || `HTTP ${res.status}`);
+          return;
+        }
+        if (data.session) this.currentSession = data.session;
+        this.showToast(this.t("任务已结束，产出的内容都保留在上方。"));
+      } catch (e) {
+        alert(this.t("结束任务失败:") + " " + e);
+      } finally {
+        this.taskBusy = false;
+      }
+    },
+
     // 窗口尺寸变化：既要把面板宽度钳回可用范围，也要重算哪些消息该折叠
     onWindowResize() {
       this.clampPanels();
@@ -247,9 +385,6 @@ createApp({
     handleGlobalClick(e) {
       if (!e.target.closest(".relative")) {
         this.showMemberDropdown = false;
-      }
-      if (!e.target.closest("#service-menu-wrap")) {
-        this.showServiceMenu = false;
       }
     },
 
@@ -341,8 +476,17 @@ createApp({
     },
 
     async init() {
+      // 先用本地缓存把语言铺上（避免首屏中文闪一下），服务端设置是最终依据
+      this.applyLanguage();
       await this.loadDefaultWorkspace();
       await this.loadSettings();
+      const serverLang = this.settings?.ui_language;
+      if (serverLang === "en" || serverLang === "zh") {
+        if (serverLang !== this.lang) this.lang = serverLang;
+        this.applyLanguage();
+      } else {
+        this.settings.ui_language = this.lang;
+      }
       await this.loadSessions();
       await this.triggerScanModels(false);
       this.fetchSystemStatus(); // 仅用于点亮服务入口，不阻塞首屏
@@ -383,7 +527,17 @@ createApp({
     async loadSettings() {
       try {
         const res = await fetch("/api/settings");
-        this.settings = await res.json();
+        const data = await res.json();
+        // 老配置没有 collab 时补上默认值，模板里直接绑 settings.collab.max_rounds 不会报错
+        data.collab = data.collab && typeof data.collab === "object"
+          ? { max_rounds: 4, allow_agent_mentions: true, ...data.collab }
+          : { max_rounds: 4, allow_agent_mentions: true };
+        data.default_mode = data.default_mode === "task" ? "task" : "roundtable";
+        // 老配置里没有 write_access 字段：补成 false，复选框才有确定的初始状态
+        data.employees = (Array.isArray(data.employees) ? data.employees : []).map(e => ({
+          ...e, write_access: !!e.write_access
+        }));
+        this.settings = data;
       } catch (e) {
         console.error("加载配置失败:", e);
       }
@@ -445,13 +599,14 @@ createApp({
       this.newSessionForm = {
         title: "",
         workspace_dir: defaultDir,
-        employee_ids: this.availableEmployees.map(e => e.id)
+        employee_ids: this.availableEmployees.map(e => e.id),
+        mode: this.settings?.default_mode === "task" ? "task" : "roundtable"
       };
       this.showNewSessionModal = true;
     },
 
     async confirmCreateSession() {
-      const title = this.newSessionForm.title.trim() || "新方案研讨";
+      const title = this.newSessionForm.title.trim() || this.t("新方案研讨");
       try {
         const res = await fetch("/api/sessions", {
           method: "POST",
@@ -459,7 +614,8 @@ createApp({
           body: JSON.stringify({
             title: title,
             workspace_dir: this.newSessionForm.workspace_dir.trim(),
-            employee_ids: this.newSessionForm.employee_ids
+            employee_ids: this.newSessionForm.employee_ids,
+            mode: this.newSessionForm.mode
           })
         });
         const newSession = await res.json();
@@ -467,18 +623,19 @@ createApp({
         await this.loadSessions();
         await this.switchSession(newSession.id);
       } catch (e) {
-        alert("创建会议失败: " + e);
+        alert(this.t("创建会议失败:") + " " + e);
       }
     },
 
-    // ----------------- 编辑会议信息 Modal (标题/目录/参会人) -----------------
+    // ----------------- 编辑会议信息 Modal (标题/目录/参会人/模式) -----------------
     openEditSessionModal(session) {
       if (!session) return;
       this.editingSessionForm = {
         id: session.id,
         title: session.title,
         workspace_dir: session.workspace_dir || this.defaultWorkspaceDir,
-        employee_ids: [...(session.employee_ids || [])]
+        employee_ids: [...(session.employee_ids || [])],
+        mode: session.mode === "task" ? "task" : "roundtable"
       };
       this.showEditSessionModal = true;
     },
@@ -493,7 +650,8 @@ createApp({
           body: JSON.stringify({
             title: this.editingSessionForm.title.trim(),
             workspace_dir: this.editingSessionForm.workspace_dir.trim(),
-            employee_ids: this.editingSessionForm.employee_ids
+            employee_ids: this.editingSessionForm.employee_ids,
+            mode: this.editingSessionForm.mode
           })
         });
         if (res.ok) {
@@ -504,9 +662,13 @@ createApp({
             this.currentSession = updated;
             this.loadWorkspaceFiles();
           }
+        } else {
+          // 会议进行中切模式会被拒：原因要回显，否则用户只会看到弹窗关不掉
+          const data = await res.json().catch(() => ({}));
+          alert(data.error || `HTTP ${res.status}`);
         }
       } catch (e) {
-        alert("保存会议配置失败: " + e);
+        alert(this.t("保存会议配置失败:") + " " + e);
       }
     },
 
@@ -562,7 +724,7 @@ createApp({
     },
 
     async deleteSessionItem(id) {
-      if (!confirm("确定要删除此会议记录吗？")) return;
+      if (!confirm(this.t("确定要删除此会议记录吗？"))) return;
       try {
         await fetch(`/api/sessions/${id}`, { method: "DELETE" });
         await this.loadSessions();
@@ -667,7 +829,7 @@ createApp({
         const data = await res.json().catch(() => ({}));
         if (!res.ok) {
           // 失败时保留输入内容与引用条，别让用户白打一遍
-          alert(data.error || `发送失败（HTTP ${res.status}）`);
+          alert(data.error || this.t("发送失败（HTTP {status}）", { status: res.status }));
           return;
         }
         this.inputContent = "";
@@ -678,7 +840,7 @@ createApp({
         await this.loadSessions();
       } catch (e) {
         console.error("发送消息失败:", e);
-        alert("发送失败：" + e);
+        alert(this.t("发送失败：") + e);
       }
     },
 
@@ -823,7 +985,7 @@ createApp({
         if (!res.ok) {
           // 常见：全员已被跳过、或只剩一个已被判定卡住的成员。
           // 过去这里不检查 ok，界面照样切成「进行中」，用户只能反复点、看不到任何原因。
-          alert(data.error || `恢复失败（HTTP ${res.status}），请稍后再试。`);
+          alert(data.error || this.t("恢复失败（HTTP {status}），请稍后再试。", { status: res.status }));
           return;
         }
 
@@ -845,8 +1007,8 @@ createApp({
       } catch (e) {
         // 服务刚重启时请求会直接失败：一定要说出来，不能只写 console
         alert(
-          "恢复请求没有送达服务端：\n" + e +
-          "\n\n如果服务刚刚重启，请等 1~2 秒后再点一次。"
+          this.t("恢复请求没有送达服务端：") + "\n" + e +
+          "\n\n" + this.t("如果服务刚刚重启，请等 1~2 秒后再点一次。")
         );
       } finally {
         this.resumeBusy = false;
@@ -891,8 +1053,10 @@ createApp({
 
     async interruptCurrentSpeaker() {
       if (!this.currentSessionId || this.interruptBusy) return;
-      // 定向应答时它是「取消这次提问」，不动这个人的发言位，提示语要跟着变
+      // 定向应答时它是「取消这次提问」，不动这个人的发言位，提示语要跟着变；
+      // 自主协作时它是「结束任务」，同样不该把人移出发言位
       const wasDirect = !!this.currentSession?.target_direct_mention;
+      const wasTask = this.isTaskRunning;
       this.interruptBusy = true;
       try {
         const res = await fetch(`/api/sessions/${this.currentSessionId}/interrupt`, {
@@ -901,22 +1065,26 @@ createApp({
         });
         const data = await res.json().catch(() => ({}));
         if (!res.ok) {
-          alert(data.error || `中断失败: HTTP ${res.status}`);
+          alert(data.error || this.t("中断失败: HTTP {status}", { status: res.status }));
+          return;
+        }
+        // 立刻拉一次最新状态，避免等下一轮轮询才有反馈
+        const latest = await fetch(`/api/sessions/${this.currentSessionId}`).then(r => r.ok ? r.json() : null);
+        if (wasTask) {
+          this.toastText = this.t("任务已结束，已产出的内容都保留在上方。");
+          setTimeout(() => { this.toastText = ""; }, 6000);
+          this.currentSession = latest && latest.id === this.currentSessionId ? latest : this.currentSession;
         } else if (wasDirect) {
-          this.toastText = `已取消 [${data.interrupted || "这次回答"}] 的提问，它仍在会上，可以随时再 @ 它。`;
+          this.toastText = this.t("已取消 [{name}] 的执行，它仍在会上，可以随时再 @ 它。", { name: data.interrupted || this.t("这一次") });
           setTimeout(() => { this.toastText = ""; }, 6000);
-          // 立刻拉一次最新状态，避免等下一轮轮询才有反馈
-          const latest = await fetch(`/api/sessions/${this.currentSessionId}`).then(r => r.ok ? r.json() : null);
-          if (latest && latest.id === this.currentSessionId) this.currentSession = latest;
+          this.currentSession = latest && latest.id === this.currentSessionId ? latest : this.currentSession;
         } else {
-          this.toastText = `已中断 [${data.interrupted || "当前发言"}]，会议交由余下成员继续。`;
+          this.toastText = this.t("已中断 [{name}]，会议交由余下成员继续。", { name: data.interrupted || this.t("当前发言") });
           setTimeout(() => { this.toastText = ""; }, 6000);
-          // 立刻拉一次最新状态，避免等下一轮轮询才有反馈
-          const latest = await fetch(`/api/sessions/${this.currentSessionId}`).then(r => r.ok ? r.json() : null);
-          if (latest && latest.id === this.currentSessionId) this.currentSession = latest;
+          this.currentSession = latest && latest.id === this.currentSessionId ? latest : this.currentSession;
         }
       } catch (e) {
-        alert("中断请求失败: " + e);
+        alert(this.t("中断请求失败:") + " " + e);
       } finally {
         this.interruptBusy = false;
       }
@@ -931,22 +1099,22 @@ createApp({
         });
         const data = await res.json().catch(() => ({}));
         if (!res.ok) {
-          alert(data.error || `重试失败: HTTP ${res.status}`);
+          alert(data.error || this.t("重试失败: HTTP {status}", { status: res.status }));
           return;
         }
         if (data.session) this.currentSession = data.session;
       } catch (e) {
-        alert("重试请求失败: " + e);
+        alert(this.t("重试请求失败:") + " " + e);
       }
     },
 
     async skipMember(msg) {
       if (!this.currentSessionId || !msg) return;
-      const name = msg.sender_name || "该成员";
+      const name = msg.sender_name || this.t("该成员");
       if (!confirm(
-        `跳过 [${name}] 并继续推进？\n\n` +
-        "它不再占用本次会议的发言位，余下成员照常推进；\n" +
-        "配置与历史发言都保留，可在「参会成员」面板点「恢复」拉回来。"
+        this.t("跳过 [{name}] 并继续推进？", { name }) + "\n\n" +
+        this.t("它不再占用本次会议的发言位，余下成员照常推进；") + "\n" +
+        this.t("配置与历史发言都保留，可在「参会成员」面板点「恢复」拉回来。")
       )) return;
       try {
         const res = await fetch(`/api/sessions/${this.currentSessionId}/messages/${msg.id}/skip`, {
@@ -955,12 +1123,12 @@ createApp({
         });
         const data = await res.json().catch(() => ({}));
         if (!res.ok) {
-          alert(data.error || `跳过失败: HTTP ${res.status}`);
+          alert(data.error || this.t("跳过失败: HTTP {status}", { status: res.status }));
           return;
         }
         if (data.session) this.currentSession = data.session;
       } catch (e) {
-        alert("跳过请求失败: " + e);
+        alert(this.t("跳过请求失败:") + " " + e);
       }
     },
 
@@ -973,12 +1141,12 @@ createApp({
         });
         const data = await res.json().catch(() => ({}));
         if (!res.ok) {
-          alert(data.error || `恢复失败: HTTP ${res.status}`);
+          alert(data.error || this.t("恢复失败: HTTP {status}", { status: res.status }));
           return;
         }
         if (data.session) this.currentSession = data.session;
       } catch (e) {
-        alert("恢复请求失败: " + e);
+        alert(this.t("恢复请求失败:") + " " + e);
       }
     },
 
@@ -988,6 +1156,12 @@ createApp({
       const d = Math.floor(s / 86400);
       const h = Math.floor((s % 86400) / 3600);
       const m = Math.floor((s % 3600) / 60);
+      if (this.lang === "en") {
+        if (d > 0) return `${d}d ${h}h`;
+        if (h > 0) return `${h}h ${m}m`;
+        if (m > 0) return `${m}m ${s % 60}s`;
+        return `${s}s`;
+      }
       if (d > 0) return `${d} 天 ${h} 小时`;
       if (h > 0) return `${h} 小时 ${m} 分`;
       if (m > 0) return `${m} 分 ${s % 60} 秒`;
@@ -1007,21 +1181,18 @@ createApp({
       }
     },
 
-    toggleServiceMenu() {
-      this.showServiceMenu = !this.showServiceMenu;
-      if (this.showServiceMenu) this.fetchSystemStatus();
-    },
-
     async restartService() {
       if (this.serviceBusy) return;
-      if (!confirm("确定重启服务？\n\n正在执行的 AI 任务会被立即终止，会议自动转为暂停；重启后点「恢复讨论」即可继续。")) return;
+      if (!confirm(
+        this.t("确定重启服务？") + "\n\n" +
+        this.t("正在执行的 AI 任务会被立即终止，会议自动转为暂停；重启后点「恢复讨论」即可继续。")
+      )) return;
 
       if (!this.systemStatus) await this.fetchSystemStatus();
       const oldStart = this.systemStatus?.started_at || 0;
       const oldPid = this.systemStatus?.pid || 0;
 
       this.serviceBusy = true;
-      this.showServiceMenu = false;
       try {
         await fetch("/api/system/restart", {
           method: "POST",
@@ -1036,17 +1207,19 @@ createApp({
       if (ok) {
         location.reload();
       } else {
-        alert("重启后 20 秒内没能连上服务。请查看终端输出，或手动执行 ./run.sh。");
+        alert(this.t("重启后 20 秒内没能连上服务。请查看终端输出，或手动执行 ./run.sh。"));
         this.serviceDown = true;
       }
     },
 
     async shutdownService() {
       if (this.serviceBusy) return;
-      if (!confirm("确定停止服务？\n\n所有在跑的 AI 任务会立即终止，会议转为暂停。停止后需重新运行 ./run.sh 才能再次使用。")) return;
+      if (!confirm(
+        this.t("确定停止服务？") + "\n\n" +
+        this.t("所有在跑的 AI 任务会立即终止，会议转为暂停。停止后需重新运行 ./run.sh 才能再次使用。")
+      )) return;
 
       this.serviceBusy = true;
-      this.showServiceMenu = false;
       try {
         await fetch("/api/system/shutdown", {
           method: "POST",
@@ -1064,7 +1237,7 @@ createApp({
       if (!this.systemStatus) {
         this.serviceDown = true;
       } else {
-        alert("停止指令已发出，但服务仍在响应。请查看终端是否有异常。");
+        alert(this.t("停止指令已发出，但服务仍在响应。请查看终端是否有异常。"));
       }
     },
 
@@ -1131,9 +1304,12 @@ createApp({
       if (!s) return "";
       const msgs = s.messages || [];
       const last = msgs[msgs.length - 1] || {};
+      const collab = s.collab || {};
       return [
         s.status, s.current_speaker, s.target_direct_mention, s.phase,
         s.doc_revision, (s.document || "").length,
+        // 任务横幅要跟着轮次/待协助者走，否则界面会停在「第 1 轮」不动
+        collab.active ? 1 : 0, collab.round || 0, collab.pending_helper || "",
         msgs.length, last.id, (last.content || "").length
       ].join("|");
     },
@@ -1228,9 +1404,9 @@ createApp({
           const res = await fetch(`/api/workspace/file?path=${encodeURIComponent(item.path)}`);
           const data = await res.json();
           this.selectedWorkspaceFile = item;
-          this.selectedFileContent = data.content || "(空文件)";
+          this.selectedFileContent = data.content || this.t("(空文件)");
         } catch (e) {
-          alert("读取文件失败: " + e);
+          alert(this.t("读取文件失败:") + " " + e);
         }
       }
     },
@@ -1274,7 +1450,7 @@ createApp({
       try {
         if (navigator.clipboard && navigator.clipboard.writeText) {
           await navigator.clipboard.writeText(text);
-          alert("已复制到剪贴板！");
+          this.showToast(this.t("已复制到剪贴板"));
         } else {
           const ta = document.createElement("textarea");
           ta.value = text;
@@ -1282,7 +1458,7 @@ createApp({
           ta.select();
           document.execCommand("copy");
           document.body.removeChild(ta);
-          alert("已复制到剪贴板！");
+          this.showToast(this.t("已复制到剪贴板"));
         }
       } catch (e) {
         console.warn("复制失败:", e);
@@ -1290,10 +1466,6 @@ createApp({
     },
 
     // ----------------- 员工与主持人配置设置 -----------------
-    openSettingsModal() {
-      this.showSettingsModal = true;
-    },
-
     async triggerScanModels(force = true) {
       try {
         const res = await fetch(`/api/scan_models?refresh=${force ? 1 : 0}`);
@@ -1335,7 +1507,8 @@ createApp({
         cli_cmd: "",
         system_prompt: "",
         enabled: true,
-        timeout: 0
+        timeout: 0,
+        write_access: false
       };
       this.showEmpEditModal = true;
     },
@@ -1366,11 +1539,11 @@ createApp({
 
     async saveEmployeeItem() {
       if (!this.editingEmp.name.trim()) {
-        alert("请输入角色姓名！");
+        alert(this.t("请输入角色姓名！"));
         return;
       }
       if (!this.editingEmp.cli_cmd.trim()) {
-        alert("CLI 执行模板不能为空！");
+        alert(this.t("CLI 执行模板不能为空！"));
         return;
       }
 
@@ -1397,7 +1570,7 @@ createApp({
 
     async deleteEmployee(idx) {
       const targetEmp = this.settings.employees[idx];
-      if (confirm(`确定要删除角色 [${targetEmp.name}] 吗？`)) {
+      if (confirm(this.t("确定要删除角色 [{name}] 吗？", { name: targetEmp.name }))) {
         this.settings.employees.splice(idx, 1);
         const saved = await this.saveSettingsToServer(null, false);
         if (saved && this.currentSession?.employee_ids) {
@@ -1409,26 +1582,30 @@ createApp({
 
     async saveSettingsToServer(nextSettings, closeMainModal = true) {
       try {
+        // 顶层偏好（语言/默认模式/协作规则）随整份配置一起提交，后端会做白名单校验
+        const payload = nextSettings || this.settings;
+        if (payload && !payload.ui_language) payload.ui_language = this.lang;
         const res = await fetch("/api/settings", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(nextSettings || this.settings)
+          body: JSON.stringify(payload)
         });
         const data = await res.json().catch(() => ({}));
         if (!res.ok) {
           // 后端的 schema / 白名单校验失败原因必须回显，否则用户只会看到「什么都没发生」
-          alert("保存配置失败: " + (data.error || `HTTP ${res.status}`));
+          alert(this.t("保存配置失败:") + " " + (data.error || `HTTP ${res.status}`));
           return false;
         }
         this.settings = data.settings || this.settings;
-        this.showEmpEditModal = false;
-        if (closeMainModal) {
-          this.showSettingsModal = false;
-          alert("配置已成功保存！");
+        if (data.settings && data.settings.ui_language) {
+          this.lang = data.settings.ui_language === "en" ? "en" : "zh";
+          this.applyLanguage();
         }
+        this.showEmpEditModal = false;
+        if (closeMainModal) this.showToast(this.t("配置已保存。"));
         return true;
       } catch (e) {
-        alert("保存配置失败: " + e);
+        alert(this.t("保存配置失败:") + " " + e);
         return false;
       }
     },
