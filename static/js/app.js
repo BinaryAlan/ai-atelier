@@ -73,8 +73,15 @@ createApp({
         mode: "roundtable"
       },
 
-      // 员工管理：单页承载成员、权限、语言、会议行为与服务进程
+      // 设置中心：分类页（通用 / 成员 / 会议 / 服务）
       showSettings: false,
+      settingsTab: "general",
+      settingsTabs: [
+        { key: "general", icon: "🎛️", label: "通用与语言" },
+        { key: "members", icon: "👥", label: "成员与主持人" },
+        { key: "meeting", icon: "🧭", label: "会议行为" },
+        { key: "service", icon: "⏻", label: "服务进程" }
+      ],
       taskBusy: false,
 
       // 员工与主持人配置弹窗
@@ -328,16 +335,14 @@ createApp({
       }
     },
 
-    // ------------------- 员工管理（单页） -------------------
-    openEmployeeManagement(section = "") {
+    // ------------------- 设置中心 -------------------
+    openSettings(tab = "general") {
+      this.settingsTab = tab;
       this.showSettings = true;
-      this.fetchSystemStatus();
-      if (section) {
-        this.$nextTick(() => {
-          const el = document.getElementById(`settings-${section}`);
-          if (el) el.scrollIntoView({ behavior: "smooth", block: "start" });
-        });
-      }
+      if (tab === "service") this.fetchSystemStatus();
+    },
+    openServiceSettings() {
+      this.openSettings("service");
     },
     // 批量开关写权限：只改内存里的配置，仍需点「保存配置」才落盘
     setAllWriteAccess(enabled) {

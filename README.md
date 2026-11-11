@@ -151,11 +151,11 @@ Pick the mode when creating a meeting (and change it later in **Edit meeting**, 
 | **🗣️ Roundtable** | Members speak in turn through Phase 1 and Phase 2; the moderator synthesises and maintains the living document. |
 | **🎯 Autonomous task** | `@` one member to hand it a task. It works on its own, keeps going across rounds until it writes a completion marker or hits the round limit, and can `@` teammates for a second opinion or help. A task banner shows the current round with an **End task** button. |
 
-Autonomous task settings live in **Employee Management** (the "Meeting Behavior" section): the maximum number of rounds per task (4 by default, 1–20) and whether the AI may call in other members. Each round is one full model call, so the limit is also a cost cap. Turning helper mentions off makes the owner work alone.
+Autonomous task settings live in **Settings → Meeting Behavior**: the maximum number of rounds per task (4 by default, 1–20) and whether the AI may call in other members. Each round is one full model call, so the limit is also a cost cap. Turning helper mentions off makes the owner work alone.
 
 ### Write access (let the AI actually do the work)
 
-Read-only roles can only look things up. In **Employee Management**, each member card shows its access mode and timeout; toggle write access there (or use **Enable all / Disable all**), then click Save settings:
+Read-only roles can only look things up. In **Settings → Members & Roles**, each member card shows its access mode and timeout; toggle write access there (or use **Enable all / Disable all**), then click Save settings:
 
 - `agy` gets `--dangerously-skip-permissions`;
 - `codebuddy` gets `-y` and `Write,Edit,Bash` appended to `--tools` (on top of `Read,Glob,Grep`).
@@ -173,7 +173,7 @@ The flags are injected by the server from the setting, so the command template s
 - At least one **local AI CLI** that accepts a prompt on the command line — the defaults assume `agy` and `codebuddy`, but any binary works via a command template (the only backend available today)
 
 > [!NOTE]
-> **Execution backends.** Today the only backend is a local CLI spawned as a subprocess; each member is a command template. Remote API calls (pointing a member at a hosted model endpoint) are planned — CLI will then be one of several backends, not a constraint of the meeting engine. The collaboration flow, minutes and prompt assembly are backend-independent.
+> **Execution backends.** Today the only backend is a local CLI spawned as a subprocess. Remote API calls are planned.
 
 ### Install and run
 
@@ -196,11 +196,11 @@ Open <http://127.0.0.1:5050>.
 ```
 
 > [!TIP]
-> The **Service** section of **Employee Management** shows the same telemetry and offers one-click restart / shutdown from inside the browser.
+> **Settings → Service** shows the same telemetry and offers one-click restart / shutdown from inside the browser.
 
 ### Your first meeting
 
-1. Open **⚙️ Employee Management**, confirm at least one employee whose `cli_cmd` actually runs on your machine (test it in a terminal first), and adjust the persona if you like;
+1. Open **⚙️ Settings**, confirm at least one moderator and employee is available;
 2. Click **＋ New meeting**, pick **Roundtable** or **Autonomous task**, the participants and a workspace directory (the models may read files there);
 3. Send your topic — or `@` an owner to delegate a self-contained task;
 4. Watch the collaboration unfold; the shared document grows on the right. In roundtable mode the meeting concludes when every member has PASSed; in autonomous task mode the owner keeps working until it reports completion or hits the round limit.
