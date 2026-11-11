@@ -1,10 +1,9 @@
 <div align="center">
 
 # 🏛️ AI-Meeting
-### Multi-AI Council & RFC Review Consensus System
+### Multi-AI Council with RFC-Style Review
 
-*A lightweight multi-agent consensus system driven by **RFC Review Paradigm***  
-*Say goodbye to endless flattery and chat flood — debate on the left, living architecture document on the right!*
+*A local, single-user council of AI models that debates a proposal and converges on one authoritative document — instead of flooding you with chat logs.*
 
 <br/>
 
@@ -12,135 +11,180 @@
 
 <br/>
 
-[![Python](https://img.shields.io/badge/Python-3.8+-3776AB?style=flat-square&logo=python&logoColor=white)](https://python.org)
+[![Python](https://img.shields.io/badge/Python-3.8%2B-3776AB?style=flat-square&logo=python&logoColor=white)](https://python.org)
 [![License](https://img.shields.io/badge/License-MIT-emerald?style=flat-square)](LICENSE)
-[![Architecture](https://img.shields.io/badge/Architecture-RFC%20Review-blueviolet?style=flat-square)](#-core-workflow)
-[![Execution](https://img.shields.io/badge/Execution-CLI%20%26%20API%20Ready-orange?style=flat-square)](#-virtual-employee-configuration)
-[![Security](https://img.shields.io/badge/Security-Local--First%20Guard-green?style=flat-square)](#-security-boundaries)
+[![Execution](https://img.shields.io/badge/Execution-Local%20CLI-blueviolet?style=flat-square)](#config)
+[![Security](https://img.shields.io/badge/Security-Local--First-green?style=flat-square)](#security)
+
+<br/>
+
+<img src="docs/demo.gif" alt="AI-Meeting demo: three-pane workspace, chat stream on the left, living document on the right, prompt inspector" width="880">
+
+<sub>Demo recorded on fictional data (a made-up weekly-report tool) — no real conversations are shown.</sub>
 
 </div>
 
 ---
 
-## 💡 Why AI-Meeting?
+## 📖 Table of Contents
 
-Most existing multi-agent discussion frameworks (such as ChatDev, AutoGen, etc.) suffer from two primary pain points in practical engineering and architecture design:
-
-1. **Endless Politeness & Non-Convergence**: AI agents tend to compliment each other and endlessly nitpick minor wording, preventing the discussion from naturally reaching closure;
-2. **Chat Flooding & Lost Signal**: Each model repeatedly rewrites full documents or thousands of lines of code into the chat stream, making it almost impossible for human operators to extract actionable consensus.
-
-**AI-Meeting** borrows the battle-tested **RFC / PR Review mechanism** from premier open-source communities (like Linux and Kubernetes):
-
-| Dimension | Traditional Multi-Agent Chat | AI-Meeting (RFC Review Paradigm) |
-| :--- | :--- | :--- |
-| **Primary Goal** | Accumulating chat logs; takeaways scattered across messages | **Deliverable-Oriented**: The right panel maintains a single, continuously growing, authoritative living document |
-| **Speech Constraint** | Open-ended, rambling dialogue prone to drifting | **Dual-Track Workflow**: Phase 1 Free Brainstorming ➡️ Phase 2 Strict Blocker Review with first-line verdict protocol |
-| **Convergence** | Relies on arbitrary round counts (e.g., "stop after 3 rounds") | **State-Ready Natural Termination**: Closes immediately when all PASS; pinpoints and fixes blockers iteratively |
-| **Fault Tolerance** | A single model timeout or crash deadlocks the entire session | **Per-Member Resilience**: In-place single-speech retry, temporary skip, and seamless member restoration |
-| **Execution Layer** | Tied to commercial cloud API keys or proprietary platforms | **Decoupled Architecture**: Natively drives local CLIs (`agy`, `codebuddy`, etc.), architected for future REST/HTTP API expansion |
+- [Why AI-Meeting?](#why)
+- [How It Works](#how)
+- [Features](#features)
+- [Quick Start](#start)
+- [Virtual Employee Configuration](#config)
+- [Security Boundaries](#security)
+- [Known Limitations](#limits)
+- [Troubleshooting](#trouble)
+- [Repository Layout](#layout)
 
 ---
 
-## 🔄 Core Workflow
+<a id="why"></a>
+## 💡 Why AI-Meeting?
+
+Most multi-agent frameworks (ChatDev, AutoGen, …) are built for open-ended conversation. In architecture and design work that produces two recurring problems:
+
+1. **No convergence** — agents compliment each other and nitpick wording, so the discussion never reaches a decision;
+2. **Signal loss** — every model rewrites the whole document into the chat stream, and nobody can extract the actual conclusion.
+
+**AI-Meeting** applies the **RFC / pull-request review** discipline used by large open-source projects:
+
+| Dimension | Typical multi-agent chat | AI-Meeting (RFC review) |
+| :--- | :--- | :--- |
+| **Primary goal** | Accumulate chat logs; conclusions scattered | **Deliverable-oriented**: one living document in the right panel, always current |
+| **Speaking rules** | Open-ended dialogue, drifts off-topic | **Two phases**: free formulation ➡️ strict blocker-only review with a first-line verdict protocol |
+| **Convergence** | "Stop after N rounds" | **State-driven**: concludes the moment everyone PASSes; blockers are fixed in a closed loop |
+| **Fault tolerance** | One timeout deadlocks the session | **Per-member resilience**: retry / skip / restore a single member |
+| **Execution** | Bound to a cloud API key | **Decoupled**: drives local CLIs (`agy`, `codebuddy`, …) via command templates |
+
+---
+
+<a id="how"></a>
+## 🔄 How It Works
 
 ```mermaid
 flowchart TD
-    User(["👤 User / Moderator Injects Topic or Directive"]) --> Phase1["Phase 1: Free Brainstorming<br/>AI members voice perspectives and core assumptions"]
-    Phase1 --> Synthesis["👑 Moderator Synthesis<br/>Generates initial Living Document draft"]
-    Synthesis --> Phase2["Phase 2: RFC Review<br/>Strict scrutiny · Fatal blockers only"]
-    
-    Phase2 --> Check{"Review Verdict"}
-    Check -->|"Fatal Defect [BLOCKER]"| Revision["👑 Moderator Revises Living Document"]
-    Revision --> Verify["🔍 Raiser Closed Verification<br/>Strict verdict: [ACCEPT] / [REJECT]"]
-    Verify -->|"[ACCEPT] Resolved"| Phase2
-    Verify -->|"[REJECT] Still Unresolved"| Revision
-    
-    Check -->|"Unanimous [PASS]"| Concluded(["🎉 Consensus Reached · Meeting Concluded"])
+    User(["👤 Owner injects a topic or directive"]) --> Phase1["Phase 1: Free formulation<br/>Members state their position and assumptions"]
+    Phase1 --> Synthesis["👑 Moderator synthesis<br/>Produces the first living-document draft"]
+    Synthesis --> Phase2["Phase 2: RFC review<br/>Fatal defects only"]
+
+    Phase2 --> Check{"Review verdict"}
+    Check -->|"[BLOCKER]"| Revision["👑 Moderator revises the document"]
+    Revision --> Verify["🔍 Author-only verification<br/>Strict verdict: [ACCEPT] / [REJECT]"]
+    Verify -->|"[ACCEPT]"| Phase2
+    Verify -->|"[REJECT]"| Revision
+
+    Check -->|"Unanimous [PASS]"| Concluded(["🎉 Consensus · meeting concluded"])
 ```
 
-### 1. Dual-Track Workflow (Open Formulation ➡️ Strict Review)
-- **Phase 1: Free Brainstorming**  
-  Participating models voice their perspectives, architectural assumptions, and recommended solutions. Length is determined dynamically by the topic's complexity, prioritizing dense, high-signal input. Once all members have spoken, the moderator synthesizes the consensus and initializes the **Living Document** in the right panel.
-- **Phase 2: Strict Blocker Scrutiny**  
-  After the draft is generated, the council switches into strict code-review mode. **Minor wording or stylistic nitpicks are strictly forbidden**. Only fatal defects—such as system crashes, concurrency deadlocks, critical security flaws, or fundamental logic contradictions—may be raised as `[BLOCKER: Brief Issue Description]`. When no fatal flaws exist, models must explicitly state `[PASS]` and yield the floor.
+### 1. Two phases: open formulation ➡️ strict review
 
-### 2. Closed-Loop Verification (Anti-Scope-Creep)
-When an AI member raises a `[BLOCKER]`:
-1. The moderator immediately applies a targeted revision to the living document;
-2. The system **invites only the blocker's author into a closed verification round** (feeding them the revised full text, with strict instructions forbidding extraneous new topics);
-3. Once the author confirms resolution with `[ACCEPT]`, the review resumes with the remaining reviewers;
-4. When all participants confirm `[PASS]` and zero blockers remain, the meeting naturally concludes with the finalized deliverable.
+- **Phase 1 — free formulation.** Each member states its perspective, assumptions and proposed approach. Answer length is decided by the model, not by a character cap. Once everyone has spoken, the moderator synthesises the consensus and creates the **living document** (right panel).
+- **Phase 2 — blocker-only scrutiny.** The council switches to review mode. Minor wording or style suggestions are explicitly forbidden; only defects that would make the plan wrong — data corruption, deadlocks, security holes, broken logic — may be raised as `[BLOCKER: one-line issue]`. Otherwise the model must answer `[PASS]` and yield the floor.
+
+### 2. Closed-loop verification (anti scope creep)
+
+When a member raises a `[BLOCKER]`:
+
+1. the moderator applies a targeted revision to the document;
+2. **only the author of that blocker** is invited to verify it (fed the revised full text, forbidden to raise unrelated topics);
+3. the author must answer `[ACCEPT]` or `[REJECT]` — rejections loop back to step 1;
+4. when every member has said `[PASS]` and no blocker is open, the meeting concludes and the document is final.
 
 > [!IMPORTANT]
-> **Strict Verdict Protocol & Data Integrity**:
-> - **Strict First-Line Protocol**: Verdicts are parsed strictly from explicit markers on the first non-empty lines of model outputs. The engine never infers agreement from conversational prose, preventing negative statements from being misclassified as approvals;
-> - **Accurate Minutes**: If a member produces an invalid response (e.g. timeout, empty output, or raw tool calls), the moderator is strictly forbidden from hallucinating positions on their behalf. The draft automatically appends a **Data Integrity Note** auditing all absent members.
+> **Verdicts are parsed, not guessed.** The engine only accepts explicit markers on the first non-empty line of a reply; it never infers agreement from prose, so a "this is not acceptable" sentence can no longer be counted as an approval.
+>
+> **Minutes contain only what happened.** If a member times out, returns an empty reply, or emits raw tool calls, the moderator is forbidden from inventing a position for it. The draft appends a *Data Integrity Note* listing every absent member, so the record stays auditable.
 
 ---
 
-## ✨ Key Features
+<a id="features"></a>
+## ✨ Features
 
-### 🛡️ Resilient Recovery: Single AI Failures Don't Halt the Session
-When a local model CLI times out or errors, the meeting pauses gracefully without discarding progress:
-- **In-Place Retry**: Rerun only the failed speech with its original prompt. The new response cleanly overwrites the record without re-running other members;
-- **Skip Member**: If a CLI is temporarily unavailable, skip that member with one click. The meeting continues with the remaining participants;
-- **Restore Member**: Re-enable skipped members at any time from the participant panel; they will rejoin in the next round.
+### 🛡️ Single-member failures don't kill the session
 
-### 👑 Human-in-the-Loop Authority
-- **Instant Pause / Resume**: Click `⏸️ Pause` at any moment to immediately send `SIGTERM` to the underlying process group, preventing orphan processes and wasted tokens;
-- **In-Flight Directives**: Messages sent by the human user are injected into subsequent prompts as the highest-priority "User Directive";
-- **Direct Mention (@) Controls**: `@all` resets the council back to Phase 1 under your updated direction; `@member` triggers an isolated direct inquiry without derailing the main session state machine.
-  The prompt carries plan document → meeting background → persona → chat context → the question → output rules. Putting the document first keeps a stable prefix across reviewers of the same revision, so provider-side prompt caching can hit. Once the document is drafted (≥3000 chars) the chat context shrinks to owner follow-ups plus the two latest peer messages, and system broadcasts / moderator status lines are dropped — the same information is never paid for twice as "raw transcript + document summary". Documents over 12k chars switch to "outline + 2–3 sections matching the question + closing summary" instead of being re-sent whole.
-- **💬 Quote Reply (WeChat-style)**: every member/moderator bubble has a `Reply` action. Sending quotes that message and routes the question to its author (equivalent to `@` them). The quoted text is resolved from the server-side record — the client only sends a message id — and is fed into the prompt as its own block; clicking the quote jumps back to the original message (brief highlight) or opens a snapshot preview if it is no longer in the list; a failed reply can be retried with the quote restored.
-- **✕ Cancel vs ⏭ Skip**: interrupting a normal turn removes that member from the speaking order; during a direct `@` answer the same button becomes `Cancel` — it only stops that one answer and the member stays in the meeting.
-- **🔍 Sectioned Prompt Inspector**: the full prompt is split into per-`【block】` cards with char/line counts; bulk material (chat transcript, plan document) is collapsed by default, so a 14k-char prompt shows ~1.2k chars on first paint, with per-section and expand/collapse-all toggles.
+- **Retry in place** — re-run only the failed speech and overwrite that record; other members are untouched;
+- **Skip a member** — if a CLI is genuinely down, skip it and let the rest finish; it can be restored later;
+- **Resume a stuck meeting** — after a crash or a service restart, the meeting pauses instead of losing state. Resuming retries the same member once; if it stalls twice in a row, that member is set aside automatically and the meeting moves on.
 
-### 🖥️ Responsive Three-Column Workspace
-- **Left Column (Sessions)**: Search, rename, favorite, and drag to resize or collapse;
-- **Center Column (Interactive Stream)**: Visual waterfall clearly distinguishing initial opinions, blockers, verification verdicts, and system broadcasts; AI messages render as Markdown (headings, lists, tables, code, quotes) while owner/system messages stay plain;
-- **Streaming Output**: subprocess stdout is throttled into 0.33s updates and shown live while waiting (per-token visibility depends on whether the CLI itself flushes). While streaming the text is rendered as **plain text** on purpose — half-finished Markdown (an unclosed code fence, a half-written table) would reflow the whole block on every tick and make it unreadable; the final message takes over with full Markdown once the call returns;
-- **Follow & "Back to latest"**: auto-scroll stops only when you scroll up yourself, so a fast-growing answer never loses your position; a `Back to latest` pill appears while you read history.
-- **Collapsible Long Answers**: messages taller than the chat viewport (~30 lines) fold automatically with an `Expand / Collapse` toggle, and re-measure on window resize so short messages are never mis-folded;
-- **Right Column (Living Document)**: Real-time Markdown rendering, version history tracking, and distraction-free full-screen reading mode.
+### 👑 Human-in-the-loop authority
+
+- **Pause / resume at any time** — sends `SIGTERM` to the process group, so no orphaned CLI processes keep burning tokens;
+- **Inject directives mid-flight** — anything you type becomes the highest-priority "owner directive" in subsequent prompts;
+- **`@all` / `@member`** — `@all` restarts Phase 1 under your new direction; `@member` is an isolated inquiry that doesn't disturb the session state machine;
+- **💬 Quote reply (WeChat-style)** — reply to any speech; the question is routed to its author (equivalent to `@` them). The quoted text is resolved server-side (the client only sends a message id) and is passed to the prompt as its own block. Clicking a quote jumps back to the original message, or shows a snapshot if it's no longer in the list;
+- **✕ Cancel vs ⏭ Skip** — interrupting a normal turn removes that member from the speaking order; during a `@` answer the same button becomes **Cancel** and keeps them in the meeting;
+- **🔍 Prompt inspector** — the full prompt of every speech, split into `【block】` cards with char/line counts; bulk material (chat transcript, plan document) is collapsed by default, so a 14k-char prompt shows ~1.2k chars on first paint.
+
+<details>
+<summary>How the <code>@</code> prompt is assembled (token-cost notes)</summary>
+
+Order: **plan document → meeting context → persona → chat transcript → the question → output rules**.
+
+Two deliberate choices:
+
+- **Document first** — the same revision is byte-identical across every reviewer, so it forms a stable prefix that provider-side prompt caching can hit; the per-member persona comes *after* it, not before.
+- **Context shrinks as the document matures** — once the document exceeds ~3000 chars, the chat transcript is trimmed to owner follow-ups plus the two latest peer messages, and system broadcasts / moderator status lines are dropped. The same fact is never paid for twice as "raw transcript + document summary".
+
+Documents over 12k chars switch to *outline + 2–3 sections matching the question + closing summary* instead of being re-sent whole.
+</details>
+
+### 🖥️ Three-pane workspace
+
+- **Left** — sessions: search, rename, favourite, collapse;
+- **Middle** — the debate: verdict badges (`PASS` / `BLOCKER` / `ACCEPT`), retry/skip/reply actions, Markdown rendering for AI replies (owner/system messages stay plain);
+- **Streaming** — subprocess stdout is pushed in 0.33 s chunks. While streaming the text is rendered as **plain text on purpose**: half-finished Markdown (an unclosed code fence, a half-written table) would reflow the whole block on every tick. The final message takes over with full Markdown. Whether you see it token-by-token depends on whether the CLI flushes its output;
+- **Follow & "back to latest"** — auto-scroll stops only when *you* scroll up, so a fast-growing answer never loses your position; a `Back to latest` pill appears while you read history;
+- **Collapsible long answers** — measured by real rendered height (roughly one viewport); re-measured on resize so short messages are never folded;
+- **Right** — the living document: live Markdown, revision history, distract-free full-screen mode.
 
 ---
 
+<a id="start"></a>
 ## 🚀 Quick Start
 
-### 1. Prerequisites
-- Python 3.8+
-- An execution environment (natively supports `agy` and `codebuddy` CLIs, with customizable templates)
+### Prerequisites
 
-### 2. Installation & Launch
+- **Python 3.8+** (developed and verified on 3.12)
+- At least one **local AI CLI** that accepts a prompt on the command line — the defaults assume `agy` and `codebuddy`, but any binary works via a command template;
+- A browser with internet access for the first load: the UI loads Vue 3, Tailwind, marked and DOMPurify from a CDN. **Offline?** The page still runs, but Markdown falls back to escaped plain text and styling degrades.
+
+### Install and run
+
 ```bash
-# Clone the repository
 git clone https://github.com/BinaryAlan/ai-meeting.git
 cd ai-meeting
-
-# Start the service (automatically initializes an isolated .venv and installs dependencies)
-./run.sh
+./run.sh          # creates .venv, installs deps, starts the server
 ```
 
-Once ready, open `http://127.0.0.1:5050` in your browser to launch your first meeting!
+Open <http://127.0.0.1:5050>.
 
-### 3. Service Lifecycle Management
-`run.sh` also acts as a full-featured service management script:
+### Service lifecycle
 
 ```bash
-./run.sh start      # Launch server (foreground daemon; Ctrl+C to exit gracefully)
-./run.sh status     # Inspect PID, uptime, hot-reload status, and active meetings
-./run.sh restart    # Gracefully restart (safely halts active CLI tasks and pauses meetings)
-./run.sh stop       # Gracefully shut down the server
+./run.sh start      # start (foreground; Ctrl+C exits gracefully)
+./run.sh status     # PID, uptime, hot-reload state, running meetings
+./run.sh restart    # graceful restart (halts active CLI tasks, pauses meetings)
+./run.sh stop       # graceful shutdown
 ```
 
 > [!TIP]
-> You can also click the **⏻ Power Menu** in the top-left of the web UI to inspect service telemetry and trigger one-click restarts or shutdowns.
+> The **⏻ power menu** in the top-left of the UI shows the same telemetry and offers one-click restart / shutdown.
+
+### Your first meeting
+
+1. Open **⚙️ Settings**, confirm at least one employee whose `cli_cmd` actually runs on your machine (test it in a terminal first), and adjust the persona if you like;
+2. Click **＋ New topic**, pick the participants and a workspace directory (the models may read files there);
+3. Send your topic. Watch Phase 1, then Phase 2; the document grows on the right;
+4. When every member has PASSed, the meeting concludes — the document is your deliverable.
 
 ---
 
+<a id="config"></a>
 ## ⚙️ Virtual Employee Configuration
 
-Configure CLI commands, model parameters, and persona prompts in the Settings modal:
+Each employee is just a command template plus a persona. `{prompt}` is replaced with the full prompt; commands are constrained to AI CLIs (see *Security*).
 
 ```json
 {
@@ -159,7 +203,7 @@ Configure CLI commands, model parameters, and persona prompts in the Settings mo
       "avatar": "🧠",
       "avatar_color": "#9333ea",
       "cli_cmd": "codebuddy --model deepseek-v4-pro --tools \"Read,Glob,Grep\" -p \"{prompt}\"",
-      "system_prompt": "Specializes in system boundary exploration and fatal edge-case discovery.",
+      "system_prompt": "Focuses on system boundaries and fatal edge cases.",
       "enabled": true
     }
   ]
@@ -167,45 +211,80 @@ Configure CLI commands, model parameters, and persona prompts in the Settings mo
 ```
 
 > [!WARNING]
-> **CodeBuddy CLI Tool Parameter Tip**:  
-> When configuring CodeBuddy models, we recommend supplying read-only inspection tools: `--tools "Read,Glob,Grep"`. If tools are disabled via `--tools ""` and a topic asks the model to inspect local files, the model may output only an incomplete planning sentence. AI-Meeting includes built-in safeguards (XML tag stripping and automatic retries) to maintain flow continuity.
+> **CodeBuddy CLI tip** — prefer supplying read-only tools: `--tools "Read,Glob,Grep"`. With `--tools ""` and a topic that requires reading local files, the model may answer with a single planning sentence. AI-Meeting strips stray XML tags and retries an obviously incomplete reply once, but it cannot recover content the model never produced.
 
 ---
 
+<a id="security"></a>
 ## 🔒 Security Boundaries
 
-Built strictly with a **Local-First, Single-User Security Architecture**:
+Built as a **local-first, single-user** tool:
 
-- **Network Boundary**: Bound strictly to `127.0.0.1` by default; enforces `Host` header verification to neutralize DNS Rebinding attacks, with production debuggers disabled;
-- **Command Whitelisting**: CLI execution templates are constrained to verified AI binaries, strictly preventing arbitrary shell execution (e.g. `bash`, `python`);
-- **Path Traversal Protection**: File and workspace browsing is confined strictly to the user home and project directory, completely blocking sensitive hidden files (`.ssh`, `.gitconfig`, etc.);
-- **XSS Sanitization**: Markdown output is rigorously sanitized through `DOMPurify` before DOM insertion.
+- **Network** — binds `127.0.0.1` only, validates the `Host` header to blunt DNS-rebinding, and runs with the Werkzeug debugger disabled;
+- **Command allow-list** — execution templates are restricted to known AI CLI binaries; shells such as `bash`/`python` are rejected, so a template cannot become arbitrary code execution;
+- **Path confinement** — workspace browsing is limited to the project and home directories, and dot-prefixed secrets (`.ssh`, `.gitconfig`, …) are blocked;
+- **XSS** — model output is sanitised with DOMPurify before it reaches the DOM.
+
+**No authentication is implemented.** Anyone who can reach the port can drive the meeting. Keep it on localhost; do not expose it to a LAN or the internet as-is.
 
 ---
 
+<a id="limits"></a>
+## ⚠️ Known Limitations & Trade-offs
+
+These are deliberate, documented rather than hidden:
+
+| Limitation | Why / impact |
+| :--- | :--- |
+| **In-process state** (`_ACTIVE_SESSIONS`, `_PENDING_RESUME`, `_SKIP_REQUESTS`, stream buffers) | Fine for a single-process dev server. Running multiple workers would break skip/resume/streaming across processes — it would need shared storage (Redis). |
+| **Full-file session writes** | Each session is one JSON file rewritten on change; cost grows with transcript size. Fine for meetings of tens of turns, not a durable chat store. |
+| **1.5 s polling** | The UI polls the whole session while a meeting runs. Simple and robust, but O(n²) in transcript size; SSE/WebSocket is the obvious upgrade. |
+| **Streaming depends on the CLI** | If the binary buffers stdout until exit (`agy` does), there is nothing to stream and you only see the final message. |
+| **CDN-loaded frontend** | Vue / Tailwind / marked / DOMPurify come from CDNs; offline use degrades to plain text and unstyled layout. |
+| **Concurrent meetings** | Each meeting runs in its own thread, so two meetings will spawn two CLI processes at once. There is no global scheduler or rate limit — the machine (and your local model) absorbs the load. |
+
+---
+
+<a id="trouble"></a>
+## 🩺 Troubleshooting
+
+| Symptom | Cause / fix |
+| :--- | :--- |
+| Meeting shows **paused** after I edited code | The dev server's hot reload restarts the process, which pauses running meetings by design. Resume from the banner or the ⏸️/▶️ button. |
+| **"Service unavailable"** right after a restart | Polls fail for a second or two while Flask restarts. Refresh, or wait for `./run.sh status` to report healthy. |
+| A member returns only "I'll read the files first…" | The CLI has no tool access for that prompt. Give it read tools (`--tools "Read,Glob,Grep"`) or ask a question that doesn't need files. |
+| `Port 5050 already in use` | `./run.sh stop` (it falls back to `lsof` + `SIGTERM`), or start with `PORT=5051 ./run.sh`. |
+| Button missing after an interrupted answer | Interrupting a `@` answer only cancels that answer; the member stays. Use retry on the failed message, or `@` them again. |
+| Markdown looks like plain text | The CDN scripts didn't load (offline / blocked). The UI intentionally degrades to escaped text instead of injecting raw HTML. |
+
+---
+
+<a id="layout"></a>
 ## 📁 Repository Layout
 
 ```text
 ai-meeting/
-├── app.py              # Flask Web server & API controller (Host guard & concurrency locks)
+├── app.py                # Flask app: routes, locks, host guard
 ├── core/
-│   ├── engine.py       # Meeting state machine & RFC consensus scheduler
-│   ├── executor.py     # Unified CLI/API execution runner with process group cleanup
-│   ├── scanner.py      # Local AI CLI / model discovery engine
-│   └── storage.py      # Session and employee persistence (atomic file writes)
+│   ├── engine.py         # Meeting state machine (phases, verdicts, prompts)
+│   ├── executor.py       # CLI runner: process groups, streaming, timeouts
+│   ├── streaming.py      # In-memory buffer for in-flight output
+│   ├── storage.py        # Atomic session/employee persistence
+│   └── scanner.py        # Local AI CLI / model discovery
 ├── data/
-│   ├── settings.json   # Employee configurations and defaults
-│   └── sessions/       # Meeting chat history and finalized deliverables
+│   ├── settings.json     # Employees, moderator, defaults
+│   └── sessions/         # Meeting transcripts + final documents (git-ignored)
 ├── static/
-│   ├── index.html      # Responsive web interface
-│   └── js/app.js       # Vue.js frontend driver (IME composition & session guard)
-├── requirements.txt    # Core Python dependencies
-├── run.sh              # Service lifecycle CLI (start / stop / restart / status)
-└── LICENSE             # MIT License
+│   ├── index.html        # Single-page UI
+│   └── js/app.js         # Vue 3 app (rendering, scroll, IME guards)
+├── docs/demo.gif         # The demo above
+├── requirements.txt      # Flask
+├── run.sh                # start / stop / restart / status
+└── LICENSE               # MIT
 ```
 
 ---
 
 ## 📄 License
 
-This project is licensed under the [MIT License](LICENSE).
+[MIT](LICENSE).
