@@ -1,9 +1,9 @@
 <div align="center">
 
 # 🏛️ AI-Meeting
-### Multi-AI Council with RFC-Style Review
+### Multi-AI Collaboration Workspace
 
-*A local, single-user council of AI models that debates a proposal and converges on one authoritative document.*
+*A local, single-user workspace where multiple AI models collaborate on the same job: debating and cross-reviewing, or splitting a task and calling in teammates for help.*
 
 <br/>
 
@@ -39,7 +39,7 @@
 <a id="why"></a>
 ## 💡 Why AI-Meeting?
 
-Most multi-agent frameworks (ChatDev, AutoGen, …) are built for open-ended conversation. In architecture and design work that produces two recurring problems:
+Most multi-agent frameworks (ChatDev, AutoGen, …) are built for open-ended conversation. In day-to-day collaborative work that produces two recurring problems:
 
 1. **No convergence** — agents compliment each other and nitpick wording, so the discussion never reaches a decision;
 2. **Signal loss** — every model rewrites the whole document into the chat stream, and nobody can extract the actual conclusion.
@@ -48,7 +48,7 @@ Most multi-agent frameworks (ChatDev, AutoGen, …) are built for open-ended con
 
 | Dimension | Typical multi-agent chat | AI-Meeting (RFC review) |
 | :--- | :--- | :--- |
-| **Primary goal** | Accumulate chat logs; conclusions scattered | **Deliverable-oriented**: one living document in the right panel, always current |
+| **Primary goal** | Accumulate chat logs; conclusions scattered | **Shared source of truth**: one living document kept current, so every member works from the same version |
 | **Speaking rules** | Open-ended dialogue, drifts off-topic | **Two phases**: free formulation ➡️ strict blocker-only review with a first-line verdict protocol |
 | **Convergence** | "Stop after N rounds" | **State-driven**: concludes the moment everyone PASSes; blockers are fixed in a closed loop |
 | **Fault tolerance** | One timeout deadlocks the session | **Per-member resilience**: retry / skip / restore a single member |
@@ -58,6 +58,8 @@ Most multi-agent frameworks (ChatDev, AutoGen, …) are built for open-ended con
 
 <a id="how"></a>
 ## 🔄 How It Works
+
+The flow below describes the **roundtable** mode; autonomous tasks are covered in [Modes & Settings](#modes).
 
 ```mermaid
 flowchart TD
@@ -86,7 +88,7 @@ When a member raises a `[BLOCKER]`:
 1. the moderator applies a targeted revision to the document;
 2. **only the author of that blocker** is invited to verify it (fed the revised full text, forbidden to raise unrelated topics);
 3. the author must answer `[ACCEPT]` or `[REJECT]` — rejections loop back to step 1;
-4. when every member has said `[PASS]` and no blocker is open, the meeting concludes and the document is final.
+4. when every member has said `[PASS]` and no blocker is open, the meeting concludes and the minutes are locked in.
 
 > [!IMPORTANT]
 > **Verdicts are parsed, not guessed.** The engine only accepts explicit markers on the first non-empty line of a reply; it never infers agreement from prose, so a "this is not acceptable" sentence can no longer be counted as an approval.
@@ -198,7 +200,7 @@ Open <http://127.0.0.1:5050>.
 1. Open **⚙️ Settings**, confirm at least one employee whose `cli_cmd` actually runs on your machine (test it in a terminal first), and adjust the persona if you like;
 2. Click **＋ New meeting**, pick **Roundtable** or **Autonomous task**, the participants and a workspace directory (the models may read files there);
 3. Send your topic — or `@` an owner to delegate a self-contained task;
-4. Watch the discussion unfold; the document grows on the right. In roundtable mode the meeting concludes when every member has PASSed, and that document is your deliverable.
+4. Watch the collaboration unfold; the shared document grows on the right. In roundtable mode the meeting concludes when every member has PASSed; in autonomous task mode the owner keeps working until it reports completion or hits the round limit.
 
 ---
 
