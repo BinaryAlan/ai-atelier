@@ -3,7 +3,7 @@
 # 🏛️ AI-Meeting
 ### 多 AI 圆桌会议 · RFC 式方案评审
 
-*一个跑在本地的单用户多模型会议室：多个 AI 就同一个议题立论、互审、收敛，最终产出一份正式方案文档 —— 而不是把聊天记录堆给你看。*
+*一个跑在本地的单用户多模型会议室：多个 AI 就同一个议题立论、互审、收敛，最终产出一份正式方案文档。*
 
 <br/>
 
@@ -12,16 +12,13 @@
 <br/>
 
 [![Python](https://img.shields.io/badge/Python-3.8%2B-3776AB?style=flat-square&logo=python&logoColor=white)](https://python.org)
-[![License](https://img.shields.io/badge/License-MIT-emerald?style=flat-square)](LICENSE)
-[![Execution](https://img.shields.io/badge/Execution-%E6%9C%AC%E5%9C%B0%20CLI-blueviolet?style=flat-square)](#config)
-[![UI](https://img.shields.io/badge/UI-%E4%B8%AD%E6%96%87%20%2F%20EN-blue?style=flat-square)](#modes)
+[![License](https://img.shields.io/badge/License-Noncommercial-orange?style=flat-square)](LICENSE)
+[![Execution](https://img.shields.io/badge/Execution-%E6%9C%AC%E5%9C%B0%20CLI-blueviolet?style=flat-square)](#start)
 [![Security](https://img.shields.io/badge/Security-Local--First-green?style=flat-square)](#security)
 
 <br/>
 
 <img src="docs/demo.gif" alt="AI-Meeting 演示：三栏工作台、左侧讨论流、右侧实时生长的方案纪要、Prompt 审计" width="880">
-
-<sub>演示使用完全虚构的数据（一个杜撰的「周报工具」议题），不含任何真实聊天内容。英文版 README 配有独立的英文界面动图。</sub>
 
 </div>
 
@@ -34,7 +31,6 @@
 - [特性亮点](#features)
 - [协作模式与系统设置](#modes)
 - [快速启动](#start)
-- [虚拟员工配置](#config)
 - [安全边界](#security)
 - [目录架构](#layout)
 
@@ -165,28 +161,6 @@ flowchart TD
 
 参数由服务端按设置注入，不用手改命令模板，权限也集中在一处可审计。**写权限默认关闭** —— 开启后该角色能直接改工作目录里的文件、执行命令，请只在本机、目录可信时启用。
 
-### 中英双语界面
-
-界面内置 **简体中文 / English**。在 **设置 → 通用与语言** 里切换，立即生效；选择写入 `data/settings.json`（同一台机器上的所有浏览器共用），本地再缓存一份避免首屏闪中文。后端生成的系统广播、主持人流程播报也跟随同一设置。模型 Prompt 与 AI 发言保持原样 —— 它们是输入输出，不是界面文案。
-
-### 按功能分类的设置中心
-
-设置不再挤在一个长弹窗里，而是分成五页：
-
-| 页面 | 内容 |
-| :--- | :--- |
-| **通用与语言** | 界面语言、前端依赖状态 |
-| **成员与主持人** | 主持人、成员人设、启停、增删角色 |
-| **执行权限** | 写权限、单次超时、批量开关 |
-| **会议行为** | 新会议默认模式、自主协作规则 |
-| **服务进程** | PID / 运行时长 / 在跑会议、**重启服务**、**停止服务** |
-
-原来悬浮在左上角的「重启 / 停止」已并入 **设置 → 服务进程**，和它影响的状态信息放在一起。侧栏的 ⏻ 按钮是这一页的快捷入口。
-
-### 不走 CDN，断网可用
-
-Vue 3、Tailwind、marked、DOMPurify 全部随项目放在 `static/vendor/`，页面**不发起任何外部请求**：内网或完全离线的机器上，Markdown 渲染与安全消毒一样正常。第三方库走长期不可变缓存，项目自己的 JS/CSS 用 ETag 协商缓存（304），改完刷新即生效、不用强刷。模型调用仍由本机 CLI 完成。
-
 ---
 
 <a id="start"></a>
@@ -195,8 +169,7 @@ Vue 3、Tailwind、marked、DOMPurify 全部随项目放在 `static/vendor/`，�
 ### 环境准备
 
 - **Python 3.8+**（开发与验证环境为 3.12）
-- 至少一个**能在命令行接收 prompt 的本地 AI CLI** —— 默认按 `agy` 与 `codebuddy` 配置，其他客户端用命令模板接即可；
-- **界面不需要联网**：前端依赖全部随项目提供。只有 AI CLI 自身可能按它的正常需要访问网络。
+- 至少一个**能在命令行接收 prompt 的本地 AI CLI** —— 默认按 `agy` 与 `codebuddy` 配置，其他客户端用命令模板接即可
 
 ### 安装与启动
 
@@ -230,46 +203,6 @@ cd ai-meeting
 
 ---
 
-<a id="config"></a>
-## ⚙️ 虚拟员工配置
-
-一个员工 = 一条命令模板 + 一段人设。`{prompt}` 会被替换成完整 Prompt；命令受白名单约束（见「安全边界」）。
-
-```json
-{
-  "employees": [
-    {
-      "id": "emp_agy",
-      "name": "agy",
-      "avatar": "🦉",
-      "avatar_color": "#2563eb",
-      "cli_cmd": "agy -p \"{prompt}\"",
-      "enabled": true,
-      "write_access": false,
-      "timeout": 0
-    },
-    {
-      "id": "codebuddy-ds4",
-      "name": "DeepSeek-V4 (DS4)",
-      "avatar": "🧠",
-      "avatar_color": "#9333ea",
-      "cli_cmd": "codebuddy --model deepseek-v4-pro --tools \"Read,Glob,Grep\" -p \"{prompt}\"",
-      "system_prompt": "注重架构边界与潜在隐患推演",
-      "enabled": true,
-      "write_access": false,
-      "timeout": 0
-    }
-  ]
-}
-```
-
-`write_access` 默认 `false`；为 `true` 时由服务端自动补对应的 CLI 参数。`timeout` 是单次回答超时秒数，`0` 表示不限时。
-
-> [!WARNING]
-> **CodeBuddy CLI 配置建议** —— 建议挂只读工具 `--tools "Read,Glob,Grep"`。若用 `--tools ""` 而议题又要求读本地文件，模型可能只回一句「我先读取……」就结束。系统会剥离异常 XML 标签、并在回答明显残缺时自动重试一次，但没法凭空补出模型没产出的内容。
-
----
-
 <a id="security"></a>
 ## 🔒 安全边界
 
@@ -279,7 +212,7 @@ cd ai-meeting
 - **命令白名单** —— 执行模板限定为已知 AI CLI 二进制，`bash` / `python` 之类会被拒绝，模板无法变成任意代码执行；
 - **路径限制** —— 工作目录浏览限定在项目与用户目录内，`.` 开头的敏感文件（`.ssh`、`.gitconfig` 等）一律屏蔽；
 - **写权限默认关闭** —— 成员默认只读；开启后该角色可以改动工作目录里的文件、执行命令，请只在可信目录上启用；
-- **XSS** —— 模型输出经本地 DOMPurify 消毒后才进 DOM；依赖缺失时界面降级为转义纯文本，不会把原始 HTML 注进页面。
+- **XSS** —— 模型输出经 DOMPurify 消毒后才进 DOM，原始 HTML 不会直接注入页面。
 
 **没有做登录鉴权。** 谁能访问这个端口，谁就能操作会议（包括打开写权限）。请只在本机使用，不要原样暴露到局域网或公网。
 
@@ -305,17 +238,17 @@ ai-meeting/
 │   ├── index.html        # 单页界面
 │   ├── js/app.js         # Vue 3 应用（渲染、滚动、输入法防误触）
 │   ├── js/i18n.js        # 英文界面词典
-│   └── vendor/           # Vue / Tailwind / marked / DOMPurify（离线、无 CDN）
+│   └── vendor/           # Vue / Tailwind / marked / DOMPurify
 ├── docs/
 │   ├── demo.gif          # 演示动图（中文界面）
 │   └── demo-en.gif       # 演示动图（英文界面）
 ├── requirements.txt      # Flask
 ├── run.sh                # start / dev / stop / restart / status
-└── LICENSE               # MIT
+└── LICENSE               # PolyForm Noncommercial 1.0.0
 ```
 
 ---
 
 ## 📄 许可证
 
-[MIT](LICENSE)。
+[PolyForm Noncommercial License 1.0.0](LICENSE) —— 仅允许个人、研究、教学及其他非商业用途；**未经版权方另行授权，不得用于商业用途**。
