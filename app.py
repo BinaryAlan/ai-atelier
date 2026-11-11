@@ -18,6 +18,7 @@ from core.engine import (
     build_direct_prompt, latest_user_message, find_quote_by_question,
 )
 from core.executor import Executor, validate_cli_template
+from core.tasks import task_manager, parse_collab, STAGE_EXEC, STAGE_REVIEW, STAGE_DELIVER
 from core.streaming import get_stream
 from core.scanner import scan_local_models
 from core.i18n import L, system_label
@@ -691,28 +692,83 @@ def api_send_message(session_id):
     elif isinstance(reply_to, str):
         reply_id = reply_to.strip()
 
+    settings = load_settings()
     with session_lock(session_id):
         session = get_session(session_id)
         if not session:
             return jsonify({"error": "会话不存在"}), 404
 
+        forced_owner_id = None
         if reply_id:
             quoted = _find_message(session, reply_id)
             if not quoted:
                 return jsonify({"error": "被回复的消息不存在，可能已被删除"}), 404
             sender = quoted.get("sender")
             if sender in ("user", "system"):
-                return jsonify({"error": "只能回复成员或主持人的发言"}), 400
-            allowed = set(session.get("employee_ids") or [])
-            allowed.add(MeetingEngine.get_moderator(load_settings()).get("id"))
-            if sender not in allowed:
-                return jsonify({"error": "该成员已不在本场会议中，无法直接回复"}), 400
+                return jsonify({"error": "只能回复 AI 成员的发言"}), 400
+            for emp in settings.get("employees") or []:
+                if isinstance(emp, dict) and emp.get("id") == sender:
+                    forced_owner_id = sender
+                    break
+            if not forced_owner_id:
+                return jsonify({"error": "该成员已不在成员列表中，无法直接回复"}), 400
 
-        MeetingEngine.user_inject(session, content, reply_to=reply_id or None)
-
-    start_background_runner(session_id)
+    # 任务系统接管：@ 单任务 / /collab 协助任务；没点名的消息只作为上下文保留
+    result = task_manager.submit_message(
+        session_id, content, settings,
+        reply_to=reply_id or None,
+        forced_owner_id=forced_owner_id,
+    )
+    if result.get("error"):
+        return jsonify({"error": result["error"], "validation_error": bool(result.get("validation_error"))}), 400
 
     return jsonify(get_session(session_id) or {})
+
+@app.route("/api/sessions/<session_id>/tasks/<tid>/cancel", methods=["POST"])
+def api_cancel_task(session_id, tid):
+    """静默取消某个执行环节：终止进程、状态转已取消，不追加系统消息。"""
+    if not is_valid_session_id(session_id):
+        return jsonify({"error": "非法 session_id"}), 400
+    data = _json_body()
+    stage = str(data.get("stage") or STAGE_EXEC)
+    if stage not in (STAGE_EXEC, STAGE_REVIEW, STAGE_DELIVER):
+        return jsonify({"error": "非法环节"}), 400
+    member_id = str(data.get("member_id") or "")
+    result = task_manager.cancel(session_id, tid, stage, member_id)
+    if result.get("error"):
+        return jsonify(result), 404
+    return jsonify(result)
+
+
+@app.route("/api/sessions/<session_id>/tasks/<tid>/retry", methods=["POST"])
+def api_retry_task(session_id, tid):
+    """重跑被点击的环节：不新增任务、不增加流程轮次。"""
+    if not is_valid_session_id(session_id):
+        return jsonify({"error": "非法 session_id"}), 400
+    data = _json_body()
+    stage = str(data.get("stage") or STAGE_EXEC)
+    if stage not in (STAGE_EXEC, STAGE_REVIEW, STAGE_DELIVER):
+        return jsonify({"error": "非法环节"}), 400
+    member_id = str(data.get("member_id") or "")
+    result = task_manager.retry(session_id, tid, stage, member_id)
+    if result.get("error"):
+        return jsonify(result), 400
+    return jsonify(result)
+
+
+@app.route("/api/collab/validate", methods=["POST"])
+def api_validate_collab():
+    """输入时的 /collab 严格校验：缺主创或缺协助成员直接拦截提示。"""
+    content = str(_json_body().get("content") or "")
+    parsed = parse_collab(content, load_settings())
+    return jsonify({
+        "ok": bool(parsed["ok"]),
+        "error": parsed.get("error", ""),
+        "owner_id": parsed.get("owner_id", ""),
+        "reviewer_ids": parsed.get("reviewer_ids", []),
+        "goal": parsed.get("goal", ""),
+    })
+
 
 @app.route("/api/sessions/<session_id>/pause", methods=["POST"])
 def api_pause(session_id):
@@ -1427,6 +1483,15 @@ def api_system_shutdown():
         "action": "shutdown",
         "message": "服务正在停止，重新启动请运行 ./run.sh",
     })
+
+
+# 服务启动 / 重启：进行中的任务标记已取消（可从被中断环节重试），排队任务重新拉起 worker
+try:
+    _recovered_tasks = task_manager.recover_on_startup()
+    if _recovered_tasks:
+        print(f"[Tasks] 服务重启：{_recovered_tasks} 个进行中的任务已标记为已取消")
+except Exception as _recover_exc:
+    print("[Tasks] 启动恢复失败:", _recover_exc)
 
 
 if __name__ == "__main__":

@@ -252,7 +252,11 @@ def create_session(
         "review_comment_retries": {},
         "passed_employees": [],
         "skipped_employees": [],   # 被群主跳过的成员（CLI 报错后不再占用发言位）
-        "messages": []
+        "messages": [],
+        # AI 团队任务系统（见 docs/task-review-protocol.md）
+        "tasks": {},               # task_id -> 任务
+        "task_queues": {},         # member_id -> [task_id]，每成员一个先进先出队列
+        "active_task_id": None,
     }
     save_session(session_data)
     return session_data

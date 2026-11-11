@@ -157,7 +157,7 @@
           :class="['group flex items-center justify-between p-2 rounded-lg cursor-pointer text-sm transition', currentSessionId === s.id ? 'bg-blue-50 text-blue-700 font-medium' : 'hover:bg-gray-100 text-gray-700']"
         >
           <div class="truncate flex-1 pr-2 flex items-center gap-1.5">
-            <span class="text-xs">{{ s.is_favorite ? '⭐' : (s.mode === 'task' ? '🎯' : '📝') }}</span>
+            <span class="text-xs">{{ s.is_favorite ? '⭐' : '📝' }}</span>
             <span class="truncate">{{ s.title }}</span>
           </div>
           <div class="flex items-center gap-1 shrink-0 opacity-0 group-hover:opacity-100 transition">
@@ -189,15 +189,7 @@
           <h2 class="font-bold text-gray-900 text-base truncate">{{ currentSession?.title || t('未选择会议') }}</h2>
           <button @click="openEditSessionModal(currentSession)" class="text-xs text-gray-400 hover:text-blue-600 transition" :title="t('编辑会议配置')">✏️</button>
 
-          <span v-if="currentSession?.mode === 'task'" class="px-2 py-0.5 text-xs font-semibold rounded-full bg-emerald-100 text-emerald-800 shrink-0">
-            {{ t('自主协作') }}
-          </span>
-          <span v-else-if="currentSession?.phase === 1" class="px-2 py-0.5 text-xs font-semibold rounded-full bg-blue-100 text-blue-800 shrink-0">
-            {{ t('阶段一: 自由发言') }}
-          </span>
-          <span v-else-if="currentSession?.phase === 2" class="px-2 py-0.5 text-xs font-semibold rounded-full bg-purple-100 text-purple-800 shrink-0">
-            {{ t('阶段二: 审阅与隐患质询') }}
-          </span>
+          <!-- 顶栏不再显示模式 / 阶段徽章；任务状态在卡片上 -->
         </div>
 
         <div class="flex items-center gap-3 shrink-0">
@@ -276,41 +268,8 @@
             </div>
           </div>
 
-          <!-- 暂停 / 恢复 控制按钮 -->
-          <button
-            v-if="currentSession?.status === 'running'"
-            @click="pauseMeeting"
-            class="px-3 py-1.5 text-xs font-medium rounded-lg bg-red-50 text-red-700 hover:bg-red-100 border border-red-200 transition flex items-center gap-1.5 shadow-sm"
-            :title="t('立即终止当前正在执行的 AI 任务')"
-          >
-            <span>🛑</span> {{ t('暂停会议') }}
-          </button>
-          <button
-            v-else-if="currentSession?.status === 'paused'"
-            @click="resumeMeeting"
-            :disabled="resumeBusy"
-            class="px-3 py-1.5 text-xs font-medium rounded-lg bg-emerald-50 text-emerald-700 hover:bg-emerald-100 border border-emerald-200 transition flex items-center gap-1.5 shadow-sm disabled:opacity-60 disabled:cursor-wait"
-            :title="t('让会议从上次中断的地方继续；连续两次停在同一人会自动暂缓它')"
-          >
-            <span>{{ resumeBusy ? '⏳' : '▶️' }}</span> {{ resumeBusy ? t('恢复中…') : t('恢复讨论') }}
-          </button>
+          <!-- 界面不设全局控制条；取消与重试都在消息 / 卡片环节上 -->
         </div>
-      </div>
-
-      <!-- 自主任务横幅：谁在负责、第几轮、现在在等谁 -->
-      <div v-if="currentSession?.collab?.active" class="px-5 py-2 bg-emerald-50 border-b border-emerald-200 flex items-center gap-3 shrink-0">
-        <span class="text-base shrink-0">🎯</span>
-        <div class="flex-1 min-w-0 text-xs">
-          <div class="font-semibold text-emerald-900 truncate">
-            {{ t('自主任务') }} · {{ currentSession.collab.owner_name }}
-          </div>
-          <div class="text-emerald-700 truncate">{{ taskStatusText }}</div>
-        </div>
-        <button
-          @click="stopTask"
-          :disabled="taskBusy"
-          class="shrink-0 px-3 py-1 text-xs rounded-lg bg-white border border-emerald-300 text-emerald-800 hover:bg-emerald-100 transition disabled:opacity-60"
-        >{{ taskBusy ? t('结束中…') : t('结束任务') }}</button>
       </div>
 
       <!-- 聊天消息流：外层 relative 只用于承载「回到最新」浮动按钮 -->
@@ -322,22 +281,48 @@
       >
         <div v-if="!currentSession?.messages?.length" class="text-center py-16 text-gray-400">
           <span class="text-4xl">💡</span>
-          <template v-if="currentSession?.mode === 'task'">
-            <p class="mt-3 text-sm font-medium text-gray-600">{{ t('用 @ 把任务交给一位成员，由它独立做完') }}</p>
-            <p class="text-xs text-gray-400 mt-1">{{ t('它会自己动手、写文件，中途还能 @ 同事要意见；做完自动收工') }}</p>
-          </template>
-          <template v-else>
-            <p class="mt-3 text-sm font-medium text-gray-600">{{ t('在此发起议题、提问或展开多方讨论') }}</p>
-            <p class="text-xs text-gray-400 mt-1">{{ t('支持 @特定AI 单独咨询、@所有人 进行协同方案构思与审阅') }}</p>
-          </template>
+          <p class="mt-3 text-sm font-medium text-gray-600">{{ t('用 @ 把任务交给一位成员，或用 /collab 发起协助任务') }}</p>
+          <p class="text-xs text-gray-400 mt-1">{{ t('/collab @主创 @协助成员 任务内容；结果会落在右侧工作目录') }}</p>
         </div>
 
         <!-- 消息气泡卡片 -->
         <div
-          v-for="msg in currentSession?.messages || []"
+          v-for="msg in visibleMessages"
           :key="msg.id"
           :class="['flex gap-3', msg.sender === 'user' ? 'justify-end' : 'justify-start']"
         >
+          <!-- 协助任务卡片：默认折叠，外壳实时显示流水状态 -->
+          <template v-if="msg.kind === 'task_card' && msg.card">
+            <div
+              @click="openCardModal(msg)"
+              class="w-full rounded-xl border border-slate-200 bg-white shadow-sm px-4 py-3 cursor-pointer hover:border-blue-300 transition"
+            >
+              <div class="flex items-center justify-between gap-2">
+                <div class="flex items-center gap-2 min-w-0">
+                  <span>🗂️</span>
+                  <span class="text-sm font-semibold text-gray-800 truncate">{{ t('协助任务') }} · {{ msg.card.goal }}</span>
+                </div>
+                <div class="flex items-center gap-2 shrink-0">
+                  <span class="text-[11px] px-2 py-0.5 rounded border" :class="statusClass(msg.card.status)">{{ stateLabel(msg.card.status) }}</span>
+                  <span class="text-[11px] text-gray-500">⏱ {{ taskElapsed(msg.card) }}</span>
+                  <span class="text-xs text-blue-600 shrink-0">{{ t('展开查看') }} ›</span>
+                </div>
+              </div>
+              <div class="mt-2 text-[11px] text-gray-500">{{ t('当前环节') }}：{{ stageLabel(msg.card) }}</div>
+              <div v-if="queueHint(msg.card.task_id, msg.card.owner.id)" class="mt-1 text-[11px] text-amber-600">
+                ⏳ {{ queueHint(msg.card.task_id, msg.card.owner.id) }}
+              </div>
+              <div class="mt-2 flex flex-wrap gap-1.5">
+                <span class="text-[11px] px-2 py-0.5 rounded bg-emerald-50 text-emerald-700 border border-emerald-100">🎯 {{ msg.card.owner_name }} · {{ stateLabel(msg.card.part_a.status) }}</span>
+                <span v-for="item in msg.card.part_b" :key="item.member_id" class="text-[11px] px-2 py-0.5 rounded bg-sky-50 text-sky-700 border border-sky-100">🤝 {{ item.name }} · {{ stateLabel(item.status) }}</span>
+              </div>
+              <div v-if="msg.card.flow && msg.card.flow.length" class="mt-2 text-[11px] text-gray-400 truncate">
+                {{ t('流水') }}：{{ msg.card.flow[msg.card.flow.length - 1].text }}
+              </div>
+            </div>
+          </template>
+
+          <template v-else>
           <!-- 非用户头像 -->
           <div
             v-if="msg.sender !== 'user'"
@@ -379,6 +364,9 @@
                 <span v-else-if="msg.verdict === 'ACCEPT'" class="px-1.5 py-0.2 rounded bg-emerald-100 text-emerald-700 font-bold text-[10px]">{{ t('ACCEPT 验收') }}</span>
                 <span v-else-if="msg.verdict === 'SKIPPED'" class="px-1.5 py-0.2 rounded bg-gray-200 text-gray-600 font-bold text-[10px]">⏭ {{ t('已跳过') }}</span>
                 <span v-if="msg.elapsed_time > 0" class="text-[11px] opacity-75">⏱️ {{ msg.elapsed_time }}s</span>
+                <span v-if="msg.kind === 'task_result' && queueHint(msg.task_id, msg.sender)" class="text-[11px] text-amber-600">
+                  ⏳ {{ queueHint(msg.task_id, msg.sender) }}
+                </span>
 
                 <!-- 引用回复：点一下就把这条发言带进输入框，发出去等于 @ 它本人 -->
                 <button
@@ -388,19 +376,19 @@
                   :title="t('引用这条发言回复（发送后由它本人作答）')"
                 >💬 {{ t('回复') }}</button>
 
-                <!-- 单人故障恢复：只重跑这一条 / 把这个人踢出本轮，避免为一次报错重开整场会议 -->
+                <!-- 单任务：取消与重试只出现在这条输出消息上 -->
                 <button
-                  v-if="canRetryMsg(msg)"
-                  @click.stop="retryMessage(msg)"
+                  v-if="msg.kind === 'task_result' && (msg.status === 'running' || msg.status === 'queued')"
+                  @click.stop="cancelTask(msg, 'exec')"
+                  class="text-[10px] px-1.5 py-0.5 rounded bg-gray-50 text-gray-600 border border-gray-200 hover:bg-gray-100 transition shrink-0"
+                  :title="t('取消这次执行，已写入的文件保留')"
+                >✕ {{ t('取消') }}</button>
+                <button
+                  v-if="msg.kind === 'task_result' && ['failed', 'cancelled', 'timeout'].includes(msg.status)"
+                  @click.stop="retryTask(msg, 'exec')"
                   class="text-[10px] px-1.5 py-0.5 rounded bg-blue-50 text-blue-700 border border-blue-200 hover:bg-blue-100 transition shrink-0"
-                  :title="t('用同一条 Prompt 单独重跑这位成员，结果原地覆盖，不影响其他人')"
+                  :title="t('按原输入重新执行这一次任务')"
                 >🔄 {{ t('重试') }}</button>
-                <button
-                  v-if="canSkipMsg(msg)"
-                  @click.stop="skipMember(msg)"
-                  class="text-[10px] px-1.5 py-0.5 rounded bg-amber-50 text-amber-700 border border-amber-200 hover:bg-amber-100 transition shrink-0"
-                  :title="t('跳过这位成员并继续推进（可随时在参会成员面板恢复）')"
-                >⏭ {{ t('跳过此人') }}</button>
 
                 <button
                   v-if="msg.sender !== 'user'"
@@ -460,42 +448,8 @@
               >{{ msgIsCollapsed(msg) ? t('展开全文') : t('收起') }}</button>
             </div>
 
-            <!-- 系统提示「服务被打断 / 已复位」时，把「怎么恢复」直接做成按钮。
-                 否则用户只能盯着「等待群主人工恢复」这句话猜操作入口。 -->
-            <div
-              v-if="msg.sender === 'system' && msg.verdict === 'RECOVER' && currentSession?.status === 'paused'"
-              class="mt-2 flex items-center gap-2 flex-wrap justify-center"
-            >
-              <button
-                @click.stop="resumeMeeting"
-                :disabled="resumeBusy"
-                class="text-[11px] px-2.5 py-1 rounded-lg bg-emerald-600 text-white hover:bg-emerald-700 transition disabled:opacity-60 disabled:cursor-wait"
-              >{{ resumeBusy ? t('⏳ 恢复中…') : t('▶️ 继续会议') }}</button>
-              <span class="text-[10px] opacity-70">{{ t('连续两次停在同一人，会自动暂缓它让其他人先走') }}</span>
-            </div>
           </div>
-        </div>
-
-        <!-- 等待思考动画 -->
-        <div v-if="currentSession?.current_speaker" class="flex items-center gap-2 text-xs text-blue-600 bg-blue-50 p-2.5 rounded-lg border border-blue-100">
-          <span class="animate-spin">⏳</span>
-          <span class="flex-1">{{ t('正在等待') }} <strong>[{{ currentSession.current_speaker }}]</strong> {{ t('响应中…') }}</span>
-          <!-- 定向 @ 应答时这是「取消」，普通轮次才是「跳过此人」：语义不同，别让用户误以为会踢人 -->
-          <button
-            @click.stop="interruptCurrentSpeaker"
-            :disabled="interruptBusy"
-            :class="[
-              'text-[11px] px-2.5 py-1 rounded-lg bg-white border transition shrink-0 disabled:opacity-60 disabled:cursor-wait',
-              (isDirectRunning || isTaskRunning)
-                ? 'border-gray-300 text-gray-600 hover:bg-gray-50'
-                : 'border-amber-300 text-amber-700 hover:bg-amber-50'
-            ]"
-            :title="isTaskRunning
-              ? t('结束这条自主任务：已产出的内容保留，之后可以重新 @ 它交办')
-              : (isDirectRunning
-                ? t('取消这次执行：只终止当前这一轮，不会把它移出发言位')
-                : t('中断这位成员的本次回答，把它移出发言位，让下一位接着发言'))"
-          >{{ interruptBusy ? t('⏳ 处理中…') : (isTaskRunning ? t('⏹ 结束任务') : (isDirectRunning ? t('✕ 取消') : t('⏭ 跳过'))) }}</button>
+          </template>
         </div>
 
         <!-- 流式预览：模型边生成边显示，完成后由正式消息接管（不留半截内容在历史里）。
@@ -532,20 +486,7 @@
         <!-- 快捷 @ 菜单 -->
         <div class="flex items-center gap-1.5 mb-2 overflow-x-auto pb-1">
           <span class="text-xs text-gray-400 shrink-0">{{ t('快捷@:') }}</span>
-          <button
-            v-if="currentSession?.mode !== 'task'"
-            @click="insertMention(t('所有人'))"
-            class="text-xs px-2 py-0.5 rounded bg-blue-50 text-blue-700 hover:bg-blue-100 border border-blue-200 transition font-medium shrink-0"
-          >
-            @{{ t('所有人') }}
-          </button>
-          <button
-            v-if="settings.moderator"
-            @click="insertMention(settings.moderator.name)"
-            class="text-xs px-2 py-0.5 rounded bg-amber-50 text-amber-800 hover:bg-amber-100 border border-amber-200 transition font-semibold shrink-0"
-          >
-            👑 @{{ settings.moderator.name }}
-          </button>
+          <!-- 任务系统只按成员接单，没有主持人和 @所有人 -->
           <!-- 参会员工快捷@ (同步仅展示当前在席参会的员工，被移出后自动消失) -->
           <button
             v-for="emp in activeSessionEmployees"
@@ -558,6 +499,13 @@
             <span v-if="emp.write_access" class="text-[9px] text-emerald-600" :title="t('已开启写权限')">✍️</span>
           </button>
         </div>
+
+        <!-- /collab 输入时严格校验：缺主创或缺协助成员直接拦截提示 -->
+        <div
+          v-if="collabHint"
+          class="mb-2 rounded-lg border px-2.5 py-1.5 text-[11px]"
+          :class="collabHint.ok ? 'border-emerald-200 bg-emerald-50 text-emerald-700' : 'border-amber-200 bg-amber-50 text-amber-800'"
+        >{{ collabHint.text }}</div>
 
         <!-- 引用回复条：显示被引用的发言，发送后由该成员本人作答（等同 @ 它） -->
         <div
@@ -622,40 +570,12 @@
         <div class="h-full w-px ml-[3px] bg-transparent group-hover:bg-blue-400 transition-colors"></div>
       </div>
 
-      <div class="flex border-b border-gray-200 bg-white text-xs font-semibold text-gray-600 shrink-0">
-        <button
-          @click="rightTab = 'doc'"
-          :class="['flex-1 py-3 text-center transition border-b-2 flex items-center justify-center gap-1.5', rightTab === 'doc' ? 'text-blue-600 border-blue-600 bg-blue-50/20' : 'border-transparent hover:text-gray-900']"
-        >
-          <span>📄</span> {{ t('会议方案 / 纪要') }}
-        </button>
-        <button
-          @click="rightTab = 'workspace'"
-          :class="['flex-1 py-3 text-center transition border-b-2 flex items-center justify-center gap-1.5', rightTab === 'workspace' ? 'text-blue-600 border-blue-600 bg-blue-50/20' : 'border-transparent hover:text-gray-900']"
-        >
-          <span>📁</span> {{ t('工作目录预览') }}
-        </button>
-        <button
-          @click="toggleDocFullscreen"
-          class="px-3 text-gray-400 hover:text-blue-600 hover:bg-gray-50 transition shrink-0"
-          :title="docFullscreen ? t('退出全屏（Esc）') : t('全屏查看方案纪要')"
-        >
-          <span v-if="docFullscreen" class="text-sm">⤡</span>
-          <span v-else class="text-sm">⛶</span>
-        </button>
+      <div class="flex items-center gap-1.5 border-b border-gray-200 bg-white px-4 py-3 text-xs font-semibold text-gray-600 shrink-0">
+        <span>📁</span> {{ t('工作目录预览') }}
       </div>
 
-      <!-- Tab 1: 会议方案纪要 -->
-      <div v-show="rightTab === 'doc'" class="flex-1 min-h-0 overflow-y-auto overflow-x-hidden p-4">
-        <div
-          v-html="renderedDoc"
-          :class="['markdown-body text-sm text-gray-800 bg-white p-5 rounded-xl border border-gray-200 shadow-sm min-h-full',
-                   docFullscreen ? 'mx-auto w-full max-w-4xl' : '']"
-        ></div>
-      </div>
-
-      <!-- Tab 2: 工作目录文件浏览器 -->
-      <div v-show="rightTab === 'workspace'" class="flex-1 flex flex-col min-h-0 bg-white">
+      <!-- 右侧面板只保留工作目录文件树与浏览 -->
+      <div class="flex-1 flex flex-col min-h-0 bg-white">
         <div class="px-4 py-2.5 bg-gray-50 border-b border-gray-200 flex items-center justify-between text-xs text-gray-500 shrink-0">
           <div class="truncate flex items-center gap-1 font-mono text-[11px]" :title="currentSession?.workspace_dir">
             <span>📂</span>
@@ -715,28 +635,7 @@
             >
           </div>
 
-          <!-- 会议模式：圆桌讨论 vs 自主协作 -->
-          <div>
-            <label class="block text-xs font-semibold text-gray-600 mb-1.5">{{ t('协作方式:') }}</label>
-            <div class="grid grid-cols-2 gap-2">
-              <button
-                type="button"
-                @click="newSessionForm.mode = 'roundtable'"
-                :class="['text-left p-2.5 rounded-lg border transition', newSessionForm.mode === 'roundtable' ? 'border-blue-500 bg-blue-50 ring-1 ring-blue-200' : 'border-gray-200 hover:bg-gray-50']"
-              >
-                <div class="text-xs font-bold text-gray-900">🗣️ {{ t('圆桌讨论') }}</div>
-                <div class="text-[11px] text-gray-500 mt-0.5 leading-snug">{{ t('成员依次发言，主持人汇总纪要') }}</div>
-              </button>
-              <button
-                type="button"
-                @click="newSessionForm.mode = 'task'"
-                :class="['text-left p-2.5 rounded-lg border transition', newSessionForm.mode === 'task' ? 'border-emerald-500 bg-emerald-50 ring-1 ring-emerald-200' : 'border-gray-200 hover:bg-gray-50']"
-              >
-                <div class="text-xs font-bold text-gray-900">🎯 {{ t('自主协作') }}</div>
-                <div class="text-[11px] text-gray-500 mt-0.5 leading-snug">{{ t('@ 一位负责人独立干活，中途可拉同事协助') }}</div>
-              </button>
-            </div>
-          </div>
+          <!-- 任务系统没有模式选择：@ 单任务、/collab 协助任务 -->
 
           <!-- 本地工作目录 (支持小窗口选择) -->
           <div>
@@ -816,28 +715,7 @@
             >
           </div>
 
-          <div>
-            <label class="block text-xs font-semibold text-gray-600 mb-1.5">{{ t('协作方式:') }}</label>
-            <div class="grid grid-cols-2 gap-2">
-              <button
-                type="button"
-                @click="editingSessionForm.mode = 'roundtable'"
-                :class="['text-left p-2 rounded-lg border transition', editingSessionForm.mode === 'roundtable' ? 'border-blue-500 bg-blue-50 ring-1 ring-blue-200' : 'border-gray-200 hover:bg-gray-50']"
-              >
-                <div class="text-xs font-bold text-gray-900">🗣️ {{ t('圆桌讨论') }}</div>
-                <div class="text-[11px] text-gray-500 mt-0.5">{{ t('成员依次发言') }}</div>
-              </button>
-              <button
-                type="button"
-                @click="editingSessionForm.mode = 'task'"
-                :class="['text-left p-2 rounded-lg border transition', editingSessionForm.mode === 'task' ? 'border-emerald-500 bg-emerald-50 ring-1 ring-emerald-200' : 'border-gray-200 hover:bg-gray-50']"
-              >
-                <div class="text-xs font-bold text-gray-900">🎯 {{ t('自主协作') }}</div>
-                <div class="text-[11px] text-gray-500 mt-0.5">{{ t('负责人独立干活') }}</div>
-              </button>
-            </div>
-            <p class="text-[11px] text-gray-400 mt-1">{{ t('会议进行中不能切换模式，请先暂停。') }}</p>
-          </div>
+          <!-- 编辑会话也不再选择模式 -->
 
           <div>
             <label class="block text-xs font-semibold text-gray-600 mb-1">{{ t('本地工作目录 (读取资料与交付物路径):') }}</label>
@@ -1100,63 +978,6 @@
               </section>
             </template>
 
-            <!-- 会议行为 -->
-            <template v-else-if="settingsTab === 'meeting'">
-              <section class="bg-white border border-gray-200 rounded-xl p-5 space-y-4">
-                <div>
-                  <h4 class="font-bold text-gray-900 text-sm">{{ t('新会议默认协作方式') }}</h4>
-                  <p class="text-xs text-gray-500 mt-0.5">{{ t('建会议时仍可单独改；这里只是默认值。') }}</p>
-                </div>
-                <div class="grid grid-cols-2 gap-3 max-w-md">
-                  <button
-                    @click="settings.default_mode = 'roundtable'"
-                    :class="['p-3 rounded-lg border text-left transition', settings.default_mode !== 'task' ? 'border-blue-500 bg-blue-50 ring-1 ring-blue-200' : 'border-gray-200 hover:bg-gray-50']"
-                  >
-                    <div class="text-sm font-bold">🗣️ {{ t('圆桌讨论') }}</div>
-                    <div class="text-[11px] text-gray-500 mt-0.5">{{ t('成员依次发言，主持人汇总纪要') }}</div>
-                  </button>
-                  <button
-                    @click="settings.default_mode = 'task'"
-                    :class="['p-3 rounded-lg border text-left transition', settings.default_mode === 'task' ? 'border-emerald-500 bg-emerald-50 ring-1 ring-emerald-200' : 'border-gray-200 hover:bg-gray-50']"
-                  >
-                    <div class="text-sm font-bold">🎯 {{ t('自主协作') }}</div>
-                    <div class="text-[11px] text-gray-500 mt-0.5">{{ t('@ 一位负责人独立干活') }}</div>
-                  </button>
-                </div>
-              </section>
-
-              <section class="bg-white border border-gray-200 rounded-xl p-5 space-y-4">
-                <div>
-                  <h4 class="font-bold text-gray-900 text-sm">{{ t('自主协作规则') }}</h4>
-                  <p class="text-xs text-gray-500 mt-0.5">{{ t('负责人没写完会自动继续，直到它写出完成标记或到达轮次上限。') }}</p>
-                </div>
-
-                <div class="flex items-center justify-between gap-4">
-                  <div class="text-xs text-gray-700">
-                    <div class="font-medium">{{ t('单个任务最大轮次') }}</div>
-                    <div class="text-[11px] text-gray-500 mt-0.5">{{ t('每轮 = 一次完整的模型调用；轮次越多成本越高，4~8 比较常用。') }}</div>
-                  </div>
-                  <input
-                    type="number" min="1" max="20"
-                    v-model.number="settings.collab.max_rounds"
-                    class="w-20 border border-gray-300 rounded-lg px-2 py-1.5 text-sm text-center"
-                  >
-                </div>
-
-                <label class="flex items-start gap-2 text-xs text-gray-700 cursor-pointer">
-                  <input type="checkbox" v-model="settings.collab.allow_agent_mentions" class="rounded text-blue-600 mt-0.5">
-                  <span>
-                    <span class="font-medium">{{ t('允许 AI 在执行中 @ 其他成员协助') }}</span>
-                    <span class="block text-[11px] text-gray-500 mt-0.5">{{ t('关掉后，负责人只能自己干，不会触发同事协助调用（更省钱）。') }}</span>
-                  </span>
-                </label>
-
-                <div class="flex justify-end">
-                  <button @click="saveSettingsToServer()" class="px-4 py-2 text-sm bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-medium shadow-sm">{{ t('保存配置') }}</button>
-                </div>
-              </section>
-            </template>
-
             <!-- 服务 -->
             <template v-else-if="settingsTab === 'service'">
               <section class="bg-white border border-gray-200 rounded-xl p-5 space-y-3">
@@ -1407,6 +1228,129 @@
 
         <div class="p-3 border-t border-gray-100 bg-gray-50 flex justify-end">
           <button @click="showInspectModal = false" class="px-4 py-1.5 text-xs bg-gray-200 hover:bg-gray-300 text-gray-700 rounded font-medium">{{ t('关闭') }}</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 协助任务卡片弹窗：两部分 + 各环节的取消 / 重试 -->
+    <div v-if="showCardModal && cardModalMsg?.card" class="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
+      <div class="bg-white rounded-2xl shadow-xl w-full max-w-3xl overflow-hidden flex flex-col max-h-[88vh]">
+        <div class="px-5 py-3 border-b border-gray-100 flex items-start justify-between gap-3 shrink-0">
+          <div class="min-w-0">
+            <div class="text-sm font-bold text-gray-900">🗂️ {{ t('协助任务卡片') }}</div>
+            <div class="text-xs text-gray-500 truncate mt-0.5">{{ cardModalMsg.card.goal }}</div>
+          </div>
+          <div class="flex items-center gap-2 shrink-0">
+            <span class="text-[11px] px-2 py-0.5 rounded border" :class="statusClass(cardModalMsg.card.status)">{{ stateLabel(cardModalMsg.card.status) }}</span>
+            <span class="text-[11px] text-gray-500">⏱ {{ taskElapsed(cardModalMsg.card) }}</span>
+            <button @click="showCardModal = false" class="text-gray-400 hover:text-gray-700 text-lg leading-none">×</button>
+          </div>
+        </div>
+
+        <div class="flex-1 min-h-0 overflow-y-auto p-5 space-y-5">
+          <!-- 实时流水 -->
+          <div class="rounded-xl border border-slate-200 bg-slate-50 p-3">
+            <div class="text-xs font-semibold text-gray-700 mb-2">{{ t('实时流水') }} · {{ stageLabel(cardModalMsg.card) }}</div>
+            <div v-for="(f, i) in cardModalMsg.card.flow.slice(-8)" :key="i" class="text-[11px] text-gray-500 flex gap-2">
+              <span class="font-mono shrink-0">{{ formatFlowTime(f.at) }}</span><span class="truncate">{{ f.text }}</span>
+            </div>
+          </div>
+
+          <!-- 第一部分 -->
+          <section>
+            <h3 class="text-sm font-bold text-gray-900 mb-2">{{ t('第一部分 · 主创做了什么') }}</h3>
+            <div class="rounded-xl border border-gray-200 p-4 space-y-3 text-xs text-gray-700">
+              <div>
+                <div class="font-semibold text-gray-800">{{ t('执行简报') }}</div>
+                <div class="mt-1 whitespace-pre-wrap">{{ cardModalMsg.card.part_a.brief || t('（暂无）') }}</div>
+              </div>
+              <div>
+                <div class="font-semibold text-gray-800">{{ t('产物清单') }}</div>
+                <div v-if="!cardModalMsg.card.artifacts.length" class="mt-1 text-gray-400">{{ t('（暂无）') }}</div>
+                <div v-for="a in cardModalMsg.card.artifacts" :key="a.path" class="mt-1 flex gap-2 font-mono text-[11px]">
+                  <span class="text-blue-700 truncate">{{ a.path }}</span>
+                  <span class="text-gray-400 shrink-0">{{ a.summary }}</span>
+                  <span class="text-gray-400 shrink-0">{{ a.bytes }} B</span>
+                </div>
+              </div>
+              <div>
+                <div class="font-semibold text-gray-800">{{ t('终版改动说明') }}</div>
+                <div class="mt-1 whitespace-pre-wrap">{{ cardModalMsg.card.part_a.final.summary || t('（暂无）') }}</div>
+                <div class="mt-1 text-gray-500 whitespace-pre-wrap">{{ cardModalMsg.card.part_a.final.opinion_handling || '' }}</div>
+              </div>
+              <div class="flex flex-wrap gap-2 pt-1">
+                <button
+                  v-if="['running', 'queued', 'in_progress'].includes(cardModalMsg.card.part_a.status)"
+                  @click="cancelTask(cardModalMsg, 'exec')"
+                  class="px-2.5 py-1 rounded-lg border border-gray-300 text-gray-700 hover:bg-gray-50"
+                >✕ {{ t('取消执行') }}</button>
+                <button
+                  v-if="['failed', 'cancelled', 'timeout'].includes(cardModalMsg.card.part_a.status)"
+                  @click="retryTask(cardModalMsg, 'exec')"
+                  class="px-2.5 py-1 rounded-lg border border-blue-200 text-blue-700 hover:bg-blue-50"
+                >🔄 {{ t('重试执行') }}</button>
+                <button
+                  v-if="['done', 'failed', 'cancelled', 'timeout'].includes(cardModalMsg.card.part_a.final_status)"
+                  @click="retryTask(cardModalMsg, 'deliver')"
+                  class="px-2.5 py-1 rounded-lg border border-emerald-200 text-emerald-700 hover:bg-emerald-50"
+                >🔄 {{ t('重新生成交付内容') }}</button>
+                <button
+                  @click="openInspectMsg({ sent_prompt: cardModalMsg.card.part_a.sent_prompt, raw_response: cardModalMsg.card.part_a.raw_output, content: cardModalMsg.card.part_a.brief })"
+                  class="px-2.5 py-1 rounded-lg border border-gray-200 text-gray-600 hover:bg-gray-50"
+                >ℹ️ {{ t('查看输入 / 原始输出') }}</button>
+              </div>
+            </div>
+          </section>
+
+          <!-- 第二部分 -->
+          <section>
+            <h3 class="text-sm font-bold text-gray-900 mb-2">{{ t('第二部分 · 协助审核') }}</h3>
+            <div class="space-y-2">
+              <div v-for="item in cardModalMsg.card.part_b" :key="item.member_id" class="rounded-xl border border-gray-200 p-4 text-xs text-gray-700">
+                <div class="flex items-center justify-between gap-2">
+                  <div class="font-semibold text-gray-800">🤝 {{ item.name }}</div>
+                  <span class="text-[11px] px-2 py-0.5 rounded border" :class="statusClass(item.status)">{{ stateLabel(item.status) }}</span>
+                </div>
+                <div class="mt-2 whitespace-pre-wrap">{{ item.summary || t('（暂无意见）') }}</div>
+                <div class="mt-2 flex flex-wrap gap-2">
+                  <button
+                    v-if="['running', 'queued', 'in_progress'].includes(item.status)"
+                    @click="cancelTask(cardModalMsg, 'review', item.member_id)"
+                    class="px-2.5 py-1 rounded-lg border border-gray-300 text-gray-700 hover:bg-gray-50"
+                  >✕ {{ t('取消') }}</button>
+                  <button
+                    v-if="['failed', 'cancelled', 'timeout', 'no_opinion'].includes(item.status)"
+                    @click="retryTask(cardModalMsg, 'review', item.member_id)"
+                    class="px-2.5 py-1 rounded-lg border border-blue-200 text-blue-700 hover:bg-blue-50"
+                  >🔄 {{ t('重试') }}</button>
+                  <button
+                    @click="openInspectMsg({ sent_prompt: item.sent_prompt, raw_response: item.raw_output, content: item.summary })"
+                    class="px-2.5 py-1 rounded-lg border border-gray-200 text-gray-600 hover:bg-gray-50"
+                  >ℹ️ {{ t('查看输入 / 原始输出') }}</button>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <!-- 历次执行记录：取消 / 重试产生的旧记录保留，点开可看完整输入与原始输出 -->
+          <section v-if="cardRecords.length">
+            <h3 class="text-sm font-bold text-gray-900 mb-2">{{ t('历次执行记录') }} · {{ cardRecords.length }}</h3>
+            <div class="space-y-1.5">
+              <button
+                v-for="(rec, ri) in cardRecords"
+                :key="rec.id || ri"
+                @click="openInspectMsg({ sent_prompt: rec.sent_prompt, raw_response: rec.raw_response, content: rec.content })"
+                class="w-full flex items-center justify-between gap-2 text-left px-3 py-2 rounded-lg border border-gray-200 hover:bg-gray-50 transition text-xs"
+              >
+                <span class="truncate">🧾 {{ rec._label }}</span>
+                <span class="shrink-0 text-[11px] text-gray-500">{{ stateLabel(rec.status) }} · {{ formatFlowTime(rec.created_at) }}</span>
+              </button>
+            </div>
+          </section>
+        </div>
+
+        <div class="p-3 border-t border-gray-100 bg-gray-50 flex justify-end shrink-0">
+          <button @click="showCardModal = false" class="px-4 py-1.5 text-xs bg-gray-200 hover:bg-gray-300 text-gray-700 rounded font-medium">{{ t('关闭') }}</button>
         </div>
       </div>
     </div>

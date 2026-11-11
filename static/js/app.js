@@ -40,7 +40,7 @@ createApp({
       expandedMsgs: {},
       // 哪些消息真的被限高截断了（渲染后实测，决定是否给「展开全文」按钮）
       overflowMsgs: {},
-      rightTab: "doc", // 'doc' | 'workspace'
+      rightTab: "workspace", // 右侧面板只保留工作目录
       workspaceItems: [],
       selectedWorkspaceFile: null,
       selectedFileContent: "",
@@ -79,7 +79,6 @@ createApp({
       settingsTabs: [
         { key: "general", icon: "🎛️", label: "通用与语言" },
         { key: "members", icon: "👥", label: "成员与主持人" },
-        { key: "meeting", icon: "🧭", label: "会议行为" },
         { key: "service", icon: "⏻", label: "服务进程" }
       ],
       taskBusy: false,
@@ -105,6 +104,11 @@ createApp({
       },
       presetAvatars: ["🤖", "🧠", "⚡", "🦉", "🛡️", "🚀", "💻", "🔬", "🎯", "🎨", "👑", "🕵️", "🔧", "💡", "⚖️", "📊"],
 
+      // 协助任务卡片弹窗（两部分 + 各环节取消 / 重试）
+      showCardModal: false,
+      cardModalMsg: null,
+      nowTick: Date.now(),   // 卡片外壳的「实时耗时」由每秒心跳驱动
+      tickTimer: null,
       // 消息审查详情弹窗
       showInspectModal: false,
       inspectTab: "prompt",
@@ -246,19 +250,70 @@ createApp({
       return `${round} · ${this.t("准备继续")}`;
     },
     inputPlaceholder() {
-      return this.currentSession?.mode === "task"
-        ? this.t("输入任务，@ 一位负责人交办… (Enter 发送，Shift+Enter 换行)")
-        : this.t("输入议题、提问、补充要求或指令... (Enter 发送，Shift+Enter 换行)");
+      return this.t("输入任务：@ 一位成员，或 /collab @主创 @协助成员 任务内容… (Enter 发送)");
     },
     // @所有人 在后端同时认「所有人」和「all」，英文界面插入 all 才不会看着别扭
     allMentionToken() {
       return this.lang === "en" ? "all" : "所有人";
+    },
+    // 协助任务各环节的执行记录不进聊天流（但能在卡片弹窗里查完整输入 / 原始输出）
+    visibleMessages() {
+      return (this.currentSession?.messages || []).filter(m => m && m.in_chat !== false);
+    },
+    hasActiveTasks() {
+      const tasks = this.currentSession?.tasks || {};
+      return Object.values(tasks).some(t => t && (t.status === "running" || t.status === "queued"));
+    },
+    // 输入时的 /collab 严格校验：主创 + 至少一位协助成员 + 任务内容
+    collabHint() {
+      const text = (this.inputContent || "").trim();
+      if (!/^\/collab(\s|$)/i.test(text)) return null;
+      const rest = text.replace(/^\/collab\s*/i, "").trim();
+      const aliases = (this.settings.employees || [])
+        .flatMap(e => {
+          const name = String(e.name || "");
+          const short = (name.match(/[（(][^（）()]+[）)]/g) || []).map(s => s.slice(1, -1));
+          return [name, String(e.id || ""), ...short];
+        })
+        .filter(Boolean)
+        .sort((a, b) => b.length - a.length);
+      let mentions = 0;
+      let cursor = 0;
+      while (true) {
+        const rawTail = rest.slice(cursor);
+        const tail = rawTail.trimStart();
+        if (!tail.startsWith("@")) break;
+        const alias = aliases.find(n => tail.startsWith("@" + n));
+        if (!alias) break;
+        mentions += 1;
+        cursor += (rawTail.length - rawTail.trimStart().length) + alias.length + 1;
+      }
+      const goal = rest.slice(cursor).trim();
+      if (mentions === 0) return { ok: false, text: this.t("缺少主创：请用 /collab @主创 @协助成员 任务内容") };
+      if (mentions < 2) return { ok: false, text: this.t("缺少协助成员：主创之后至少再指定一位协助成员") };
+      if (!goal) return { ok: false, text: this.t("请写上任务内容") };
+      return { ok: true, text: this.t("格式正确：将发起一轮协助任务") };
+    },
+    // 卡片弹窗里的「历次执行记录」：取消 / 重试产生的旧记录也保留，可按记录查看完整输入与原始输出
+    cardRecords() {
+      const tid = this.showCardModal ? this._taskId(this.cardModalMsg) : "";
+      if (!tid) return [];
+      const seen = {};
+      return (this.currentSession?.messages || [])
+        .filter(m => m && m.task_id === tid && m.kind === "task_record")
+        .map(m => {
+          const k = `${m.stage}:${m.member_id || ""}`;
+          seen[k] = (seen[k] || 0) + 1;
+          return { ...m, _label: this.recordLabel(m, seen[k]) };
+        });
     }
   },
   mounted() {
     this.restoreLayout();
     this.init();
     this.pollInterval = setInterval(this.pollActiveSession, 1500);
+    // 卡片外壳的「实时耗时」流水：每秒只更新一个时间戳，不重拉接口
+    this.tickTimer = setInterval(() => { this.nowTick = Date.now(); }, 1000);
     // 流式预览：单独一条更快的轮询，只在有人正在发言时真正请求
     this.streamTimer = setInterval(this.pollStreamPreview, 700);
     // 全局点击关闭参会人下拉框
@@ -271,6 +326,7 @@ createApp({
   },
   beforeUnmount() {
     if (this.pollInterval) clearInterval(this.pollInterval);
+    if (this.tickTimer) clearInterval(this.tickTimer);
     if (this.streamTimer) clearInterval(this.streamTimer);
     document.removeEventListener("click", this.handleGlobalClick);
     window.removeEventListener("mousemove", this.onDragMove);
@@ -279,6 +335,111 @@ createApp({
     window.removeEventListener("keydown", this.onWindowKeydown);
   },
   methods: {
+    // ----------------- 任务卡片与消息上的取消 / 重试 -----------------
+    openCardModal(msg) {
+      this.cardModalMsg = msg;
+      this.showCardModal = true;
+    },
+    openInspectMsg(payload) {
+      this.openInspectModal({
+        id: "task-record",
+        sender: "task",
+        sender_name: this.t("任务记录"),
+        content: payload.content || "",
+        sent_prompt: payload.sent_prompt || "",
+        raw_response: payload.raw_response || ""
+      });
+    },
+    _taskId(msg) {
+      return msg && (msg.task_id || (msg.card && msg.card.task_id));
+    },
+    async _taskAction(msg, stage, memberId, action) {
+      const tid = this._taskId(msg);
+      if (!tid || !this.currentSessionId) return;
+      try {
+        await fetch(`/api/sessions/${this.currentSessionId}/tasks/${tid}/${action}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ stage, member_id: memberId || "" })
+        });
+        // 静默：不弹窗、不 toast，输入框本来就一直可用
+        await this.refreshSession();
+      } catch (e) {
+        console.error(`${action} 任务失败:`, e);
+      }
+    },
+    cancelTask(msg, stage, memberId = "") {
+      return this._taskAction(msg, stage, memberId, "cancel");
+    },
+    retryTask(msg, stage, memberId = "") {
+      return this._taskAction(msg, stage, memberId, "retry");
+    },
+    async refreshSession() {
+      if (!this.currentSessionId) return;
+      const res = await fetch(`/api/sessions/${this.currentSessionId}`);
+      if (!res.ok) return;
+      const latest = await res.json();
+      if (latest.id !== this.currentSessionId) return;
+      this.currentSession = latest;
+      if (this.showCardModal && this.cardModalMsg) {
+        const updated = (latest.messages || []).find(m => m.id === this.cardModalMsg.id);
+        if (updated) this.cardModalMsg = updated;
+      }
+    },
+    stateLabel(status) {
+      const map = {
+        queued: "排队中", running: "执行中", delivered: "已交付", cancelled: "已取消",
+        failed: "失败", timeout: "超时", no_opinion: "无意见", done: "已完成",
+        waiting: "等待", in_progress: "进行中"
+      };
+      return this.t(map[status] || status || "等待");
+    },
+    statusClass(status) {
+      if (["delivered", "done", "completed"].includes(status)) return "bg-emerald-50 text-emerald-700 border-emerald-200";
+      if (["failed", "timeout", "cancelled"].includes(status)) return "bg-rose-50 text-rose-700 border-rose-200";
+      if (["running", "in_progress"].includes(status)) return "bg-blue-50 text-blue-700 border-blue-200";
+      return "bg-gray-50 text-gray-600 border-gray-200";
+    },
+    stageLabel(card) {
+      if (!card) return "";
+      if (card.status === "delivered") return this.t("已交付");
+      if (card.status === "cancelled") return this.t("已取消");
+      if (card.step === 1) return this.t("主创执行中");
+      if (card.step === 2) return this.t("成员并行审核中");
+      if (card.step === 3) return this.t("主创交付中");
+      return this.t("排队中");
+    },
+    taskElapsed(card) {
+      if (!card || !card.started_at) return "0s";
+      const end = card.finished_at || Math.floor(this.nowTick / 1000);
+      const sec = Math.max(0, end - card.started_at);
+      if (sec < 60) return `${sec}s`;
+      return `${Math.floor(sec / 60)}m ${sec % 60}s`;
+    },
+    // 同一成员多个任务排队时，外壳上显示它在队列里的位置
+    queueHint(taskId, memberId) {
+      const queues = this.currentSession?.task_queues || {};
+      const tasks = this.currentSession?.tasks || {};
+      const done = ["delivered", "cancelled", "failed", "timeout"];
+      const queue = (queues[memberId] || []).filter(t => {
+        const s = (tasks[t] || {}).status;
+        return s && !done.includes(s);
+      });
+      const idx = queue.indexOf(taskId);
+      if (idx < 0 || queue.length < 2) return "";
+      return this.t("该成员队列：第 {n} / {m} 项", { n: idx + 1, m: queue.length });
+    },
+    recordLabel(rec, seq) {
+      const stage = rec.stage === "review" ? this.t("审核")
+        : rec.stage === "deliver" ? this.t("交付") : this.t("执行");
+      const name = rec.sender_name || rec.member_id || "";
+      return `${name} · ${stage} · ${this.t("第 {n} 次", { n: seq })}`;
+    },
+    formatFlowTime(ts) {
+      if (!ts) return "--:--:--";
+      return new Date(ts * 1000).toLocaleTimeString();
+    },
+
     // ------------------- 多语言 -------------------
     // t("中文原文")：中文直接返回原文，英文查 i18n.js 的词典；查不到时退回中文，
     // 这样漏翻一个词只会显示中文，不会出现空白按钮或 undefined。
@@ -810,6 +971,13 @@ createApp({
       const text = this.inputContent.trim();
       if (!text || !this.currentSessionId) return;
 
+      // 输入时严格校验 /collab：缺主创或缺协助成员直接拦截，不发给后端
+      const hint = this.collabHint;
+      if (hint && !hint.ok) {
+        this.showToast(hint.text);
+        return;
+      }
+
       const reply = this.replyTarget;
       try {
         const res = await fetch(`/api/sessions/${this.currentSessionId}/message`, {
@@ -823,8 +991,8 @@ createApp({
         });
         const data = await res.json().catch(() => ({}));
         if (!res.ok) {
-          // 失败时保留输入内容与引用条，别让用户白打一遍
-          alert(data.error || this.t("发送失败（HTTP {status}）", { status: res.status }));
+          // 失败时保留输入内容与引用条，别让用户白打一遍；校验错误走轻提示，不弹窗
+          this.showToast(data.error || this.t("发送失败（HTTP {status}）", { status: res.status }));
           return;
         }
         this.inputContent = "";
@@ -835,7 +1003,7 @@ createApp({
         await this.loadSessions();
       } catch (e) {
         console.error("发送消息失败:", e);
-        alert(this.t("发送失败：") + e);
+        this.showToast(this.t("发送失败：") + e);
       }
     },
 
@@ -1300,11 +1468,19 @@ createApp({
       const msgs = s.messages || [];
       const last = msgs[msgs.length - 1] || {};
       const collab = s.collab || {};
+      const taskSig = Object.values(s.tasks || {})
+        .map(t => `${t.task_id}:${t.status}:${t.step}:${(t.flow || []).length}`).join(",");
+      const resultSig = msgs.filter(m => m.kind === "task_result")
+        .map(m => `${m.id}:${m.status}`).join(",");
+      const cardSig = msgs.filter(m => m.kind === "task_card")
+        .map(m => `${m.id}:${(m.card && m.card.status) || ""}:${((m.card && m.card.flow) || []).length}`).join(",");
       return [
         s.status, s.current_speaker, s.target_direct_mention, s.phase,
         s.doc_revision, (s.document || "").length,
         // 任务横幅要跟着轮次/待协助者走，否则界面会停在「第 1 轮」不动
         collab.active ? 1 : 0, collab.round || 0, collab.pending_helper || "",
+        // 任务状态、流水、结果消息状态变了都要重渲染，否则卡片停在旧状态
+        taskSig, resultSig, cardSig,
         msgs.length, last.id, (last.content || "").length
       ].join("|");
     },
@@ -1314,7 +1490,8 @@ createApp({
       if (!targetId) return;
       // 单独重试期间 status 可能仍是 paused，只有 current_speaker 能反映「正在跑」
       const busy = this.currentSession
-        && (this.currentSession.status === "running" || this.currentSession.current_speaker);
+        && (this.currentSession.status === "running" || this.currentSession.current_speaker
+            || this.hasActiveTasks);
       if (busy) {
         try {
           const res = await fetch(`/api/sessions/${targetId}`);
@@ -1327,6 +1504,10 @@ createApp({
             const nextCount = (latest.messages || []).length;
             const speakerAppeared = !this.currentSession.current_speaker && !!latest.current_speaker;
             this.currentSession = latest;
+            if (this.showCardModal && this.cardModalMsg) {
+              const updatedCard = (latest.messages || []).find(m => m.id === this.cardModalMsg.id);
+              if (updatedCard) this.cardModalMsg = updatedCard;
+            }
             if (nextCount > prevCount) {
               // 正式消息已落地，实时气泡让位，避免同一段内容显示两遍
               this.liveStream = null;
