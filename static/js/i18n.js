@@ -7,6 +7,8 @@ window.AIM_I18N = {
     "多 AI 协同圆桌讨论中枢": "Multi-AI roundtable",
     "服务状态 · 重启 · 停止": "Service status · Restart · Stop",
     "系统设置": "Settings",
+    "员工管理": "Employee Management",
+    "读写权限": "Access",
     "发起新议题": "New meeting",
     "全部": "All",
     "收藏": "Favorites",

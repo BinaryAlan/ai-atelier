@@ -13,7 +13,7 @@
 
 [![Python](https://img.shields.io/badge/Python-3.8%2B-3776AB?style=flat-square&logo=python&logoColor=white)](https://python.org)
 [![License](https://img.shields.io/badge/License-Noncommercial-orange?style=flat-square)](LICENSE)
-[![Execution](https://img.shields.io/badge/Execution-Local%20CLI-blueviolet?style=flat-square)](#start)
+[![Execution](https://img.shields.io/badge/Execution-Local%20CLI%20(current)-blueviolet?style=flat-square)](#start)
 [![Security](https://img.shields.io/badge/Security-Local--First-green?style=flat-square)](#security)
 
 <br/>
@@ -29,7 +29,7 @@
 - [Why AI-Meeting?](#why)
 - [How It Works](#how)
 - [Features](#features)
-- [Modes & Settings](#modes)
+- [Modes & Configuration](#modes)
 - [Quick Start](#start)
 - [Security Boundaries](#security)
 - [Repository Layout](#layout)
@@ -52,14 +52,14 @@ Most multi-agent frameworks (ChatDev, AutoGen, …) are built for open-ended con
 | **Speaking rules** | Open-ended dialogue, drifts off-topic | **Two phases**: free formulation ➡️ strict blocker-only review with a first-line verdict protocol |
 | **Convergence** | "Stop after N rounds" | **State-driven**: concludes the moment everyone PASSes; blockers are fixed in a closed loop |
 | **Fault tolerance** | One timeout deadlocks the session | **Per-member resilience**: retry / skip / restore a single member |
-| **Execution** | Bound to a cloud API key | **Decoupled**: drives local CLIs (`agy`, `codebuddy`, …) via command templates |
+| **Execution** | Locked to one cloud API key | **Pluggable backend**: local CLIs (`agy`, `codebuddy`, …) today; remote API calls planned |
 
 ---
 
 <a id="how"></a>
 ## 🔄 How It Works
 
-The flow below describes the **roundtable** mode; autonomous tasks are covered in [Modes & Settings](#modes).
+The flow below describes the **roundtable** mode; autonomous tasks are covered in [Modes & Configuration](#modes).
 
 ```mermaid
 flowchart TD
@@ -140,7 +140,7 @@ Documents over 12k chars switch to *outline + 2–3 sections matching the questi
 ---
 
 <a id="modes"></a>
-## 🎛️ Modes & Settings
+## 🎛️ Modes & Configuration
 
 ### Two ways to collaborate
 
@@ -151,11 +151,11 @@ Pick the mode when creating a meeting (and change it later in **Edit meeting**, 
 | **🗣️ Roundtable** | Members speak in turn through Phase 1 and Phase 2; the moderator synthesises and maintains the living document. |
 | **🎯 Autonomous task** | `@` one member to hand it a task. It works on its own, keeps going across rounds until it writes a completion marker or hits the round limit, and can `@` teammates for a second opinion or help. A task banner shows the current round with an **End task** button. |
 
-Autonomous task settings live in **Settings → Meeting Behavior**: the maximum number of rounds per task (4 by default, 1–20) and whether the AI may call in other members. Each round is one full model call, so the limit is also a cost cap. Turning helper mentions off makes the owner work alone.
+Autonomous task settings live in **Employee Management** (the "Meeting Behavior" section): the maximum number of rounds per task (4 by default, 1–20) and whether the AI may call in other members. Each round is one full model call, so the limit is also a cost cap. Turning helper mentions off makes the owner work alone.
 
 ### Write access (let the AI actually do the work)
 
-Read-only roles can only look things up. In **Settings → Permissions** you can grant write access per member (or use **Enable all / Disable all**), then click Save settings:
+Read-only roles can only look things up. In **Employee Management**, each member card shows its access mode and timeout; toggle write access there (or use **Enable all / Disable all**), then click Save settings:
 
 - `agy` gets `--dangerously-skip-permissions`;
 - `codebuddy` gets `-y` and `Write,Edit,Bash` appended to `--tools` (on top of `Read,Glob,Grep`).
@@ -170,7 +170,10 @@ The flags are injected by the server from the setting, so the command template s
 ### Prerequisites
 
 - **Python 3.8+** (developed and verified on 3.12)
-- At least one **local AI CLI** that accepts a prompt on the command line — the defaults assume `agy` and `codebuddy`, but any binary works via a command template
+- At least one **local AI CLI** that accepts a prompt on the command line — the defaults assume `agy` and `codebuddy`, but any binary works via a command template (the only backend available today)
+
+> [!NOTE]
+> **Execution backends.** Today the only backend is a local CLI spawned as a subprocess; each member is a command template. Remote API calls (pointing a member at a hosted model endpoint) are planned — CLI will then be one of several backends, not a constraint of the meeting engine. The collaboration flow, minutes and prompt assembly are backend-independent.
 
 ### Install and run
 
@@ -193,11 +196,11 @@ Open <http://127.0.0.1:5050>.
 ```
 
 > [!TIP]
-> **Settings → Service** shows the same telemetry and offers one-click restart / shutdown from inside the browser.
+> The **Service** section of **Employee Management** shows the same telemetry and offers one-click restart / shutdown from inside the browser.
 
 ### Your first meeting
 
-1. Open **⚙️ Settings**, confirm at least one employee whose `cli_cmd` actually runs on your machine (test it in a terminal first), and adjust the persona if you like;
+1. Open **⚙️ Employee Management**, confirm at least one employee whose `cli_cmd` actually runs on your machine (test it in a terminal first), and adjust the persona if you like;
 2. Click **＋ New meeting**, pick **Roundtable** or **Autonomous task**, the participants and a workspace directory (the models may read files there);
 3. Send your topic — or `@` an owner to delegate a self-contained task;
 4. Watch the collaboration unfold; the shared document grows on the right. In roundtable mode the meeting concludes when every member has PASSed; in autonomous task mode the owner keeps working until it reports completion or hits the round limit.
@@ -210,7 +213,7 @@ Open <http://127.0.0.1:5050>.
 Built as a **local-first, single-user** tool:
 
 - **Network** — binds `127.0.0.1` only, validates the `Host` header to blunt DNS-rebinding, and runs with the Werkzeug debugger disabled;
-- **Command allow-list** — execution templates are restricted to known AI CLI binaries; shells such as `bash`/`python` are rejected, so a template cannot become arbitrary code execution;
+- **Command allow-list** — in the current CLI backend, execution templates are restricted to known AI CLI binaries; shells such as `bash`/`python` are rejected, so a template cannot become arbitrary code execution;
 - **Path confinement** — workspace browsing is limited to the project and home directories, and dot-prefixed secrets (`.ssh`, `.gitconfig`, …) are blocked;
 - **Write access is opt-in** — members are read-only by default. Enabling it lets that role modify files and run commands inside the workspace; keep it off unless the directory is trusted;
 - **XSS** — model output is sanitised with DOMPurify before it reaches the DOM; raw HTML is never injected into the page.
@@ -227,7 +230,7 @@ ai-meeting/
 ├── app.py                # Flask app: routes, locks, host guard, cache policy
 ├── core/
 │   ├── engine.py         # Meeting state machine (phases, verdicts, prompts, tasks)
-│   ├── executor.py       # CLI runner: process groups, streaming, timeouts, write access
+│   ├── executor.py       # Execution backend: process groups, streaming, timeouts, write access
 │   ├── streaming.py      # In-memory buffer for in-flight output
 │   ├── storage.py        # Atomic session/settings persistence
 │   ├── i18n.py           # Backend system-message language selection
