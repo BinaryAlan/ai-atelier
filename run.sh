@@ -6,7 +6,7 @@
 #   ./run.sh start      前台启动（正常使用，默认不开热重载）
 #   ./run.sh dev        开发模式启动（FLASK_DEBUG=1，改 .py 自动重载）
 #   ./run.sh stop       优雅停止（先走 API，失败再按端口 / PID 兜底）
-#   ./run.sh restart    重启（会终止在跑的 AI 任务并把会议转为暂停）
+#   ./run.sh restart    重启（进行中的任务标记为已取消，可在卡片里重试）
 #   ./run.sh status     查看服务状态
 # -------------------------------------------------------------
 
@@ -88,7 +88,7 @@ d = json.load(sys.stdin)
 print("   PID        : %s" % d.get("pid"))
 print("   已运行     : %s 秒" % d.get("uptime_seconds"))
 print("   热重载     : %s" % ("已开启" if d.get("hot_reload") else "未开启"))
-print("   在跑会议   : %s" % len(d.get("active_sessions") or []))
+print("   进行中任务 : %s" % len(d.get("active_tasks") or []))
 print("   会话总数   : %s" % d.get("session_count"))' 2>/dev/null
         echo "   命令行管理 : ./run.sh restart | ./run.sh stop"
         return 0
@@ -176,7 +176,7 @@ do_start() {
     echo "$$" > "$PID_FILE"
 
     echo "=========================================================="
-    echo "🏛️  正在启动 AI-Meeting (AI 圆桌会议室)..."
+    echo "🚀 正在启动 AI-Meeting（多 AI 协同任务工作台）..."
     echo "🌐 访问地址: ${BASE}"
     echo "🛠️  命令行管理: ./run.sh status | ./run.sh restart | ./run.sh stop"
     echo "按 Ctrl+C 停止服务"
@@ -195,7 +195,7 @@ do_restart() {
     old_pid="$(api_json | json_field pid)"
     old_start="$(api_json | json_field started_at)"
 
-    echo "🔄 正在重启服务（在跑的 AI 任务会被终止，会议转为暂停）..."
+    echo "🔄 正在重启服务（进行中的任务会标记为已取消）..."
     curl -fsS -X POST -H "$ACTION_HEADER" "$BASE/api/system/restart" >/dev/null 2>&1
 
     i=0
@@ -208,7 +208,7 @@ do_restart() {
                 mkdir -p "$(dirname "$PID_FILE")"
                 echo "$new_pid" > "$PID_FILE" 2>/dev/null
                 echo "✅ 服务已重启：${BASE}（新 PID: ${new_pid}）"
-                echo "   被打断的会议已转为暂停，在网页上点「恢复讨论」即可继续。"
+                echo "   被打断的任务已标记为已取消，可在任务卡片里重试。"
                 return 0
             fi
         fi

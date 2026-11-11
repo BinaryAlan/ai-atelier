@@ -44,23 +44,8 @@ def session_lock(session_id: str) -> threading.RLock:
 
 
 DEFAULT_SETTINGS = {
-    # 界面语言：zh | en（系统设置 → 通用 里可切换）
+    # 界面语言：zh | en
     "ui_language": "zh",
-    # 新会议默认模式：roundtable 圆桌讨论 | task 自主协作（@ 某人一直干活）
-    "default_mode": "roundtable",
-    # 自主协作：单个任务最多几轮（含求助后继续），避免模型自己绕圈烧 token
-    "collab": {"max_rounds": 4, "allow_agent_mentions": True},
-    "moderator": {
-        "id": "moderator",
-        "name": "Antigravity",
-        "avatar": "👑",
-        "avatar_color": "#d97706",
-        "type": "cli",
-        "cli_cmd": 'agy -p "{prompt}"',
-        "system_prompt": "你是会议主持人。负责中立客观地主持会议进程、梳理记录各方发言要点、综合整理方案纪要，并在全员达成共识时出具定稿报告。",
-        # 0 = 不设超时：需要打断时由群主点「⏭ 跳过当前发言」主动结束
-        "timeout": 0
-    },
     "employees": [
         {
             "id": "emp_agy",
@@ -122,29 +107,21 @@ def load_settings() -> Dict[str, Any]:
             # 配置文件损坏时回退默认值，但不覆盖用户文件（保留现场便于排查）
             return copy.deepcopy(DEFAULT_SETTINGS)
 
-        changed = False
-        if not isinstance(data.get("moderator"), dict):
-            data["moderator"] = copy.deepcopy(DEFAULT_SETTINGS["moderator"])
+        # 只认界面语言与成员列表两个字段，文件里多出来的内容一律忽略
+        clean = {
+            "ui_language": data.get("ui_language"),
+            "employees": data.get("employees"),
+        }
+        changed = set(data.keys()) != {"ui_language", "employees"}
+        if clean["ui_language"] not in ("zh", "en"):
+            clean["ui_language"] = DEFAULT_SETTINGS["ui_language"]
             changed = True
-        if not isinstance(data.get("employees"), list):
-            data["employees"] = copy.deepcopy(DEFAULT_SETTINGS["employees"])
+        if not isinstance(clean["employees"], list):
+            clean["employees"] = copy.deepcopy(DEFAULT_SETTINGS["employees"])
             changed = True
-        # 新增的顶层偏好项：老配置里没有就补默认值（不回填的话前端拿不到语言/协作设置）
-        for key in ("ui_language", "default_mode"):
-            if not isinstance(data.get(key), str) or not data.get(key):
-                data[key] = DEFAULT_SETTINGS[key]
-                changed = True
-        if not isinstance(data.get("collab"), dict):
-            data["collab"] = copy.deepcopy(DEFAULT_SETTINGS["collab"])
-            changed = True
-        else:
-            for key, val in DEFAULT_SETTINGS["collab"].items():
-                if key not in data["collab"]:
-                    data["collab"][key] = copy.deepcopy(val)
-                    changed = True
         if changed:
-            save_settings(data)
-        return data
+            save_settings(clean)
+        return clean
 
 
 def save_settings(settings: Dict[str, Any]):
@@ -170,12 +147,10 @@ def list_sessions() -> List[Dict[str, Any]]:
             continue
         sessions.append({
             "id": data.get("id") or fname[:-5],
-            "title": data.get("title") or "未命名会议",
+            "title": data.get("title") or "未命名会话",
             "is_favorite": bool(data.get("is_favorite", False)),
             "created_at": data.get("created_at") or 0,
             "updated_at": data.get("updated_at") or 0,
-            "status": data.get("status", "idle"),
-            "phase": data.get("phase", 1),
             "employee_ids": data.get("employee_ids", []),
             "workspace_dir": data.get("workspace_dir", "")
         })
@@ -206,10 +181,9 @@ def get_session(session_id: str) -> Optional[Dict[str, Any]]:
 
 
 def create_session(
-    title: str = "新方案研讨会议",
+    title: str = "新会话",
     employee_ids: Optional[List[str]] = None,
     workspace_dir: Optional[str] = None,
-    mode: str = "roundtable"
 ) -> Dict[str, Any]:
     settings = load_settings()
     now = int(time.time())
@@ -233,25 +207,12 @@ def create_session(
 
     session_data = {
         "id": session_id,
-        "title": title or "新方案研讨会议",
+        "title": title or "新会话",
         "is_favorite": False,
         "created_at": now,
         "updated_at": now,
-        "status": "idle",  # idle | running | paused
-        "phase": 1,        # 1: 自由立论; 2: 方案审阅
-        # roundtable: 圆桌讨论（原流程）；task: 自主协作（@ 某人独立干活，中途可 @ 他人协助）
-        "mode": mode if mode in ("roundtable", "task") else "roundtable",
-        "collab": None,    # 自主协作的进行中状态（见 core.engine.MeetingEngine._collab_step）
         "employee_ids": employee_ids,
         "workspace_dir": os.path.abspath(workspace_dir),
-        "current_speaker": None,
-        "document": "# 会议方案草案\n\n*(等待各参会成员发表初步立论中...)*\n",
-        "doc_revision": 0,   # 正文版本号，同时用作「同一轮审阅」的界线
-        "blocker_under_review": None,
-        "blocker_retry_count": 0,
-        "review_comment_retries": {},
-        "passed_employees": [],
-        "skipped_employees": [],   # 被群主跳过的成员（CLI 报错后不再占用发言位）
         "messages": [],
         # AI 团队任务系统（见 docs/task-review-protocol.md）
         "tasks": {},               # task_id -> 任务
@@ -267,8 +228,8 @@ def save_session(session_data: Dict[str, Any], merge: bool = False):
     保存会话。
 
     merge=False：直接原子覆盖（API 层在 session_lock 保护下使用）。
-    merge=True ：以磁盘最新状态为基线合并（后台线程在长时间 CLI 调用后回写时使用），
-                 避免旧副本覆盖期间发生的暂停、成员变更、系统广播等写入。
+    merge=True ：以磁盘最新状态为基线合并（后台任务线程在长时间 CLI 调用后回写时使用），
+                 避免旧副本覆盖期间新增的消息。
                  会话文件已被删除时抛 SessionDeletedError，调用方须停止推进。
     """
     session_id = session_data.get("id")
@@ -292,19 +253,11 @@ def save_session(session_data: Dict[str, Any], merge: bool = False):
                     merged_msgs.append(msg)
                     known_ids.add(msg.get("id"))
 
-            stale_status = session_data.get("status")
-            latest_status = base.get("status")
-
             for key, value in session_data.items():
                 if key == "messages":
                     continue
                 base[key] = value
             base["messages"] = merged_msgs
-
-            # 2) 用户暂停优先级最高：后台线程不得把它写回 running
-            if latest_status == "paused" and stale_status == "running":
-                base["status"] = "paused"
-                base["current_speaker"] = None
 
             session_data = base
 

@@ -61,7 +61,7 @@ def execution_key(session_id: str, tid: str, stage: str, member_id: str) -> str:
 
 
 def ensure_task_fields(session: Dict[str, Any]) -> None:
-    """老会话没有任务字段时补齐，避免读旧会议报错。"""
+    """会话缺少任务字段时补齐，保证读写不报错。"""
     if not isinstance(session.get("tasks"), dict):
         session["tasks"] = {}
     if not isinstance(session.get("task_queues"), dict):
@@ -906,7 +906,7 @@ class TaskManager:
         elif status in ("error", "failed"):
             mapped = STATUS_FAILED
         else:
-            # 执行记录代表「这一次执行完成」，不是整个任务已交付；任务终态由各阶段写回
+            # 执行记录代表「这一次执行完成」，不是整个任务已交付；任务终态由各环节写回
             mapped = STATUS_DONE
 
         with self.store.session_lock(sid):

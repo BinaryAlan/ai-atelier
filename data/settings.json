@@ -1,53 +1,41 @@
 {
+  "ui_language": "zh",
   "employees": [
     {
-      "avatar": "🦉",
-      "avatar_color": "#2563eb",
-      "cli_cmd": "agy -p \"{prompt}\"",
-      "enabled": true,
       "id": "emp_agy",
       "name": "agy",
+      "avatar": "🦉",
+      "avatar_color": "#2563eb",
+      "type": "cli",
+      "cli_cmd": "agy -p \"{prompt}\"",
       "system_prompt": "",
+      "enabled": true,
       "timeout": 0,
-      "type": "cli"
+      "write_access": true
     },
     {
-      "avatar": "🧠",
-      "avatar_color": "#9333ea",
-      "cli_cmd": "codebuddy --model deepseek-v4-pro --tools \"Read,Glob,Grep\" -p \"{prompt}\"",
-      "enabled": true,
       "id": "codebuddy-ds4",
       "name": "DeepSeek-V4 (DS4)",
+      "avatar": "🧠",
+      "avatar_color": "#9333ea",
+      "type": "cli",
+      "cli_cmd": "codebuddy --model deepseek-v4-pro --tools \"Read,Glob,Grep\" -p \"{prompt}\"",
       "system_prompt": "擅长深度逻辑推演、推演潜在隐患与方案边界风险，以客观严谨的态度提出建设性意见。",
+      "enabled": true,
       "timeout": 0,
-      "type": "cli"
+      "write_access": true
     },
     {
-      "avatar": "⚡",
-      "avatar_color": "#059669",
-      "cli_cmd": "codebuddy --model hy4std --tools \"Read,Glob,Grep\" -p \"{prompt}\"",
-      "enabled": true,
       "id": "codebuddy-hy4",
       "name": "混元-4 (HY4)",
+      "avatar": "⚡",
+      "avatar_color": "#059669",
+      "type": "cli",
+      "cli_cmd": "codebuddy --model hy4std --tools \"Read,Glob,Grep\" -p \"{prompt}\"",
       "system_prompt": "注重实际落地执行可行性、周期效率与实操适配度，提供稳健务实的路径建议。",
+      "enabled": true,
       "timeout": 0,
-      "type": "cli"
+      "write_access": true
     }
-  ],
-  "moderator": {
-    "avatar": "👑",
-    "avatar_color": "#d97706",
-    "cli_cmd": "agy -p \"{prompt}\"",
-    "id": "moderator",
-    "name": "主持人",
-    "system_prompt": "你是会议主持人。负责中立客观地主持会议进程、梳理记录各方发言要点、综合整理方案纪要，并在全员达成共识时出具定稿报告。",
-    "timeout": 0,
-    "type": "cli"
-  },
-  "ui_language": "zh",
-  "default_mode": "roundtable",
-  "collab": {
-    "max_rounds": 4,
-    "allow_agent_mentions": true
-  }
+  ]
 }

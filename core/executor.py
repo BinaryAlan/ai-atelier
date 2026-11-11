@@ -1,4 +1,3 @@
-import codecs
 import os
 import re
 import signal
@@ -20,7 +19,7 @@ MAX_TIMEOUT = 86400    # 有上限时最多 24 小时，防止配置写错变成
 # 超时语义：0 或空 = 不限制（详见 _coerce_timeout）
 
 # 模型把「工具调用」或思考链当正文吐出来时的产物（CodeBuddy 在 --tools "" 下尤其明显，
-# 或 DeepSeek 等推理模型外溢的 think 块）。这些不是发言内容，必须剥掉，避免干扰结论解析。
+# 或 DeepSeek 等推理模型外溢的 think 块）。这些不是任务输出，必须剥掉，避免干扰结果解析。
 _TOOL_TAGS = (
     "tool_calls", "system_calls", "function_calls", "tool_use",
     "tool_reminder", "system_reminder", "system_prompt",
@@ -149,7 +148,7 @@ def _coerce_timeout(value: Any, fallback: Optional[int] = None) -> Optional[int]
 
     - 缺省/空值 → 用 fallback（调用方传的默认值，也是 None 表示不限制）
     - 0 或负数 → None，即不设超时：模型想跑多久就跑多久，
-      由群主在界面上点「⏭ 跳过」主动打断（这是可选行为，不再被 180 秒硬切）。
+      需要中断时由用户在对应消息或任务卡片上点「取消」。
     """
     if value is None or (isinstance(value, str) and not value.strip()):
         return fallback
@@ -174,7 +173,7 @@ class Executor:
 
         for p in procs:
             if p and p.poll() is None:
-                # 打上显式中断标记，供 _run_cli 区分「用户暂停」与「程序自身非零退出」
+                # 打上显式中断标记，供 _run_cli 区分「用户取消」与「程序自身非零退出」
                 try:
                     p.wb_interrupted = True  # type: ignore[attr-defined]
                 except Exception:
@@ -224,10 +223,9 @@ class Executor:
         session_id: str = "default",
         workspace_dir: Optional[str] = None,
         timeout: Optional[int] = None,
-        on_chunk: Optional[Any] = None
     ) -> ExecutionResult:
         """
-        调用参会员工/模型，返回结构化 ExecutionResult。
+        调用一位 AI 成员，返回结构化 ExecutionResult。
         """
         start_time = time.time()
         emp_type = employee.get("type", "cli")
@@ -238,7 +236,7 @@ class Executor:
             if not cmd_template:
                 return ExecutionResult(
                     status="error",
-                    output="【该角色未配置 CLI 命令模板，无法发言】",
+                    output="【该成员未配置 CLI 命令模板，无法执行任务】",
                     raw_output="",
                     elapsed=0.0,
                     error_msg="missing cli_cmd"
@@ -249,7 +247,6 @@ class Executor:
                 session_id=session_id,
                 workspace_dir=workspace_dir,
                 timeout=emp_timeout,
-                on_chunk=on_chunk,
                 write_access=bool(employee.get("write_access"))
             )
         elif emp_type == "api":
@@ -277,67 +274,6 @@ class Executor:
 
         return result
 
-    @staticmethod
-    def _stream_process(p, timeout, on_chunk) -> Tuple[str, str]:
-        """
-        边读边回调：CLI 每写出一段就交给调用方，界面可以边生成边显示。
-
-        用两个线程分别抽干 stdout / stderr，避免任一管道写满把子进程卡死；
-        回调限流到约 3 次/秒，防止界面被过细的增量刷爆。
-        用 buffer.read1 而不是 read(n)：read(n) 会等凑满 n 个字符才返回，
-        流式就变成了「攒够才吐一次」。
-        """
-        out_parts: List[str] = []
-        err_parts: List[str] = []
-        last_emit = [0.0]
-        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
-        err_decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
-
-        def _pump(stream, parts, emit, dec):
-            try:
-                raw = getattr(stream, "buffer", stream)
-                while True:
-                    chunk = raw.read1(4096)
-                    if not chunk:
-                        break
-                    parts.append(dec.decode(chunk))
-                    if not emit:
-                        continue
-                    now = time.time()
-                    if now - last_emit[0] >= 0.33:
-                        last_emit[0] = now
-                        try:
-                            on_chunk("".join(out_parts))
-                        except Exception:
-                            pass
-            except Exception:
-                pass
-
-        t_out = threading.Thread(target=_pump, args=(p.stdout, out_parts, True, decoder), daemon=True)
-        t_err = threading.Thread(target=_pump, args=(p.stderr, err_parts, False, err_decoder), daemon=True)
-        t_out.start()
-        t_err.start()
-        try:
-            p.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            try:
-                if os.name == "posix":
-                    os.killpg(os.getpgid(p.pid), signal.SIGKILL)
-                else:
-                    p.kill()
-            except Exception:
-                pass
-            raise
-        finally:
-            t_out.join(timeout=1.5)
-            t_err.join(timeout=1.5)
-        # 收尾再补一次完整文本：限流会把最后一小段吞掉，界面会停在「少一句」的状态
-        final_out = "".join(out_parts)
-        try:
-            on_chunk(final_out)
-        except Exception:
-            pass
-        return final_out, "".join(err_parts)
 
     @staticmethod
     def _run_cli(
@@ -346,7 +282,6 @@ class Executor:
         session_id: str = "default",
         workspace_dir: Optional[str] = None,
         timeout: Optional[int] = None,
-        on_chunk: Optional[Any] = None,
         write_access: bool = False
     ) -> ExecutionResult:
         """
@@ -414,20 +349,17 @@ class Executor:
             with _PROCESS_LOCK:
                 ACTIVE_PROCESSES.setdefault(session_id, []).append(p)
 
-            if on_chunk is None:
-                stdout, stderr = p.communicate(timeout=timeout)
-            else:
-                stdout, stderr = Executor._stream_process(p, timeout, on_chunk)
+            stdout, stderr = p.communicate(timeout=timeout)
 
-            # 只有被 kill_session_process 显式标记过的才算「用户暂停」
+            # 只有被 kill_session_process 显式标记过的才算「用户取消」
             # （否则 CLI 自己 exit(9)/exit(15) 会被误判为用户中断）
             if getattr(p, "wb_interrupted", False):
                 return ExecutionResult(
                     status="interrupted",
-                    output="【任务已被用户手动暂停中断】",
+                    output="【任务已被用户取消】",
                     raw_output=(stderr or "").strip() or (stdout or "").strip(),
                     elapsed=0.0,
-                    error_msg="Process interrupted by user pause"
+                    error_msg="Process interrupted by user cancellation"
                 )
 
             if p.returncode != 0:

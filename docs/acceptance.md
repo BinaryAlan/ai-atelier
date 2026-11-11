@@ -1,6 +1,7 @@
-# AI-Meeting 任务系统改造 · 验收标准与核对表
+# AI-Meeting 任务系统 · 验收标准与核对表
 
-对应规格：`docs/task-review-protocol.md`。本次只改代码与测试，规格文档未改动。
+对应规格：`docs/task-review-protocol.md`。验收范围是软件的最终形态：任务系统行为，以及旧圆桌代码、
+旧接口、旧数据、旧设置字段和旧界面文案是否清除干净。规格文档本身不改动。
 
 ## 验证方式
 
@@ -9,17 +10,21 @@
 .venv/bin/python -m unittest discover -s tests -v
 
 # 2. 语法检查
-.venv/bin/python -m py_compile app.py core/tasks.py core/storage.py
+.venv/bin/python -m py_compile app.py core/*.py
 node --check static/js/app.js && node --check static/js/i18n.js
 
-# 3. 界面验证（无头 Chrome + CDP，虚构会话数据注入，不碰真实会话文件）
+# 3. 路由与接口冒烟（Flask test_client，数据目录指向临时目录）
+#    检查：路由清单无旧接口、设置只落两个字段、新会话无旧字段、状态接口是 active_tasks
+
+# 4. 界面验证（无头 Chrome + CDP，虚构会话数据注入，不碰真实会话文件）
 PORT=5097 FLASK_DEBUG=0 .venv/bin/python app.py
-node /tmp/verify_ui.mjs
+node /tmp/verify_ui.mjs        # 任务系统行为与布局
+node /tmp/verify_cleanup.mjs   # 旧文案 / 旧字段 / 设置三部分 / 确认弹窗文案
 ```
 
 界面验证使用 `static/` 的真实页面与真实 Vue 实例，通过 CDP 向组件注入一份虚构会话
 （含任务卡片、执行中/失败的单任务结果消息、`in_chat:false` 的执行记录），检查 DOM 与交互。
-截图：`/tmp/aim-verify-card.png`。
+截图：`/tmp/aim-verify-card.png`、`/tmp/aim-verify-cleanup.png`。
 
 ---
 
@@ -53,22 +58,24 @@ node /tmp/verify_ui.mjs
 | A24 | 4.4 | 刷新页面不改变正在执行的任务；服务重启后进行中任务标记已取消，可从被中断环节重试 | `test_recover_marks_running_as_cancelled` + 服务启动时 `recover_on_startup()`；刷新不改变会话状态（前端只轮询） | 通过 |
 | A25 | 8 | 工作目录按会话配置；写权限由成员设置决定；取消后文件保留、卡片如实列出 | `test_review_is_read_only`、产物清单解析 `scan_artifacts`、CDP 产物清单渲染 | 通过 |
 | A26 | 9 | 运行规程 4 份文本随软件提供，服务端拼进成员输入；结构化输出解析不到按纯文本展示 | `test_prompt_includes_protocol_files`、`test_plain_text_output_fallback`；文件：`prompts/protocol/task-flow.md`、`prompts/roles/{single,owner,reviewer}.md` | 通过 |
-| A27 | 10 | 设置只有成员管理 / 界面语言 / 服务三部分，没有模式选择 | CDP：`settingsTabs = [general, members, service]`；模板删除会议行为页与新建/编辑会话的模式选择 | 通过（成员页仍保留旧「主持人」配置卡片，任务流程不读取它，属旧数据兼容） |
+| A27 | 10 | 设置只有成员管理 / 界面语言 / 服务三部分，没有模式选择 | CDP：`settingsTabs = [general, members, service]`、三项中文标签正确、`hasMeetingTab=false`；`settings` 只有 `ui_language` / `employees` 两个键 | 通过 |
 | A28 | 2 / 6.1 | 长内容默认折叠；每条消息可查看完整输入与原始输出 | 原折叠/查看器逻辑保留；CDP 弹窗查看输入按钮 | 通过 |
 | A29 | 11 | Flask + Vue3、会话 JSON 落盘、CLI 子进程执行、输入拼装与结构化输出解析模块齐备 | 语法编译 + Flask test_client 接口测试 + CDP 页面挂载 | 通过（端到端用注入的 FakeRunner，未调用真实 CLI 子进程，避免真实 token 消耗） |
-| A30 | 全局 | 双语：新增界面文案有英文词条 | CDP：`stateLabel('running')='Running'`、`stageLabel='Members reviewing in parallel'`；i18n 词典「AI 团队任务系统」段共 46 条，`t()` 中文词条无遗漏（正则误匹配的 CSS 选择器除外） | 通过 |
+| A30 | 全局 | 双语：新增界面文案有英文词条 | CDP：`stateLabel('running')='Running'`、`stateLabel('delivered')='Delivered'`；词典共 204 条，任务系统段 54 条；脚本核对 `t()` 的中文词条无遗漏、无重复键 | 通过 |
+| A31 | 全局 | 旧代码与旧接口删除：`core/engine.py`、`core/streaming.py`、`core/i18n.py` 以及 `/stream`、`/pause`、`/resume`、`/interrupt`、`/skip`、`/task/stop`、旧消息 `/retry` 全部不存在 | `git status` 显示 3 个模块已删除；`app.url_map` 路由清单 21 条，逐条确认无旧路径；全仓 grep 无 `core.engine` / `core.streaming` / `core.i18n` 引用 | 通过 |
+| A32 | 全局 | 旧数据清除：`settings.json` 只有 `ui_language` 与 `employees`（3 个可用成员）；旧会话文件清空；新会话不再有 `status` / `phase` / `mode` / `document` / `current_speaker` 等旧字段 | 文件内容核对；接口冒烟：带 `moderator` / `collab` / `default_mode` 的旧配置读取后只回两个键，POST 写入也只落两个键；带 `mode` / `phase` 创建会话，返回字段里无旧字段；`data/sessions/` 只剩 `.gitkeep` | 通过 |
+| A33 | 10 | 主持人配置删除：界面无主持人卡片、设置无 `moderator`、`load_settings` 不再按旧字段做兼容 | CDP 设置面板文案无「主持人」；`settingsKeys` 无 `moderator`；`core/storage.py` 改为只按白名单字段构造设置 | 通过 |
+| A34 | 全局 | 用户可见文案与规格一致：界面、词典、启动提示、重启/停止确认、run.sh、README 都改为「会话 / 成员 / 任务 / 已取消可重试」 | CDP 首屏 + 新建会话弹窗 + 设置面板 + 服务页：旧词命中数 0；词典 204 条旧词命中 0；重启/停止确认含「已取消」「任务卡片」且不含「恢复讨论」；全仓中文旧词 grep 无业务残留 | 通过 |
+| A35 | 全局 | 中英 README 与 `run.sh` 同步任务系统；旧圆桌演示 GIF 移除 | README 两份按规格 11 章结构重写，目录树与真实文件一致；`run.sh status` 读 `active_tasks`、启动/重启提示改为任务表述；`git rm docs/demo.gif docs/demo-en.gif`（已备份到 `/tmp/aim-legacy-backup-20261111-184514/`） | 通过 |
 
 ---
 
-## 明确不在本次改造范围 / 保留兼容项
+## 不在验收范围
 
-1. **旧圆桌流程代码与接口保留**：`core/engine.py`、`/pause`、`/resume`、`/interrupt`、`/skip`、旧消息 `/retry` 仍在，
-   但 `api_send_message` 已改走任务系统，界面不再暴露任何全局控制条。旧会话可只读浏览。
-2. **设置里的主持人配置卡片保留**：`settings.moderator` 是旧数据字段，任务系统不读取、不调用主持人。
-3. **流式预览通道保留但未被任务系统触发**：任务执行不写 `current_speaker`，因此流式气泡不会出现。
-4. **README 与演示 GIF 仍描述旧圆桌界面**：本次按用户要求只改代码与测试，未重写 README。
-5. **真实 CLI 端到端未跑**：全部流程用注入执行器验证；真实 `agy` / `codebuddy` 子进程只由既有
+1. **真实 CLI 端到端未跑**：全部流程用注入执行器验证；真实 `agy` / `codebuddy` 子进程只由现有
    `Executor.run_employee` 路径承载，取消信号由 `Executor.kill_session_process`（SIGTERM → 0.3s → SIGKILL）实现。
+2. **取消信号未对真实进程实测**：killer 注入验证调用链与状态流转，未在本轮消耗真实 CLI token。
+3. **演示 GIF 未重录**：旧 GIF 展示的是已删除的圆桌界面，先移除；当前界面无演示动图。
 
 ---
 
@@ -84,3 +91,20 @@ node /tmp/verify_ui.mjs
 - 复核后补两处：成员队列位置显示（A15）、卡片弹窗「历次执行记录」按记录查看完整输入/原始输出（A21）；
   同时把成功执行记录的状态由「已交付」修正为「已完成」，避免环节记录与任务终态混淆。
   新增 `test_queue_exposes_pending_order`、`test_history_records_preserved_after_retry`，并扩充 CDP 校验项后重跑，全部通过。
+
+## 旧圆桌清理复核记录（2026-11-11）
+
+- 备份先行：旧会话、`settings.json`、`scanned_models.json`、两份演示 GIF 都先复制到
+  `/tmp/aim-legacy-backup-20261111-184514/`，然后再删除/覆盖。
+- 删除：`core/engine.py`、`core/streaming.py`、`core/i18n.py`（`git rm`）；`data/sessions/` 下 3 个旧会话文件清空。
+- 回归：`Ran 33 tests in 7.429s — OK`；`py_compile app.py core/*.py`、`node --check` 两个 JS 全部通过。
+- 路由清单 21 条，无 `/stream` `/pause` `/resume` `/interrupt` `/skip` `/task/stop` 及旧消息 `/retry`。
+- 接口冒烟（临时数据目录）：`GET /api/settings` → `['employees','ui_language']`；带旧字段 POST 后落盘仍是两个键；
+  `POST /api/sessions` 返回 `active_task_id` / `tasks` / `task_queues` 等任务字段且无任何旧字段；
+  `/api/system/status` 有 `active_tasks`、无 `active_sessions`。
+- 界面（CDP `/tmp/verify_ui.mjs`）：卡片外壳 / 环节 / 耗时 / 状态点、消息上的取消与重试、`in_chat:false` 过滤、
+  右栏只工作目录、无全局控制条、无模式徽章、`/collab` 输入校验、弹窗两部分与历次记录、
+  已交付后的交付重试、输入框始终可用、设置三部分、英文词条，全部符合预期。
+- 界面（CDP `/tmp/verify_cleanup.mjs`）：页面标题为「AI-Meeting · 多 AI 协同任务工作台」；首屏、
+  新建会话弹窗、设置面板的旧词命中数均为 0；词典 204 条旧词命中 0；服务页显示「进行中任务 / 重启服务 / 停止服务」；
+  重启与停止确认文案含「已取消」「任务卡片」、不含「恢复讨论」。截图 `/tmp/aim-verify-cleanup.png`。

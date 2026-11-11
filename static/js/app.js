@@ -12,25 +12,14 @@ createApp({
         id: "",
         title: "",
         messages: [],
-        document: "",
         employee_ids: [],
         workspace_dir: "",
-        status: "idle",
-        phase: 1,
-        current_speaker: null
+        tasks: {},
+        task_queues: {},
+        active_task_id: null
       },
       settings: {
-        moderator: {
-          id: "moderator",
-          name: "会议主持人",
-          title: "会议主持人",
-          avatar: "👑",
-          avatar_color: "#d97706",
-          type: "cli",
-          cli_cmd: 'agy -p "{prompt}"',
-          system_prompt: "你是会议主持人。负责主持会议进程、客观梳理各方意见、汇总生成方案草案，并在全员达成共识时出具终稿文档。",
-          timeout: 0
-        },
+        ui_language: "zh",
         employees: []
       },
       inputContent: "",
@@ -40,7 +29,6 @@ createApp({
       expandedMsgs: {},
       // 哪些消息真的被限高截断了（渲染后实测，决定是否给「展开全文」按钮）
       overflowMsgs: {},
-      rightTab: "workspace", // 右侧面板只保留工作目录
       workspaceItems: [],
       selectedWorkspaceFile: null,
       selectedFileContent: "",
@@ -54,38 +42,34 @@ createApp({
       folderPickerDirs: [],
       folderPickerTargetForm: "newSessionForm", // 'newSessionForm' | 'editingSessionForm'
 
-      // 新建议题弹窗
+      // 新建会话弹窗
       showNewSessionModal: false,
       newSessionForm: {
         title: "",
         workspace_dir: "",
-        employee_ids: [],
-        mode: "roundtable"
+        employee_ids: []
       },
 
-      // 编辑当前会议弹窗 (改名、改目录、增减参会人员)
+      // 编辑当前会话弹窗（改名、改目录、增减成员）
       showEditSessionModal: false,
       editingSessionForm: {
         id: "",
         title: "",
         workspace_dir: "",
-        employee_ids: [],
-        mode: "roundtable"
+        employee_ids: []
       },
 
-      // 设置中心：分类页（通用 / 成员 / 会议 / 服务）
+      // 设置中心：成员管理 / 界面语言 / 服务
       showSettings: false,
       settingsTab: "general",
       settingsTabs: [
-        { key: "general", icon: "🎛️", label: "通用与语言" },
-        { key: "members", icon: "👥", label: "成员与主持人" },
+        { key: "general", icon: "🎛️", label: "界面语言" },
+        { key: "members", icon: "👥", label: "成员管理" },
         { key: "service", icon: "⏻", label: "服务进程" }
       ],
-      taskBusy: false,
 
-      // 员工与主持人配置弹窗
+      // 成员配置弹窗
       showEmpEditModal: false,
-      isEditingModerator: false,
       isEditingEmployee: false,
       editingEmpIdx: -1,
       selectedModelId: "",
@@ -120,9 +104,6 @@ createApp({
       flashMsgId: "",
       // 原话已不在列表里时的快照预览弹窗
       quotePreview: null,
-      // 流式输出：等待期间从 /stream 拉到的实时文本
-      liveStream: null,
-      streamTimer: null,
       // 自动跟随：只有用户主动往上翻时才停跟随，否则无论内容长多快都贴底。
       // 不用「距底部多少像素」当判据——一次到达几百字就足以把距离撑过阈值，
       // 于是跟随永久失效，用户以为「跳不到底」。
@@ -138,28 +119,24 @@ createApp({
       systemStatus: null,
       serviceBusy: false,
       serviceDown: false,
-      resumeBusy: false,  // 恢复请求在途：按钮保持「恢复中…」，避免连点变成暂停
-      interruptBusy: false, // 中断当前发言在途，避免连点重复杀进程
-      toastText: "",      // 顶部轻提示（恢复结果/自动暂缓等）
+      toastText: "",      // 顶部轻提示
 
-      // 布局：左栏可收起、左右两栏宽度可拖拽、纪要可全屏
+      // 布局：左栏可收起、左右两栏宽度可拖拽
       sidebarWidth: 256,
       rightWidth: 440,
       sidebarCollapsed: false,
-      docFullscreen: false,
       dragTarget: null,   // 'sidebar' | 'right'
       dragStartX: 0,
       dragStartW: 0
     };
   },
   computed: {
-    // Prompt 按【区块标题】切段：大段材料（聊天上下文、方案纪要/草案）默认折叠，
-    // 只留标题和体量提示，避免一屏全是历史正文、真正要看的要求被挤到很下面。
+    // 完整输入按【区块标题】切段：大段材料默认折叠，只留标题和体量提示
     promptSections() {
       const raw = String((this.inspectingMsg && this.inspectingMsg.sent_prompt) || "");
       if (!raw.trim()) return [];
 
-      const COLLAPSED_BY_DEFAULT = ["上下文", "纪要", "草案", "正文", "回复的这条消息"];
+      const COLLAPSED_BY_DEFAULT = ["上下文", "正文", "回复的这条消息"];
       const headerRe = /^[ \t]*【([^】\n]{1,60})】[ \t]*$/;
       const buckets = [];
       let cur = { title: "", body: [] };
@@ -189,23 +166,13 @@ createApp({
         .filter(s => s.title || s.body);
     },
 
-    // 实际参加本场会议的员工列表（未勾选/未选择的不在此列表中）
+    // 本会话已选成员列表（未勾选的不在此列表中）
     activeSessionEmployees() {
       if (!this.currentSession || !Array.isArray(this.currentSession.employee_ids)) return [];
       const empMap = new Map((this.settings.employees || []).filter(e => e.enabled).map(e => [e.id, e]));
       return this.currentSession.employee_ids
         .map(id => empMap.get(id))
         .filter(Boolean);
-    },
-    totalParticipantsCount() {
-      // 仅统计：主持人 (1) + 本场实际参会员工数 (未选中的不被计数)
-      return 1 + this.activeSessionEmployees.length;
-    },
-    // 被群主「跳过」的成员（CLI 报错后不再占发言位，可随时恢复）
-    skippedCount() {
-      return Array.isArray(this.currentSession?.skipped_employees)
-        ? this.currentSession.skipped_employees.length
-        : 0;
     },
     favoriteSessions() {
       return this.sessions.filter(s => s.is_favorite);
@@ -219,42 +186,8 @@ createApp({
     availableEmployees() {
       return (this.settings.employees || []).filter(e => e.enabled);
     },
-    renderedDoc() {
-      const doc = this.currentSession?.document || this.t("*(暂无方案文档)*");
-      // 任一依赖 CDN 不可用时，绝不把原始 Markdown/HTML 直接交给 v-html（会执行脚本）
-      if (!window.marked || !window.DOMPurify) {
-        return `<pre style="white-space:pre-wrap">${this.escapeHtml(doc)}</pre>`;
-      }
-      return DOMPurify.sanitize(marked.parse(doc));
-    },
-    // 定向 @ 应答进行中：此时的「中断」语义是取消这次提问，而不是把成员移出发言位
-    isDirectRunning() {
-      return !!this.currentSession?.target_direct_mention;
-    },
-    // 自主协作任务进行中：中断 = 结束这一轮任务，同样不该把人移出发言位
-    isTaskRunning() {
-      return !!(this.currentSession?.collab && this.currentSession.collab.active);
-    },
-    taskStatusText() {
-      const c = this.currentSession?.collab || {};
-      if (!c.active) return "";
-      const round = this.t("第 {round} / {max} 轮", {
-        round: c.round || 0,
-        max: c.max_rounds || 0
-      });
-      if (c.pending_helper) {
-        const helper = (this.settings.employees || []).find(e => e.id === c.pending_helper);
-        return `${round} · ${this.t("等待 {name} 协助", { name: helper?.name || c.pending_helper })}`;
-      }
-      if (this.currentSession?.current_speaker) return `${round} · ${this.currentSession.current_speaker}`;
-      return `${round} · ${this.t("准备继续")}`;
-    },
     inputPlaceholder() {
       return this.t("输入任务：@ 一位成员，或 /collab @主创 @协助成员 任务内容… (Enter 发送)");
-    },
-    // @所有人 在后端同时认「所有人」和「all」，英文界面插入 all 才不会看着别扭
-    allMentionToken() {
-      return this.lang === "en" ? "all" : "所有人";
     },
     // 协助任务各环节的执行记录不进聊天流（但能在卡片弹窗里查完整输入 / 原始输出）
     visibleMessages() {
@@ -314,25 +247,20 @@ createApp({
     this.pollInterval = setInterval(this.pollActiveSession, 1500);
     // 卡片外壳的「实时耗时」流水：每秒只更新一个时间戳，不重拉接口
     this.tickTimer = setInterval(() => { this.nowTick = Date.now(); }, 1000);
-    // 流式预览：单独一条更快的轮询，只在有人正在发言时真正请求
-    this.streamTimer = setInterval(this.pollStreamPreview, 700);
-    // 全局点击关闭参会人下拉框
+    // 全局点击关闭成员下拉框
     document.addEventListener("click", this.handleGlobalClick);
-    // 拖拽调宽 / Esc 退出全屏
+    // 拖拽调宽
     window.addEventListener("mousemove", this.onDragMove);
     window.addEventListener("mouseup", this.onDragEnd);
     window.addEventListener("resize", this.onWindowResize);
-    window.addEventListener("keydown", this.onWindowKeydown);
   },
   beforeUnmount() {
     if (this.pollInterval) clearInterval(this.pollInterval);
     if (this.tickTimer) clearInterval(this.tickTimer);
-    if (this.streamTimer) clearInterval(this.streamTimer);
     document.removeEventListener("click", this.handleGlobalClick);
     window.removeEventListener("mousemove", this.onDragMove);
     window.removeEventListener("mouseup", this.onDragEnd);
     window.removeEventListener("resize", this.onWindowResize);
-    window.removeEventListener("keydown", this.onWindowKeydown);
   },
   methods: {
     // ----------------- 任务卡片与消息上的取消 / 重试 -----------------
@@ -459,20 +387,13 @@ createApp({
     displaySender(name) {
       const s = String(name || "");
       if (this.lang !== "en") return s;
-      const labels = {
-        "系统广播": "System",
-        "系统复位": "Service Recovery",
-        "系统异常捕获": "Error Handler",
-        "群主 (你)": "Owner (you)"
-      };
-      if (labels[s]) return labels[s];
-      if (s.endsWith(" (主持人)")) return s.slice(0, -6) + " (Moderator)";
-      return s;
+      const labels = { "我": "Me", "任务卡片": "Task card", "任务记录": "Task record" };
+      return labels[s] || s;
     },
     applyLanguage() {
       const en = this.lang === "en";
       document.documentElement.setAttribute("lang", en ? "en" : "zh-CN");
-      document.title = en ? "AI-Meeting · AI Roundtable" : "AI-Meeting · AI 圆桌会议室";
+      document.title = en ? "AI-Meeting · Multi-AI Task Workspace" : "AI-Meeting · 多 AI 协同任务工作台";
       try { localStorage.setItem("aim.lang", this.lang); } catch (e) { /* 隐私模式忽略 */ }
     },
     async setLanguage(lang) {
@@ -511,29 +432,6 @@ createApp({
     },
 
     // 结束当前的自主任务（负责人不再自动往下跑，已产出的内容都保留）
-    async stopTask() {
-      if (!this.currentSessionId || this.taskBusy) return;
-      this.taskBusy = true;
-      try {
-        const res = await fetch(`/api/sessions/${this.currentSessionId}/task/stop`, {
-          method: "POST",
-          headers: { "X-Meeting-Action": "1" }
-        });
-        const data = await res.json().catch(() => ({}));
-        if (!res.ok) {
-          alert(data.error || `HTTP ${res.status}`);
-          return;
-        }
-        if (data.session) this.currentSession = data.session;
-        this.showToast(this.t("任务已结束，产出的内容都保留在上方。"));
-      } catch (e) {
-        alert(this.t("结束任务失败:") + " " + e);
-      } finally {
-        this.taskBusy = false;
-      }
-    },
-
-    // 窗口尺寸变化：既要把面板宽度钳回可用范围，也要重算哪些消息该折叠
     onWindowResize() {
       this.clampPanels();
       this.measureMsgOverflow();
@@ -574,7 +472,6 @@ createApp({
       this.rightWidth = Math.round(Math.min(Math.max(this.rightWidth, 300), maxRight));
     },
     startResize(target, e) {
-      if (target === "right" && this.docFullscreen) return;
       this.dragTarget = target;
       this.dragStartX = e.clientX;
       this.dragStartW = target === "sidebar" ? this.sidebarWidth : this.rightWidth;
@@ -622,16 +519,6 @@ createApp({
       this.clampPanels();
       this.persistLayout();
     },
-    toggleDocFullscreen() {
-      this.docFullscreen = !this.docFullscreen;
-      if (this.docFullscreen) this.rightTab = "doc";
-    },
-    onWindowKeydown(e) {
-      if (e.key === "Escape" && this.docFullscreen) {
-        this.docFullscreen = false;
-      }
-    },
-
     async init() {
       // 先用本地缓存把语言铺上（避免首屏中文闪一下），服务端设置是最终依据
       this.applyLanguage();
@@ -649,7 +536,7 @@ createApp({
 
       if (this.sessions.length > 0) {
         // 刷新页面（尤其是「正在回答」时刷新）要回到刚才那场会，而不是列表第一场：
-        // 会话数据在服务端，刷新不影响会议进程，只有选错会话才会让人误以为「丢了」。
+        // 会话数据在服务端，刷新不影响任务进程，只有选错会话才会让人误以为「丢了」。
         const remembered = this.readLastSessionId();
         const target = this.sessions.find(s => s.id === remembered) || this.sessions[0];
         await this.switchSession(target.id);
@@ -684,16 +571,14 @@ createApp({
       try {
         const res = await fetch("/api/settings");
         const data = await res.json();
-        // 老配置没有 collab 时补上默认值，模板里直接绑 settings.collab.max_rounds 不会报错
-        data.collab = data.collab && typeof data.collab === "object"
-          ? { max_rounds: 4, allow_agent_mentions: true, ...data.collab }
-          : { max_rounds: 4, allow_agent_mentions: true };
-        data.default_mode = data.default_mode === "task" ? "task" : "roundtable";
-        // 老配置里没有 write_access 字段：补成 false，复选框才有确定的初始状态
-        data.employees = (Array.isArray(data.employees) ? data.employees : []).map(e => ({
+        // 设置只有界面语言与成员列表
+        const employees = (Array.isArray(data.employees) ? data.employees : []).map(e => ({
           ...e, write_access: !!e.write_access
         }));
-        this.settings = data;
+        this.settings = {
+          ui_language: data.ui_language === "en" ? "en" : "zh",
+          employees
+        };
       } catch (e) {
         console.error("加载配置失败:", e);
       }
@@ -731,10 +616,9 @@ createApp({
       this.selectedWorkspaceFile = null;
       this.selectedFileContent = "";
       this.showMemberDropdown = false;
-      // 引用与展开状态都属于具体会话的某条消息，切会话就清掉，避免引用到别的会议的发言
+      // 引用与展开状态都属于具体会话的某条消息，切会话就清掉
       this.replyTarget = null;
       this.expandedMsgs = {};
-      this.liveStream = null;   // 实时文本属于上一场会议，切走要清
       try {
         const res = await fetch(`/api/sessions/${id}`);
         if (token !== this.switchToken) return;
@@ -749,20 +633,19 @@ createApp({
       }
     },
 
-    // ----------------- 新建议题 Modal -----------------
+    // ----------------- 新建会话 -----------------
     openNewSessionModal() {
       const defaultDir = this.currentSession?.workspace_dir || this.defaultWorkspaceDir;
       this.newSessionForm = {
         title: "",
         workspace_dir: defaultDir,
-        employee_ids: this.availableEmployees.map(e => e.id),
-        mode: this.settings?.default_mode === "task" ? "task" : "roundtable"
+        employee_ids: this.availableEmployees.map(e => e.id)
       };
       this.showNewSessionModal = true;
     },
 
     async confirmCreateSession() {
-      const title = this.newSessionForm.title.trim() || this.t("新方案研讨");
+      const title = this.newSessionForm.title.trim() || this.t("新会话");
       try {
         const res = await fetch("/api/sessions", {
           method: "POST",
@@ -770,8 +653,7 @@ createApp({
           body: JSON.stringify({
             title: title,
             workspace_dir: this.newSessionForm.workspace_dir.trim(),
-            employee_ids: this.newSessionForm.employee_ids,
-            mode: this.newSessionForm.mode
+            employee_ids: this.newSessionForm.employee_ids
           })
         });
         const newSession = await res.json();
@@ -779,19 +661,18 @@ createApp({
         await this.loadSessions();
         await this.switchSession(newSession.id);
       } catch (e) {
-        alert(this.t("创建会议失败:") + " " + e);
+        alert(this.t("创建会话失败:") + " " + e);
       }
     },
 
-    // ----------------- 编辑会议信息 Modal (标题/目录/参会人/模式) -----------------
+    // ----------------- 编辑会话信息 Modal（标题/目录/成员） -----------------
     openEditSessionModal(session) {
       if (!session) return;
       this.editingSessionForm = {
         id: session.id,
         title: session.title,
         workspace_dir: session.workspace_dir || this.defaultWorkspaceDir,
-        employee_ids: [...(session.employee_ids || [])],
-        mode: session.mode === "task" ? "task" : "roundtable"
+        employee_ids: [...(session.employee_ids || [])]
       };
       this.showEditSessionModal = true;
     },
@@ -806,8 +687,7 @@ createApp({
           body: JSON.stringify({
             title: this.editingSessionForm.title.trim(),
             workspace_dir: this.editingSessionForm.workspace_dir.trim(),
-            employee_ids: this.editingSessionForm.employee_ids,
-            mode: this.editingSessionForm.mode
+            employee_ids: this.editingSessionForm.employee_ids
           })
         });
         if (res.ok) {
@@ -819,12 +699,12 @@ createApp({
             this.loadWorkspaceFiles();
           }
         } else {
-          // 会议进行中切模式会被拒：原因要回显，否则用户只会看到弹窗关不掉
+          // 失败原因要回显，否则用户只会看到弹窗关不掉
           const data = await res.json().catch(() => ({}));
           alert(data.error || `HTTP ${res.status}`);
         }
       } catch (e) {
-        alert(this.t("保存会议配置失败:") + " " + e);
+        alert(this.t("保存会话配置失败:") + " " + e);
       }
     },
 
@@ -880,7 +760,7 @@ createApp({
     },
 
     async deleteSessionItem(id) {
-      if (!confirm(this.t("确定要删除此会议记录吗？"))) return;
+      if (!confirm(this.t("确定要删除此会话记录吗？"))) return;
       try {
         await fetch(`/api/sessions/${id}`, { method: "DELETE" });
         await this.loadSessions();
@@ -911,7 +791,7 @@ createApp({
           await this.loadSessions();
         }
       } catch (e) {
-        console.error("更新参会成员失败:", e);
+        console.error("更新会话成员失败:", e);
       }
     },
 
@@ -942,7 +822,7 @@ createApp({
         // 当光标未做选中且光标位置大于 0 时，检查光标前面是否紧挨着 @... 标签
         if (start === end && start > 0) {
           const textBefore = textarea.value.substring(0, start);
-          // 匹配光标前最近的一个 @标签 (例如 "@所有人 " 或 "@DeepSeek-V4 (DS4) ")
+          // 匹配光标前最近的一个 @成员标签（例如 "@DeepSeek-V4 (DS4) "）
           const match = textBefore.match(/@([^\s@]+)\s?$/);
           if (match) {
             e.preventDefault();
@@ -1047,11 +927,8 @@ createApp({
     canReplyMsg(msg) {
       if (!msg || !msg.id) return false;
       if (msg.sender === "user" || msg.sender === "system") return false;
-      // 报错/超时/跳过的占位没有可引用的内容
-      if (["TIMEOUT", "ERROR", "SKIPPED"].includes(msg.verdict)) return false;
       if (!String(msg.content || "").trim()) return false;
-      if (this.isModerator(msg.sender)) return true;
-      // 已移出本场会议的成员不再提供回复入口（后端也会拒绝）
+      // 已移出本场会话的成员不再提供回复入口（后端也会拒绝）
       return this.activeSessionEmployees.some(e => e.id === msg.sender);
     },
     startReply(msg) {
@@ -1066,7 +943,7 @@ createApp({
       });
     },
 
-    // Markdown 渲染（AI 发言 / 定时纪要共用）：CDN 不可用时退回安全纯文本。
+    // Markdown 渲染（成员消息与任务结果）：本地依赖不可用时退回安全纯文本。
     // 加一层结果缓存：模板里每次 re-render 都会重新调用，不缓存就等于每 1.5 秒
     // 把整屏历史消息全部重新解析一遍（长会话下滚动会明显卡）。
     renderMdText(text) {
@@ -1122,63 +999,6 @@ createApp({
       return t.length > 120 ? t.slice(0, 120) + "…" : t;
     },
 
-    async pauseMeeting() {
-      if (!this.currentSessionId) return;
-      try {
-        const res = await fetch(`/api/sessions/${this.currentSessionId}/pause`, { method: "POST" });
-        if (res.ok) {
-          this.currentSession.status = "paused";
-          this.currentSession.current_speaker = null;
-          const sRes = await fetch(`/api/sessions/${this.currentSessionId}`);
-          this.currentSession = await sRes.json();
-          this.$nextTick(() => this.scrollToBottom(false));
-        }
-      } catch (e) {
-        console.error("暂停失败:", e);
-      }
-    },
-
-    async resumeMeeting() {
-      if (!this.currentSessionId || this.resumeBusy) return;
-      const targetId = this.currentSessionId;
-      this.resumeBusy = true;
-      try {
-        const res = await fetch(`/api/sessions/${targetId}/resume`, { method: "POST" });
-        const data = await res.json().catch(() => ({}));
-        if (!res.ok) {
-          // 常见：全员已被跳过、或只剩一个已被判定卡住的成员。
-          // 过去这里不检查 ok，界面照样切成「进行中」，用户只能反复点、看不到任何原因。
-          alert(data.error || this.t("恢复失败（HTTP {status}），请稍后再试。", { status: res.status }));
-          return;
-        }
-
-        // 用服务端真实状态覆盖本地，而不是先乐观改成 running：
-        // 否则按钮会立刻变成「暂停会议」，用户再点一下就把刚恢复的会议又暂停了。
-        if (targetId === this.currentSessionId) {
-          try {
-            const sRes = await fetch(`/api/sessions/${targetId}`, { cache: "no-store" });
-            if (sRes.ok) {
-              const latest = await sRes.json();
-              if (latest.id === this.currentSessionId) this.currentSession = latest;
-            }
-          } catch (e) {
-            /* 状态拉取失败不影响恢复本身 */
-          }
-        }
-        if (data.message) this.showToast(data.message);
-        this.pinToBottom();
-      } catch (e) {
-        // 服务刚重启时请求会直接失败：一定要说出来，不能只写 console
-        alert(
-          this.t("恢复请求没有送达服务端：") + "\n" + e +
-          "\n\n" + this.t("如果服务刚刚重启，请等 1~2 秒后再点一次。")
-        );
-      } finally {
-        this.resumeBusy = false;
-      }
-    },
-
-    // 轻量提示条：不打断操作，也不需要用户点掉
     showToast(text) {
       if (!text) return;
       this.toastText = text;
@@ -1186,134 +1006,7 @@ createApp({
       this._toastTimer = setTimeout(() => { this.toastText = ""; }, 4000);
     },
 
-    // ---------------- 单个成员的异常恢复（重试 / 跳过 / 恢复） ----------------
-    isSkipped(empId) {
-      return Array.isArray(this.currentSession?.skipped_employees)
-        && this.currentSession.skipped_employees.includes(empId);
-    },
-
-    // 被 @ 的定向应答不属于任何轮次，失败了只能同一个人重问（换人没意义）。
-    // 阶段一的立论异常也支持原地重跑；阶段二的审阅异常靠「恢复讨论」重问同一人。
-    canRetryMsg(msg) {
-      if (!msg) return false;
-      if (msg.verdict !== "ERROR" && msg.verdict !== "TIMEOUT") return false;
-      if (!msg.sent_prompt) return false;
-      if (this.isModerator(msg.sender) || msg.sender === "user" || msg.sender === "system") return false;
-      if (msg.direct_mention) return true;
-      if (msg.phase !== 1) return false;
-      // 会议已经走到阶段二了，再回头补一条立论没有意义
-      if ((this.currentSession?.phase || 1) !== 1) return false;
-      return true;
-    },
-
-    canSkipMsg(msg) {
-      if (!msg) return false;
-      if (msg.verdict !== "ERROR" && msg.verdict !== "TIMEOUT") return false;
-      // 群主点名要的答案，跳过这个人等于让这次提问没有下文 —— 只给「重试」
-      if (msg.direct_mention) return false;
-      return !this.isModerator(msg.sender) && msg.sender !== "user" && msg.sender !== "system";
-    },
-
-    async interruptCurrentSpeaker() {
-      if (!this.currentSessionId || this.interruptBusy) return;
-      // 定向应答时它是「取消这次提问」，不动这个人的发言位，提示语要跟着变；
-      // 自主协作时它是「结束任务」，同样不该把人移出发言位
-      const wasDirect = !!this.currentSession?.target_direct_mention;
-      const wasTask = this.isTaskRunning;
-      this.interruptBusy = true;
-      try {
-        const res = await fetch(`/api/sessions/${this.currentSessionId}/interrupt`, {
-          method: "POST",
-          headers: { "X-Meeting-Action": "1" }
-        });
-        const data = await res.json().catch(() => ({}));
-        if (!res.ok) {
-          alert(data.error || this.t("中断失败: HTTP {status}", { status: res.status }));
-          return;
-        }
-        // 立刻拉一次最新状态，避免等下一轮轮询才有反馈
-        const latest = await fetch(`/api/sessions/${this.currentSessionId}`).then(r => r.ok ? r.json() : null);
-        if (wasTask) {
-          this.toastText = this.t("任务已结束，已产出的内容都保留在上方。");
-          setTimeout(() => { this.toastText = ""; }, 6000);
-          this.currentSession = latest && latest.id === this.currentSessionId ? latest : this.currentSession;
-        } else if (wasDirect) {
-          this.toastText = this.t("已取消 [{name}] 的执行，它仍在会上，可以随时再 @ 它。", { name: data.interrupted || this.t("这一次") });
-          setTimeout(() => { this.toastText = ""; }, 6000);
-          this.currentSession = latest && latest.id === this.currentSessionId ? latest : this.currentSession;
-        } else {
-          this.toastText = this.t("已中断 [{name}]，会议交由余下成员继续。", { name: data.interrupted || this.t("当前发言") });
-          setTimeout(() => { this.toastText = ""; }, 6000);
-          this.currentSession = latest && latest.id === this.currentSessionId ? latest : this.currentSession;
-        }
-      } catch (e) {
-        alert(this.t("中断请求失败:") + " " + e);
-      } finally {
-        this.interruptBusy = false;
-      }
-    },
-
-    async retryMessage(msg) {
-      if (!this.currentSessionId || !msg) return;
-      try {
-        const res = await fetch(`/api/sessions/${this.currentSessionId}/messages/${msg.id}/retry`, {
-          method: "POST",
-          headers: { "X-Meeting-Action": "1" }
-        });
-        const data = await res.json().catch(() => ({}));
-        if (!res.ok) {
-          alert(data.error || this.t("重试失败: HTTP {status}", { status: res.status }));
-          return;
-        }
-        if (data.session) this.currentSession = data.session;
-      } catch (e) {
-        alert(this.t("重试请求失败:") + " " + e);
-      }
-    },
-
-    async skipMember(msg) {
-      if (!this.currentSessionId || !msg) return;
-      const name = msg.sender_name || this.t("该成员");
-      if (!confirm(
-        this.t("跳过 [{name}] 并继续推进？", { name }) + "\n\n" +
-        this.t("它不再占用本次会议的发言位，余下成员照常推进；") + "\n" +
-        this.t("配置与历史发言都保留，可在「参会成员」面板点「恢复」拉回来。")
-      )) return;
-      try {
-        const res = await fetch(`/api/sessions/${this.currentSessionId}/messages/${msg.id}/skip`, {
-          method: "POST",
-          headers: { "X-Meeting-Action": "1" }
-        });
-        const data = await res.json().catch(() => ({}));
-        if (!res.ok) {
-          alert(data.error || this.t("跳过失败: HTTP {status}", { status: res.status }));
-          return;
-        }
-        if (data.session) this.currentSession = data.session;
-      } catch (e) {
-        alert(this.t("跳过请求失败:") + " " + e);
-      }
-    },
-
-    async restoreMember(empId) {
-      if (!this.currentSessionId || !empId) return;
-      try {
-        const res = await fetch(`/api/sessions/${this.currentSessionId}/members/${empId}/restore`, {
-          method: "POST",
-          headers: { "X-Meeting-Action": "1" }
-        });
-        const data = await res.json().catch(() => ({}));
-        if (!res.ok) {
-          alert(data.error || this.t("恢复失败: HTTP {status}", { status: res.status }));
-          return;
-        }
-        if (data.session) this.currentSession = data.session;
-      } catch (e) {
-        alert(this.t("恢复请求失败:") + " " + e);
-      }
-    },
-
-    // ---------------- 服务进程控制 ----------------
+    // ---------------- 服务状态显示 ----------------
     formatUptime(sec) {
       const s = Math.max(0, Math.floor(sec || 0));
       const d = Math.floor(s / 86400);
@@ -1348,7 +1041,7 @@ createApp({
       if (this.serviceBusy) return;
       if (!confirm(
         this.t("确定重启服务？") + "\n\n" +
-        this.t("正在执行的 AI 任务会被立即终止，会议自动转为暂停；重启后点「恢复讨论」即可继续。")
+        this.t("进行中的任务会被立即终止并标记为已取消，重启后可在任务卡片里重试。")
       )) return;
 
       if (!this.systemStatus) await this.fetchSystemStatus();
@@ -1379,7 +1072,7 @@ createApp({
       if (this.serviceBusy) return;
       if (!confirm(
         this.t("确定停止服务？") + "\n\n" +
-        this.t("所有在跑的 AI 任务会立即终止，会议转为暂停。停止后需重新运行 ./run.sh 才能再次使用。")
+        this.t("所有在跑的任务会立即终止并标记为已取消。停止后需重新运行 ./run.sh 才能再次使用。")
       )) return;
 
       this.serviceBusy = true;
@@ -1433,97 +1126,49 @@ createApp({
       if (ok) location.reload();
     },
 
-    // 流式预览：有人正在发言时拉一次「正在生成的文本」。
-    // 暂存区在服务端内存里，拉不到（204）就保持「等待中」的显示，不报错。
-    async pollStreamPreview() {
-      if (!this.currentSessionId) return;
-      if (!this.currentSession?.current_speaker) {
-        if (this.liveStream) this.liveStream = null;
-        return;
-      }
-      try {
-        const res = await fetch(`/api/sessions/${this.currentSessionId}/stream`, { cache: "no-store" });
-        if (!res.ok || res.status === 204) return;
-        const data = await res.json();
-        if (!data || !data.text) return;
-        if (this.liveStream) {
-          // 只覆盖变化的字段：整体换对象会让 Vue 重建气泡，长文本下每 700ms 抖一次
-          this.liveStream.text = data.text;
-          this.liveStream.chars = data.chars;
-          if (data.speaker) this.liveStream.speaker = data.speaker;
-        } else {
-          this.liveStream = { ...data };
-        }
-        // 用户在底部就一直跟随；正在往上翻读历史时不抢位置
-        if (this.stickToBottom) this.$nextTick(() => this.scrollToBottom());
-      } catch (e) {
-        // 瞬时失败忽略，下一轮再取
-      }
-    },
-
-    // 只比较会被界面用到的字段：内容没变就不整体替换 session 对象。
-    // 否则等待期间每 1.5s 重渲染整屏消息（每条都要重新 markdown 解析）＝ 肉眼可见的抖动。
+        // 会话签名：内容没变就不整体替换 currentSession，避免每次轮询全量重渲染
     sessionSignature(s) {
       if (!s) return "";
       const msgs = s.messages || [];
       const last = msgs[msgs.length - 1] || {};
-      const collab = s.collab || {};
       const taskSig = Object.values(s.tasks || {})
         .map(t => `${t.task_id}:${t.status}:${t.step}:${(t.flow || []).length}`).join(",");
       const resultSig = msgs.filter(m => m.kind === "task_result")
         .map(m => `${m.id}:${m.status}`).join(",");
       const cardSig = msgs.filter(m => m.kind === "task_card")
         .map(m => `${m.id}:${(m.card && m.card.status) || ""}:${((m.card && m.card.flow) || []).length}`).join(",");
-      return [
-        s.status, s.current_speaker, s.target_direct_mention, s.phase,
-        s.doc_revision, (s.document || "").length,
-        // 任务横幅要跟着轮次/待协助者走，否则界面会停在「第 1 轮」不动
-        collab.active ? 1 : 0, collab.round || 0, collab.pending_helper || "",
-        // 任务状态、流水、结果消息状态变了都要重渲染，否则卡片停在旧状态
-        taskSig, resultSig, cardSig,
-        msgs.length, last.id, (last.content || "").length
-      ].join("|");
+      const queueSig = Object.entries(s.task_queues || {})
+        .map(([k, v]) => `${k}:${(v || []).length}`).join(",");
+      return [taskSig, resultSig, cardSig, queueSig,
+        msgs.length, last.id, (last.content || "").length].join("|");
     },
 
     async pollActiveSession() {
       const targetId = this.currentSessionId;
       if (!targetId) return;
-      // 单独重试期间 status 可能仍是 paused，只有 current_speaker 能反映「正在跑」
-      const busy = this.currentSession
-        && (this.currentSession.status === "running" || this.currentSession.current_speaker
-            || this.hasActiveTasks);
-      if (busy) {
-        try {
-          const res = await fetch(`/api/sessions/${targetId}`);
-          if (res.ok) {
-            const latest = await res.json();
-            // 防止在途请求返回时用户已切换会话导致数据覆盖
-            if (latest.id !== this.currentSessionId) return;
-            if (this.sessionSignature(latest) === this.sessionSignature(this.currentSession)) return;
-            const prevCount = (this.currentSession.messages || []).length;
-            const nextCount = (latest.messages || []).length;
-            const speakerAppeared = !this.currentSession.current_speaker && !!latest.current_speaker;
-            this.currentSession = latest;
-            if (this.showCardModal && this.cardModalMsg) {
-              const updatedCard = (latest.messages || []).find(m => m.id === this.cardModalMsg.id);
-              if (updatedCard) this.cardModalMsg = updatedCard;
-            }
-            if (nextCount > prevCount) {
-              // 正式消息已落地，实时气泡让位，避免同一段内容显示两遍
-              this.liveStream = null;
-            }
-            if (speakerAppeared && this.stickToBottom) {
-              // 点名刚开始回答：贴底，否则「等待条 / 实时气泡」出现在视口外，看起来像没反应。
-              // 用户正在往上翻历史时不抢位置（角落有「回到最新」提示）
-              this.pinToBottom();
-            } else if (nextCount > prevCount) {
-              this.$nextTick(() => this.scrollToBottom(false));
-            }
-            if (nextCount !== prevCount) this.measureMsgOverflow();
-          }
-        } catch (e) {
-          // 静默容错
+      // 有活动任务时才轮询，空闲会话不发无谓请求
+      if (!this.hasActiveTasks && !this.showCardModal) return;
+      try {
+        const res = await fetch(`/api/sessions/${targetId}`);
+        if (!res.ok) return;
+        const latest = await res.json();
+        // 防止在途请求返回时用户已切换会话导致数据覆盖
+        if (latest.id !== this.currentSessionId) return;
+        if (this.sessionSignature(latest) === this.sessionSignature(this.currentSession)) return;
+        const prevCount = (this.currentSession.messages || []).length;
+        const nextCount = (latest.messages || []).length;
+        this.currentSession = latest;
+        if (this.showCardModal && this.cardModalMsg) {
+          const updatedCard = (latest.messages || []).find(m => m.id === this.cardModalMsg.id);
+          if (updatedCard) this.cardModalMsg = updatedCard;
         }
+        if (nextCount > prevCount) {
+          // 用户正在往上翻历史时不抢位置（角落有「回到最新」提示）
+          this.$nextTick(() => this.scrollToBottom(false));
+          this.measureMsgOverflow();
+        }
+      } catch (e) {
+        // 静默容错
       }
     },
 
@@ -1535,20 +1180,14 @@ createApp({
       });
     },
 
-    isModerator(senderId) {
-      return senderId === "moderator" || senderId === "antigravity" || senderId === this.settings.moderator?.id;
-    },
-
     getEmployeeColor(senderId) {
       if (senderId === "system") return "#f59e0b";
-      if (this.isModerator(senderId)) return this.settings.moderator?.avatar_color || "#d97706";
       const emp = (this.settings.employees || []).find(e => e.id === senderId);
       return emp?.avatar_color || "#3b82f6";
     },
 
     getEmployeeAvatar(senderId) {
       if (senderId === "system") return "📢";
-      if (this.isModerator(senderId)) return this.settings.moderator?.avatar || "👑";
       const emp = (this.settings.employees || []).find(e => e.id === senderId);
       return emp?.avatar || "🤖";
     },
@@ -1641,7 +1280,7 @@ createApp({
       }
     },
 
-    // ----------------- 员工与主持人配置设置 -----------------
+    // ----------------- 成员配置 -----------------
     async triggerScanModels(force = true) {
       try {
         const res = await fetch(`/api/scan_models?refresh=${force ? 1 : 0}`);
@@ -1656,18 +1295,7 @@ createApp({
       return m.key || `${m.cli}:${m.model_id}`;
     },
 
-    openEditModeratorModal() {
-      this.isEditingModerator = true;
-      this.isEditingEmployee = false;
-      this.editingEmpIdx = -1;
-      this.editingEmp = JSON.parse(JSON.stringify(this.settings.moderator || {}));
-      const match = this.scannedModels.find(m => m.cli_cmd === this.editingEmp.cli_cmd);
-      this.selectedModelId = match ? this.modelKey(match) : "";
-      this.showEmpEditModal = true;
-    },
-
     openAddEmployeeModal() {
-      this.isEditingModerator = false;
       this.isEditingEmployee = false;
       this.editingEmpIdx = -1;
       this.selectedModelId = "";
@@ -1690,7 +1318,6 @@ createApp({
     },
 
     openEditEmployeeModal(emp, idx) {
-      this.isEditingModerator = false;
       this.isEditingEmployee = true;
       this.editingEmpIdx = idx;
       this.editingEmp = JSON.parse(JSON.stringify(emp));
@@ -1715,7 +1342,7 @@ createApp({
 
     async saveEmployeeItem() {
       if (!this.editingEmp.name.trim()) {
-        alert(this.t("请输入角色姓名！"));
+        alert(this.t("请输入成员姓名！"));
         return;
       }
       if (!this.editingEmp.cli_cmd.trim()) {
@@ -1725,14 +1352,11 @@ createApp({
 
       // 先在副本上修改，保存成功后再落到 this.settings，避免失败时本地已被改脏
       const next = {
-        ...this.settings,
-        moderator: JSON.parse(JSON.stringify(this.settings.moderator || {})),
+        ui_language: this.settings.ui_language,
         employees: JSON.parse(JSON.stringify(this.settings.employees || []))
       };
 
-      if (this.isEditingModerator) {
-        next.moderator = JSON.parse(JSON.stringify(this.editingEmp));
-      } else if (this.isEditingEmployee && this.editingEmpIdx >= 0) {
+      if (this.isEditingEmployee && this.editingEmpIdx >= 0) {
         next.employees[this.editingEmpIdx] = JSON.parse(JSON.stringify(this.editingEmp));
       } else {
         next.employees.push(JSON.parse(JSON.stringify(this.editingEmp)));
@@ -1746,7 +1370,7 @@ createApp({
 
     async deleteEmployee(idx) {
       const targetEmp = this.settings.employees[idx];
-      if (confirm(this.t("确定要删除角色 [{name}] 吗？", { name: targetEmp.name }))) {
+      if (confirm(this.t("确定要删除成员 [{name}] 吗？", { name: targetEmp.name }))) {
         this.settings.employees.splice(idx, 1);
         const saved = await this.saveSettingsToServer(null, false);
         if (saved && this.currentSession?.employee_ids) {
@@ -1758,7 +1382,7 @@ createApp({
 
     async saveSettingsToServer(nextSettings, closeMainModal = true) {
       try {
-        // 顶层偏好（语言/默认模式/协作规则）随整份配置一起提交，后端会做白名单校验
+        // 界面语言与成员列表随整份配置一起提交，后端会做白名单校验
         const payload = nextSettings || this.settings;
         if (payload && !payload.ui_language) payload.ui_language = this.lang;
         const res = await fetch("/api/settings", {
