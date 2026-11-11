@@ -97,6 +97,7 @@ class FakeRunner:
         self.killed = set()
         self.fail_for = []
         self.empty_for = []
+        self.timeout_for = []
         # 每位成员同时在跑的调用数（不变量：任意成员永远不超过 1）
         self.per_member = {}
         self.max_per_member = {}
@@ -132,6 +133,8 @@ class FakeRunner:
                 gate.wait(timeout=3)
             if session_id in self.killed:
                 return SimpleNamespace(status="interrupted", output="", raw_output="", elapsed=0)
+            if any(flag in session_id for flag in self.timeout_for):
+                return SimpleNamespace(status="timeout", output="", raw_output="超时无输出", elapsed=600)
             if any(flag in session_id for flag in self.fail_for):
                 return SimpleNamespace(status="error", output="调用失败", raw_output="调用失败", elapsed=0)
             if any(flag in session_id for flag in self.empty_for):
@@ -934,7 +937,57 @@ class TestBusinessInvariants(TaskCase):
         self.manager.wait_idle()
 
 
-class TestHttpApi(unittest.TestCase):
+    def test_timeout_is_terminal_and_blocks_cancel(self):
+        # 超时是任务终态（设计文档 6.3）：不能被「取消」打回已取消，但可以重试
+        self.runner.timeout_for = [":exec:"]
+        result = self._submit("@agy 做一件事")
+        task = self._wait(result["task_id"])
+        self.assertEqual(task["status"], T.STATUS_TIMEOUT)
+        self.assertIn(task["status"], T.FINAL_TASK_STATES)
+        self.assertEqual(task["part_a"]["status"], T.STATUS_TIMEOUT)
+        rejected = self.manager.cancel("s1", result["task_id"], T.STAGE_EXEC)
+        self.assertEqual(rejected.get("code"), "task_finished")
+        self.assertEqual(self._task(result["task_id"])["status"], T.STATUS_TIMEOUT)
+        self.runner.timeout_for = []
+        self.assertTrue(self.manager.retry("s1", result["task_id"], T.STAGE_EXEC)["ok"])
+        self.assertEqual(self._wait(result["task_id"])["status"], T.STATUS_DELIVERED)
+        self.manager.wait_idle()
+
+    def test_rerun_exec_failure_does_not_keep_previous_round(self):
+        # 首轮主创成功、交付失败 → 任务 failed；再重跑执行且这轮执行也失败
+        self.runner.fail_for = [":deliver:"]
+        result = self._submit("/collab @agy @DS4 写方案")
+        task = self._wait(result["task_id"])
+        self.assertEqual(task["status"], T.STATUS_FAILED)
+        self.assertTrue(task["part_a"]["brief"])
+        self.assertTrue(task["part_a"]["artifacts"])
+        self.assertTrue(any(i["summary"] for i in task["part_b"]))  # 上一轮 DS4 意见
+        with self.runner.lock:
+            before = len(self.runner.calls)
+        self.runner.fail_for = [":exec:"]
+        self.assertTrue(self.manager.retry("s1", result["task_id"], T.STAGE_EXEC)["ok"])
+        deadline = time.time() + 6
+        while time.time() < deadline:
+            with self.runner.lock:
+                ran = len(self.runner.calls) > before
+            task = self._task(result["task_id"])
+            if ran and task["part_a"]["status"] == T.STATUS_FAILED:
+                break
+            time.sleep(0.02)
+        task = self._task(result["task_id"])
+        self.assertEqual(task["status"], T.STATUS_FAILED)
+        self.assertEqual(task["part_a"]["status"], T.STATUS_FAILED)
+        # 这一轮什么都没产出，就不该继续展示上一轮的简报、产物与审核意见
+        for field in ("brief", "sent_prompt", "raw_output"):
+            self.assertEqual(task["part_a"][field], "", field)
+        self.assertEqual(task["part_a"]["artifacts"], [])
+        self.assertEqual(task["artifacts"], [])
+        self.assertTrue(all(i["status"] == T.MEMBER_WAITING for i in task["part_b"]))
+        self.assertTrue(all(not i["summary"] for i in task["part_b"]))
+        self.manager.wait_idle()
+
+
+
     @classmethod
     def setUpClass(cls):
         import app as flask_app

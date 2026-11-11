@@ -6,7 +6,7 @@
 ## 验证方式
 
 ```bash
-# 1. 自动化测试（49 项，不调用真实 CLI、不写真实 data/）
+# 1. 自动化测试（51 项，不调用真实 CLI、不写真实 data/）
 .venv/bin/python -m unittest discover -s tests -v
 
 # 2. 语法检查
@@ -53,7 +53,7 @@ node /tmp/verify_cleanup.mjs   # 旧文案 / 旧字段 / 设置三部分 / 确�
 | A19 | 4.3 / 5.2 | 重试沿用原输入与同一工作目录，不新增任务、不增加流程轮次 | 重试类测试断言 `tasks` 长度不变、执行次数符合预期（单任务重试为 `exec, exec`，不额外跑交付） | 通过 |
 | A20 | 6.2 | 任务创建时卡片即出现，默认折叠；外壳显示摘要、整体状态、环节进度、实时耗时流水、成员状态点，并在审核过程中实时更新 | `test_collab_task_creates_card`（创建即 queued）+ CDP（外壳、环节、耗时、状态点）+ 轮询签名含 `part_a.status` / `part_b[].status`，环节状态变化即刷新 | 通过 |
 | A21 | 6.2 / 7 | 点击卡片弹窗分两部分，按记录可查完整输入与原始输出；取消/重试产生的历次记录保留可查 | CDP 弹窗两部分 /「历次执行记录」列表 / 点记录打开审查弹窗显示完整 prompt 与 raw；`test_three_stages_and_card`（4 条 `in_chat:false` 记录）、`test_history_records_preserved_after_retry`（重跑交付后 4 条记录，含 2 条交付记录） | 通过 |
-| A22 | 6.3 | 任务状态与成员状态集合齐全，成员含「超时」「无意见」 | `test_empty_review_marked_no_opinion` + 状态映射 `stateLabel`（含英文） | 通过 |
+| A22 | 6.3 | 任务状态与成员状态集合齐全：任务含「超时」（终态、可重试），成员含「超时」「无意见」 | `test_empty_review_marked_no_opinion` + 状态映射 `stateLabel`（含英文） | 通过 |
 | A23 | 7 | 会话保存 `tasks` / `task_queues` / `active_task_id`；消息带 `kind` / `task_id` / `in_chat` / `sent_prompt` / `raw_response` | `test_single_task_structure`、`test_old_sessions_get_task_fields`（老会话自动补字段） | 通过 |
 | A24 | 4.4 | 刷新页面不改变正在执行的任务；服务重启后进行中任务标记已取消，三个环节的「进行中」一并转已取消，可从被中断的环节重试；已结束的任务不被恢复逻辑改动 | `test_recover_marks_running_as_cancelled`、`test_recover_cancels_inflight_stages`、`test_single_task_closes_part_a_and_recover_ignores_finished` | 通过 |
 | A25 | 8 | 工作目录按会话配置；写权限由成员设置决定；取消后文件保留、卡片如实列出 | `test_review_is_read_only`、产物清单解析 `scan_artifacts`、CDP 产物清单渲染 | 通过 |
@@ -170,7 +170,17 @@ node /tmp/verify_cleanup.mjs   # 旧文案 / 旧字段 / 设置三部分 / 确�
    同一环节下一轮执行会被无条件判成「已取消」——真的调了模型却丢弃结果。→ 标记只对一次执行有效（执行结束即清理），
    并在起进程前再查一次，排队期间被取消的单元不再白烧 token。
 
-回归：`Ran 49 tests in 2.9s — OK`（新增 8 项：交叉协作不死锁、取消拒绝终态、失败任务取消不篡改、
-交付需先执行成功、单任务 part_a 闭环、重试带补充约束、取消标记单次有效、等待超时改判失败）。
+回归：`Ran 51 tests in 3.0s — OK`（新增 10 项：交叉协作不死锁、取消拒绝终态、失败任务取消不篡改、
+交付需先执行成功、单任务 part_a 闭环、重试带补充约束、取消标记单次有效、等待超时改判失败、超时属终态、重跑失败不残留上一轮内容）。
 `py_compile app.py core/*.py tests/*.py`、`node --check static/js/app.js` 通过；
 CDP 界面验证 `verify_ui.mjs` / `verify_cleanup.mjs` 全项通过（词典 204 条、旧词 0 命中）。
+
+7. **遗留项收尾（第三轮）**：
+   - 「超时」原先只存在于成员状态，单任务超时会写出第 6 种任务状态却不在 `FINAL_TASK_STATES` 里，
+     文档 6.3 也只列 5 种。→ 任务状态补为 6 种（含超时），超时计入终态：取消会被拒绝（`task_finished`），
+     重试照常可用（`test_timeout_is_terminal_and_blocks_cancel`）。
+   - 重跑执行失败后，`part_a` 仍留着上一轮的简报、产物、`sent_prompt`/`raw_output`，卡片在失败态下把旧内容
+     当本轮结果展示。→ 每个执行单元启动时先清空本轮要产出的字段；主创重跑时同时把 `part_b` 复位为等待并清掉旧意见
+     （`test_rerun_exec_failure_does_not_keep_previous_round`）。
+   - `part_a.final.changed_files` 装的是全部产物路径，与字段名和 6.2 的「终版改动说明」都不符，且无人读取。
+     → 从代码与设计文档 7 的数据结构里一并移除，产物清单以 `part_a.artifacts` 为准。

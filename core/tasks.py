@@ -48,7 +48,10 @@ MEMBER_IN_PROGRESS = "in_progress"
 # 早期实现是「超时就照跑」，那会让同一成员同时跑两个 CLI 进程、并发写同一工作目录。
 MEMBER_BUSY_SUMMARY = "等待该成员空闲超时，本次未执行；可稍后重试"
 
-FINAL_TASK_STATES = (STATUS_DELIVERED, STATUS_CANCELLED, STATUS_FAILED)
+# 任务终态：交付、取消、失败、超时。超时同样是「这一轮已经结束」，
+# 不列入终态会让它既不能被当作结束（重启恢复、队列清理的判断依据），
+# 又会和成员状态的「超时」说法不一致（设计文档 6.3）。
+FINAL_TASK_STATES = (STATUS_DELIVERED, STATUS_CANCELLED, STATUS_FAILED, STATUS_TIMEOUT)
 RETRYABLE_STATES = (STATUS_FAILED, STATUS_CANCELLED, STATUS_TIMEOUT, STATUS_NO_OPINION)
 
 
@@ -981,8 +984,10 @@ class TaskManager:
                 part_a["artifacts"] = task["artifacts"]
                 part_a["final"] = {
                     "summary": result.get("summary", ""),
+                    # 终版改动说明 = 成员自述如何处理审核意见。
+                    # 产物清单看 part_a["artifacts"]，这里不再重复一份路径列表
+                    # （早期叫 changed_files，实际装的是全部产物路径，名不符实且无人读取）
                     "opinion_handling": result.get("changes", ""),
-                    "changed_files": [a.get("path") for a in task["artifacts"]],
                 }
                 part_a["final_status"] = STATUS_DONE
                 part_a["final_sent_prompt"] = result.get("prompt", "")
@@ -1104,10 +1109,31 @@ class TaskManager:
                 for item in task.get("part_b") or []:
                     if item.get("member_id") == member_id:
                         item["status"] = MEMBER_IN_PROGRESS
+                        # 上一轮的意见与输入输出先清掉：这一轮还没出结果，
+                        # 留着旧内容会让人把上一轮的意见当成本轮的
+                        item.update({
+                            "summary": "", "raw_output": "", "sent_prompt": "",
+                            "msg_id": "", "elapsed": 0,
+                        })
             elif stage == STAGE_EXEC:
-                task["part_a"]["status"] = MEMBER_IN_PROGRESS
+                # 重跑执行时先清空上一轮的简报与产物：本轮失败也不该拿旧简报当结果展示
+                task["part_a"].update({
+                    "status": MEMBER_IN_PROGRESS, "brief": "", "artifacts": [],
+                    "sent_prompt": "", "raw_output": "", "msg_id": "",
+                })
+                task["artifacts"] = []
+                # 主创重跑意味着上一轮的审核意见全部作废：不清掉的话，卡片上会挂着
+                # 上一轮的「已完成」和旧意见，看起来像这一轮审核已经通过了
+                for item in task.get("part_b") or []:
+                    item.update({
+                        "status": MEMBER_WAITING, "summary": "", "raw_output": "",
+                        "sent_prompt": "", "msg_id": "", "elapsed": 0,
+                    })
             elif stage == STAGE_DELIVER:
                 task["part_a"]["final_status"] = MEMBER_IN_PROGRESS
+                task["part_a"].update({
+                    "final": {}, "final_sent_prompt": "", "final_raw_output": "",
+                })
             task.setdefault("attempts", {})[attempt_key] = task["attempts"].get(attempt_key, 0) + 1
             self._update_card(session, task)
             self._save(session)
