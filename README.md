@@ -89,7 +89,8 @@ When a local model CLI times out or errors, the meeting pauses gracefully withou
 ### 👑 Human-in-the-Loop Authority
 - **Instant Pause / Resume**: Click `⏸️ Pause` at any moment to immediately send `SIGTERM` to the underlying process group, preventing orphan processes and wasted tokens;
 - **In-Flight Directives**: Messages sent by the human user are injected into subsequent prompts as the highest-priority "User Directive";
-- **Direct Mention (@) Controls**: `@all` resets the council back to Phase 1 under your updated direction; `@member` triggers an isolated direct inquiry without derailing the main session state machine;
+- **Direct Mention (@) Controls**: `@all` resets the council back to Phase 1 under your updated direction; `@member` triggers an isolated direct inquiry without derailing the main session state machine.
+  The prompt carries meeting background → persona → chat context → plan document → the question → output rules. Once the document is drafted (≥3000 chars) the chat context shrinks to owner follow-ups plus the two latest peer messages, and system broadcasts / moderator status lines are dropped — so the same information is never paid for twice as "raw transcript + document summary".
 - **💬 Quote Reply (WeChat-style)**: every member/moderator bubble has a `Reply` action. Sending quotes that message and routes the question to its author (equivalent to `@` them). The quoted text is resolved from the server-side record — the client only sends a message id — and is fed into the prompt as its own block; a failed reply can be retried with the quote restored.
 - **🔍 Sectioned Prompt Inspector**: the full prompt is split into per-`【block】` cards with char/line counts; bulk material (chat transcript, plan document) is collapsed by default, so a 14k-char prompt shows ~1.2k chars on first paint, with per-section and expand/collapse-all toggles.
 

@@ -458,6 +458,7 @@ def _feedback_block(session: Dict[str, Any], exclude_id: Optional[str] = None, i
 _DIRECT_CONTEXT_MAX_MESSAGES = 40
 _DIRECT_CONTEXT_MSG_CHARS = 800        # 单条消息最多展示多少字
 _DIRECT_CONTEXT_TOTAL_CHARS = 8000     # 聊天上下文总预算
+_DIRECT_DOC_READY_CHARS = 3000         # 纪要达到这个体量即视为已成稿，聊天上下文可收窄
 _DIRECT_DOC_MAX_CHARS = 16000          # 纪要正文上限（超长时掐头留尾）
 # 失败占位文案（超时/报错）不携带任何信息，混进上下文只会污染判断
 _FAILURE_NOTE_PREFIXES = ("【超时未能及时回复", "【执行出错", "【执行失败", "【进程")
@@ -497,28 +498,60 @@ def build_chat_transcript(
     max_messages: int = _DIRECT_CONTEXT_MAX_MESSAGES,
     per_msg_chars: int = _DIRECT_CONTEXT_MSG_CHARS,
     total_chars: int = _DIRECT_CONTEXT_TOTAL_CHARS,
+    owner_max: Optional[int] = None,
+    others_max: Optional[int] = None,
+    owner_chars: Optional[int] = None,
+    member_only: bool = False,
 ) -> str:
-    """把聊天窗口最近的对话压成一段可读的文本记录（时间顺序，较早的在上）。"""
+    """
+    把聊天窗口最近的对话压成一段可读的文本记录（时间顺序，较早的在上）。
+
+    owner_max / others_max：分别限制「群主消息」与「其他成员消息」的条数。
+    给定后，群主的话优先保量（追问意图最关键），同事发言只留最近几条——
+    因为纪要正文本来就收录了各方观点，再把原话全搬一遍是重复计费。
+    """
     exclude_ids = exclude_ids or set()
     msgs = [m for m in (session.get("messages") or []) if isinstance(m, dict)]
 
     lines: List[str] = []
     used = 0
     omitted = 0
+    owner_kept = 0
+    other_kept = 0
     for m in reversed(msgs):
         if m.get("id") in exclude_ids:
             continue
         if _is_failure_note(m):
             continue
+        # 系统广播（重试/恢复/跳过通知）不是发言，任何情况下都不该占上下文预算
+        if m.get("sender") == "system":
+            continue
+        # 收窄模式只保留「成员实质发言」：主持人的流程播报（已整理纪要/进入下一阶段/结案）
+        # 在纪要里都有对应内容，重复一遍纯属浪费
+        if member_only and m.get("verdict") in ("SYNTHESIS", "CONCLUDED", "RECOVER"):
+            continue
+        is_owner = m.get("sender") == "user"
+        if owner_max is not None:
+            if is_owner and owner_kept >= owner_max:
+                omitted += 1
+                continue
+            if not is_owner and other_kept >= (others_max or 0):
+                omitted += 1
+                continue
         content = " ".join(str(m.get("content") or "").split())
         if not content:
             continue
-        line = f"[{_speaker_label(m)}]: {_clip_text(content, per_msg_chars)}"
+        clip = owner_chars if (is_owner and owner_chars) else per_msg_chars
+        line = f"[{_speaker_label(m)}]: {_clip_text(content, clip)}"
         if len(lines) >= max_messages or used + len(line) > total_chars:
             omitted += 1
             continue
         lines.append(line)
         used += len(line)
+        if is_owner:
+            owner_kept += 1
+        else:
+            other_kept += 1
 
     lines.reverse()
     if omitted:
@@ -592,10 +625,33 @@ def build_direct_prompt(
             attendee_names.append(name)
 
     persona = str(target_emp.get("system_prompt") or "").strip() or "（该角色未配置人设，按你本身的能力作答）"
-    transcript = build_chat_transcript(
-        session,
-        exclude_ids={exclude_msg_id} if exclude_msg_id else None,
-    ) or "（聊天窗口里还没有可参考的历史消息，这是本场会议的第一轮交流）"
+    # 纪要是「结论 + 各方观点转述」，聊天窗口是同一批人的原话。纪要成稿后两者高度重复，
+    # 再把 40 条原话整段塞进去等于同一信息付两遍钱，还容易让模型在两版表述间来回摇摆。
+    # 所以成稿后只留群主的全部追问 + 最近两条同事发言。
+    doc_ready = len(str(session.get("document") or "").strip()) >= _DIRECT_DOC_READY_CHARS
+    if doc_ready:
+        transcript = build_chat_transcript(
+            session,
+            exclude_ids={exclude_msg_id} if exclude_msg_id else None,
+            max_messages=8,
+            per_msg_chars=500,
+            total_chars=3000,
+            owner_max=6,
+            others_max=2,
+            owner_chars=600,
+            member_only=True,
+        )
+        transcript_note = (
+            "（纪要已收录各方观点，这里只保留群主的追加要求与最近两条同事发言；"
+            "更早的讨论请以纪要为准。）\n"
+        )
+    else:
+        transcript = build_chat_transcript(
+            session,
+            exclude_ids={exclude_msg_id} if exclude_msg_id else None,
+        )
+        transcript_note = ""
+    transcript = transcript or "（聊天窗口里还没有可参考的历史消息，这是本场会议的第一轮交流）"
 
     doc_block = build_document_block(session)
     role_line = (
@@ -631,7 +687,7 @@ def build_direct_prompt(
 {role_line}
 
 【聊天窗口最近上下文（按时间顺序，较早的在上）】
-{transcript}
+{transcript_note}{transcript}
 
 【当前会议方案纪要（右侧面板最新正文）】
 {doc_block}

@@ -329,7 +329,11 @@ createApp({
       this.fetchSystemStatus(); // 仅用于点亮服务入口，不阻塞首屏
 
       if (this.sessions.length > 0) {
-        await this.switchSession(this.sessions[0].id);
+        // 刷新页面（尤其是「正在回答」时刷新）要回到刚才那场会，而不是列表第一场：
+        // 会话数据在服务端，刷新不影响会议进程，只有选错会话才会让人误以为「丢了」。
+        const remembered = this.readLastSessionId();
+        const target = this.sessions.find(s => s.id === remembered) || this.sessions[0];
+        await this.switchSession(target.id);
       } else {
         this.openNewSessionModal();
       }
@@ -375,8 +379,23 @@ createApp({
       }
     },
 
+    // 记住最近打开的是哪一场（只存 id，真正的消息都在服务端）
+    readLastSessionId() {
+      try {
+        return localStorage.getItem("aim.lastSession") || "";
+      } catch (e) {
+        return "";
+      }
+    },
+    persistLastSessionId(id) {
+      try {
+        if (id) localStorage.setItem("aim.lastSession", id);
+      } catch (e) { /* 隐私模式写不了，忽略 */ }
+    },
+
     async switchSession(id) {
       this.currentSessionId = id;
+      this.persistLastSessionId(id);
       // 请求序号：快速连切会话时，丢弃已过期的在途响应，避免界面显示 A、操作发往 B
       const token = this.switchToken + 1;
       this.switchToken = token;
