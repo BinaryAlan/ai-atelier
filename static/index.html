@@ -45,6 +45,29 @@
     .msg-clamped-wrap.on-user::after {
       background: linear-gradient(to bottom, rgba(37,99,235,0), rgba(37,99,235,0.92));
     }
+
+    /* 点引用块跳回原话时的短暂高亮，避免「跳过去了但不知道看哪条」 */
+    .msg-flash { animation: msgFlash 1.6s ease-out; }
+    @keyframes msgFlash {
+      0%   { background: rgba(250, 204, 21, 0.55); box-shadow: 0 0 0 3px rgba(250, 204, 21, 0.35); }
+      60%  { background: rgba(250, 204, 21, 0.25); }
+      100% { background: transparent; box-shadow: none; }
+    }
+
+    /* 气泡里的 Markdown：压掉文档级的首尾间距，别把气泡撑得虚胖 */
+    .bubble-md > :first-child { margin-top: 0; }
+    .bubble-md > :last-child { margin-bottom: 0; }
+    .bubble-md h1, .bubble-md h2, .bubble-md h3, .bubble-md h4 { font-size: 1em; margin: 0.5rem 0 0.25rem; border: none; padding: 0; }
+    .bubble-md h1 { font-size: 1.1em; }
+    .bubble-md p { margin-bottom: 0.5rem; line-height: 1.65; }
+    .bubble-md ul, .bubble-md ol { list-style-position: inside; padding-left: 0.25rem; }
+
+    /* 流式输出的光标 */
+    .stream-caret {
+      display: inline-block; width: 0.5rem; height: 1rem; margin-left: 2px;
+      background: #2563eb; vertical-align: -2px; animation: caretBlink 1s steps(2, start) infinite;
+    }
+    @keyframes caretBlink { 50% { opacity: 0; } }
   </style>
 </head>
 <body class="bg-gray-50 text-gray-800 antialiased h-screen overflow-hidden">
@@ -386,14 +409,17 @@
               </div>
             </div>
 
-            <!-- 引用块：群主「💬 回复」某条发言时，气泡里显示引用的原话（类似微信引用） -->
+            <!-- 引用块：群主「💬 回复」某条发言时，气泡里显示引用的原话（类似微信引用）
+                 点一下跳到被引用的原话；原话已不在当前列表时弹出快照预览 -->
             <div
               v-if="msg.quote"
+              @click.stop="jumpToQuote(msg.quote)"
+              :title="'点击跳到这条被引用的消息'"
               :class="[
-                'mb-2 rounded-md px-2 py-1 text-[11px] border-l-2',
+                'mb-2 rounded-md px-2 py-1 text-[11px] border-l-2 cursor-pointer transition',
                 msg.sender === 'user'
-                  ? 'bg-blue-700/40 border-blue-200 text-blue-50'
-                  : 'bg-gray-100 border-gray-300 text-gray-600'
+                  ? 'bg-blue-700/40 border-blue-200 text-blue-50 hover:bg-blue-700/60'
+                  : 'bg-gray-100 border-gray-300 text-gray-600 hover:bg-gray-200/70'
               ]"
             >
               <div class="opacity-80 font-medium">{{ msg.quote.sender_name }}</div>
@@ -404,8 +430,19 @@
             <div :class="[msgIsCollapsed(msg) && overflowMsgs[msg.id] ? 'msg-clamped-wrap' : '', msg.sender === 'user' ? 'on-user' : '']">
               <div
                 :data-msg-id="msg.id"
-                :class="['whitespace-pre-wrap select-text', msgIsCollapsed(msg) ? 'msg-clamped' : '']"
-              >{{ msg.content }}</div>
+                :class="[
+                  'select-text rounded-md',
+                  msgIsCollapsed(msg) ? 'msg-clamped' : '',
+                  flashMsgId === msg.id ? 'msg-flash' : ''
+                ]"
+              >
+                <!-- 群主与系统广播保持纯文本原样；AI 发言按 Markdown 渲染 -->
+                <div
+                  v-if="msg.sender === 'user' || msg.sender === 'system'"
+                  class="whitespace-pre-wrap"
+                >{{ msg.content }}</div>
+                <div v-else class="markdown-body bubble-md" v-html="renderMdText(msg.content)"></div>
+              </div>
             </div>
             <div v-if="overflowMsgs[msg.id]" class="mt-1.5">
               <button
@@ -439,14 +476,36 @@
         <div v-if="currentSession?.current_speaker" class="flex items-center gap-2 text-xs text-blue-600 bg-blue-50 p-2.5 rounded-lg border border-blue-100">
           <span class="animate-spin">⏳</span>
           <span class="flex-1">正在等待 <strong>[{{ currentSession.current_speaker }}]</strong> 响应中...</span>
-          <!-- 不设超时了，所以「什么时候不等了」由群主决定 -->
-          <span class="text-[11px] text-blue-400 hidden sm:inline">不设时限，需要打断就点右侧</span>
+          <!-- 定向 @ 应答时这是「取消」，普通轮次才是「跳过此人」：语义不同，别让用户误以为会踢人 -->
           <button
             @click.stop="interruptCurrentSpeaker"
             :disabled="interruptBusy"
-            class="text-[11px] px-2.5 py-1 rounded-lg bg-white border border-amber-300 text-amber-700 hover:bg-amber-50 transition shrink-0 disabled:opacity-60 disabled:cursor-wait"
-            title="中断这位成员的本次回答，把它移出发言位，让下一位接着发言"
-          >{{ interruptBusy ? '⏳ 中断中…' : '⏭ 跳过' }}</button>
+            :class="[
+              'text-[11px] px-2.5 py-1 rounded-lg bg-white border transition shrink-0 disabled:opacity-60 disabled:cursor-wait',
+              isDirectRunning
+                ? 'border-gray-300 text-gray-600 hover:bg-gray-50'
+                : 'border-amber-300 text-amber-700 hover:bg-amber-50'
+            ]"
+            :title="isDirectRunning
+              ? '取消这次提问：只终止当前回答，不会把它移出发言位'
+              : '中断这位成员的本次回答，把它移出发言位，让下一位接着发言'"
+          >{{ interruptBusy ? '⏳ 处理中…' : (isDirectRunning ? '✕ 取消' : '⏭ 跳过') }}</button>
+        </div>
+
+        <!-- 流式预览：模型边生成边显示，完成后由正式消息接管（不留半截内容在历史里） -->
+        <div
+          v-if="liveStream && liveStream.text && currentSession?.current_speaker"
+          class="flex gap-3 justify-start"
+        >
+          <div class="w-8 h-8 rounded-full bg-gray-300 text-white text-base flex items-center justify-center shrink-0 shadow-sm">✍️</div>
+          <div class="max-w-[85%] rounded-2xl rounded-tl-none px-4 py-3 shadow-sm text-sm leading-relaxed border bg-white border-blue-200 text-gray-800">
+            <div class="flex items-center justify-between gap-3 mb-1 text-xs opacity-80">
+              <span class="font-semibold">{{ liveStream.speaker || currentSession.current_speaker }}</span>
+              <span class="text-[10px] text-blue-500">生成中 · {{ liveStream.chars }} 字</span>
+            </div>
+            <div class="markdown-body bubble-md" v-html="renderMdText(liveStream.text)"></div>
+            <span class="stream-caret"></span>
+          </div>
         </div>
       </div>
 
@@ -490,7 +549,11 @@
               回复 {{ replyTarget.sender_name }}
               <span class="font-normal opacity-70">· 发送后由它本人作答</span>
             </div>
-            <div class="text-[11px] text-gray-600 truncate">{{ quoteExcerpt(replyTarget.content) }}</div>
+            <div
+              class="text-[11px] text-gray-600 truncate cursor-pointer hover:underline"
+              title="点击跳到这条被引用的消息"
+              @click.stop="jumpToQuote({ id: replyTarget.id, sender_name: replyTarget.sender_name, excerpt: quoteExcerpt(replyTarget.content) })"
+            >{{ quoteExcerpt(replyTarget.content) }}</div>
           </div>
           <button
             @click="cancelReply"
@@ -990,8 +1053,7 @@
                 placeholder="0"
               />
               <span class="text-[11px] text-gray-400 leading-snug">
-                留 0 表示不设时限：模型可以一直跑到自己认为答完，
-                需要打断时点聊天区的「⏭ 跳过」即可
+                留 0 表示不限时
               </span>
             </div>
           </div>
@@ -1000,6 +1062,27 @@
         <div class="p-3 border-t border-gray-100 bg-gray-50 flex justify-end gap-2">
           <button @click="showEmpEditModal = false" class="px-3 py-1.5 text-xs text-gray-600 hover:bg-gray-200 rounded">取消</button>
           <button @click="saveEmployeeItem" class="px-4 py-1.5 text-xs bg-blue-600 hover:bg-blue-700 text-white rounded font-medium shadow-sm">确定</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 8.5 引用原文快照（被引用的消息已不在当前列表时，点击引用块弹出） -->
+    <div
+      v-if="quotePreview"
+      class="fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4"
+      @click.self="quotePreview = null"
+    >
+      <div class="bg-white rounded-2xl shadow-2xl w-full max-w-lg max-h-[70vh] flex flex-col overflow-hidden">
+        <div class="p-4 border-b border-gray-100 flex items-center justify-between">
+          <div class="text-sm font-bold text-gray-900">引用原文快照</div>
+          <button @click="quotePreview = null" class="text-gray-400 hover:text-gray-600 text-lg font-bold">×</button>
+        </div>
+        <div class="flex-1 overflow-y-auto p-4">
+          <div class="text-xs text-gray-500 mb-1">{{ quotePreview.sender_name }}</div>
+          <div class="whitespace-pre-wrap text-sm text-gray-800 select-text leading-relaxed">{{ quotePreview.content || quotePreview.excerpt }}</div>
+        </div>
+        <div class="p-3 border-t border-gray-100 bg-gray-50 text-[11px] text-gray-500">
+          原消息已不在当前列表中（可能已被重试覆盖），这里显示发送时保存的引用快照。
         </div>
       </div>
     </div>

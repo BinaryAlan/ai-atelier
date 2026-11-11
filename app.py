@@ -18,6 +18,7 @@ from core.engine import (
     build_direct_prompt, latest_user_message, find_quote_by_question,
 )
 from core.executor import Executor, validate_cli_template
+from core.streaming import get_stream
 from core.scanner import scan_local_models
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -366,6 +367,21 @@ def api_create_session():
         workspace_dir=workspace_dir
     )
     return jsonify(session)
+
+@app.route("/api/sessions/<session_id>/stream", methods=["GET"])
+def api_session_stream(session_id):
+    """
+    正在生成中的文本（流式预览）。
+
+    只读内存暂存区，不碰会话文件：拿不到内容时返回 204，前端据此保持「等待中」的骨架屏。
+    """
+    if not is_valid_session_id(session_id):
+        return jsonify({"error": "非法 session_id"}), 400
+    data = get_stream(session_id)
+    if not data:
+        return ("", 204)
+    return jsonify(data)
+
 
 @app.route("/api/sessions/<session_id>", methods=["GET"])
 def api_get_session(session_id):

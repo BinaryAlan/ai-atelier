@@ -97,6 +97,13 @@ createApp({
       // Prompt 分段折叠状态（key → 是否展开）。只记用户手动点过的段，
       // 没点过的走 promptSections 里的 defaultOpen，所以每次打开弹窗都是默认视图。
       promptOpen: {},
+      // 点引用块跳转时，被引用那条的短暂高亮 id
+      flashMsgId: "",
+      // 原话已不在列表里时的快照预览弹窗
+      quotePreview: null,
+      // 流式输出：等待期间从 /stream 拉到的实时文本
+      liveStream: null,
+      streamTimer: null,
 
       isComposing: false, // 正在使用输入法组词或英文回车确认
       defaultWorkspaceDir: "",
@@ -196,12 +203,18 @@ createApp({
         return `<pre style="white-space:pre-wrap">${this.escapeHtml(doc)}</pre>`;
       }
       return DOMPurify.sanitize(marked.parse(doc));
+    },
+    // 定向 @ 应答进行中：此时的「中断」语义是取消这次提问，而不是把成员移出发言位
+    isDirectRunning() {
+      return !!this.currentSession?.target_direct_mention;
     }
   },
   mounted() {
     this.restoreLayout();
     this.init();
     this.pollInterval = setInterval(this.pollActiveSession, 1500);
+    // 流式预览：单独一条更快的轮询，只在有人正在发言时真正请求
+    this.streamTimer = setInterval(this.pollStreamPreview, 700);
     // 全局点击关闭参会人下拉框
     document.addEventListener("click", this.handleGlobalClick);
     // 拖拽调宽 / Esc 退出全屏
@@ -212,6 +225,7 @@ createApp({
   },
   beforeUnmount() {
     if (this.pollInterval) clearInterval(this.pollInterval);
+    if (this.streamTimer) clearInterval(this.streamTimer);
     document.removeEventListener("click", this.handleGlobalClick);
     window.removeEventListener("mousemove", this.onDragMove);
     window.removeEventListener("mouseup", this.onDragEnd);
@@ -405,6 +419,7 @@ createApp({
       // 引用与展开状态都属于具体会话的某条消息，切会话就清掉，避免引用到别的会议的发言
       this.replyTarget = null;
       this.expandedMsgs = {};
+      this.liveStream = null;   // 实时文本属于上一场会议，切走要清
       try {
         const res = await fetch(`/api/sessions/${id}`);
         if (token !== this.switchToken) return;
@@ -716,11 +731,50 @@ createApp({
         if (this.$refs.chatInput) this.$refs.chatInput.focus();
       });
     },
+
+    // Markdown 渲染（AI 发言 / 定时纪要共用）：CDN 不可用时退回安全纯文本
+    renderMdText(text) {
+      const src = String(text || "");
+      if (!src.trim()) return "";
+      if (!window.marked || !window.DOMPurify) {
+        return `<pre style="white-space:pre-wrap">${this.escapeHtml(src)}</pre>`;
+      }
+      try {
+        return DOMPurify.sanitize(marked.parse(src));
+      } catch (e) {
+        return `<pre style="white-space:pre-wrap">${this.escapeHtml(src)}</pre>`;
+      }
+    },
+
+    // 点引用块：原话还在列表里就滚过去并高亮；已经不在（被重试覆盖/清空）就弹快照预览
+    jumpToQuote(quote) {
+      if (!quote || !quote.id) return;
+      const exists = (this.currentSession?.messages || []).some(m => m.id === quote.id);
+      if (exists) {
+        const root = this.$refs.chatContainer;
+        const el = root && root.querySelector(`[data-msg-id="${quote.id}"]`);
+        if (el) {
+          el.scrollIntoView({ behavior: "smooth", block: "center" });
+          this.flashMsgId = quote.id;
+          if (this._flashTimer) clearTimeout(this._flashTimer);
+          this._flashTimer = setTimeout(() => { this.flashMsgId = ""; }, 1700);
+          return;
+        }
+      }
+      this.quotePreview = quote;
+    },
     cancelReply() {
       this.replyTarget = null;
     },
     quoteExcerpt(text) {
-      const t = String(text || "").replace(/\s+/g, " ").trim();
+      // 引用的是 Markdown 原文时，摘要里的 # / ** / 表格竖线只是噪音，去掉更好读
+      const t = String(text || "")
+        .replace(/```[\s\S]*?```/g, " ")
+        .replace(/^[#>\-\*\s]+/gm, "")
+        .replace(/\*\*|__|`/g, "")
+        .replace(/\|/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
       return t.length > 120 ? t.slice(0, 120) + "…" : t;
     },
 
@@ -818,6 +872,8 @@ createApp({
 
     async interruptCurrentSpeaker() {
       if (!this.currentSessionId || this.interruptBusy) return;
+      // 定向应答时它是「取消这次提问」，不动这个人的发言位，提示语要跟着变
+      const wasDirect = !!this.currentSession?.target_direct_mention;
       this.interruptBusy = true;
       try {
         const res = await fetch(`/api/sessions/${this.currentSessionId}/interrupt`, {
@@ -827,6 +883,12 @@ createApp({
         const data = await res.json().catch(() => ({}));
         if (!res.ok) {
           alert(data.error || `中断失败: HTTP ${res.status}`);
+        } else if (wasDirect) {
+          this.toastText = `已取消 [${data.interrupted || "这次回答"}] 的提问，它仍在会上，可以随时再 @ 它。`;
+          setTimeout(() => { this.toastText = ""; }, 6000);
+          // 立刻拉一次最新状态，避免等下一轮轮询才有反馈
+          const latest = await fetch(`/api/sessions/${this.currentSessionId}`).then(r => r.ok ? r.json() : null);
+          if (latest && latest.id === this.currentSessionId) this.currentSession = latest;
         } else {
           this.toastText = `已中断 [${data.interrupted || "当前发言"}]，会议交由余下成员继续。`;
           setTimeout(() => { this.toastText = ""; }, 6000);
@@ -1014,6 +1076,30 @@ createApp({
       const ok = await this.fetchSystemStatus();
       this.serviceBusy = false;
       if (ok) location.reload();
+    },
+
+    // 流式预览：有人正在发言时拉一次「正在生成的文本」。
+    // 暂存区在服务端内存里，拉不到（204）就保持「等待中」的显示，不报错。
+    async pollStreamPreview() {
+      if (!this.currentSessionId) return;
+      if (!this.currentSession?.current_speaker) {
+        if (this.liveStream) this.liveStream = null;
+        return;
+      }
+      const container = this.$refs.chatContainer;
+      const atBottom = container
+        ? container.scrollHeight - container.scrollTop - container.clientHeight < 140
+        : true;
+      try {
+        const res = await fetch(`/api/sessions/${this.currentSessionId}/stream`, { cache: "no-store" });
+        if (!res.ok || res.status === 204) return;
+        const data = await res.json();
+        if (!data || !data.text) return;
+        this.liveStream = data;
+        if (atBottom) this.$nextTick(this.scrollToBottom);
+      } catch (e) {
+        // 瞬时失败忽略，下一轮再取
+      }
     },
 
     async pollActiveSession() {

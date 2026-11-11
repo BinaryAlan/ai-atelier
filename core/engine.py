@@ -4,6 +4,7 @@ import time
 import uuid
 from typing import Dict, Any, Optional, Tuple, List
 from core.executor import Executor, ExecutionResult, sanitize_model_output
+from core.streaming import publish_stream, clear_stream, get_stream
 from core.storage import load_settings, save_session, get_session, is_valid_session_id
 
 def generate_msg_id() -> str:
@@ -330,15 +331,36 @@ def run_with_retry(
     employee: Dict[str, Any],
     prompt: str,
     session_id: str,
-    workspace_dir: Optional[str] = None
+    workspace_dir: Optional[str] = None,
+    stream: bool = True
 ) -> "ExecutionResult":
     """
     调用一次；若回答明显残缺（空 / 只有计划句 / 只剩工具标记），带上强指令重试一次。
 
     工具被禁用的模型经常先回一句「我先读取…」就结束本轮，直接入库会让会议带着空发言推进，
     所以这里重试一次；仍失败才升级为 error 让上层暂停并明确告知群主原因。
+
+    stream=True 时，子进程每吐出一段就写进内存暂存区，前端可以边生成边显示；
+    无论成功失败都会在退出前清空暂存区，避免下一位发言看到上一位的残留。
     """
-    res = Executor.run_employee(employee, prompt, session_id=session_id, workspace_dir=workspace_dir)
+    speaker = employee.get("name") or employee.get("id") or "成员"
+    on_chunk = (lambda text: publish_stream(session_id, speaker, text)) if stream else None
+    try:
+        return _run_with_retry(employee, prompt, session_id, workspace_dir, on_chunk)
+    finally:
+        clear_stream(session_id)
+
+
+def _run_with_retry(
+    employee: Dict[str, Any],
+    prompt: str,
+    session_id: str,
+    workspace_dir: Optional[str],
+    on_chunk=None
+) -> "ExecutionResult":
+    res = Executor.run_employee(
+        employee, prompt, session_id=session_id, workspace_dir=workspace_dir, on_chunk=on_chunk
+    )
 
     # 执行器已清洗过一次；这里再兜一层，保证「判定是否残缺」永远针对干净正文，
     # 不依赖调用方是否走了同一条清洗路径。
@@ -350,7 +372,8 @@ def run_with_retry(
 
     print(f"[Executor] {employee.get('name', employee.get('id'))} 回答疑似未完成（{len(res.output)} 字），重试一次")
     res2 = Executor.run_employee(
-        employee, prompt + _RETRY_HINT, session_id=session_id, workspace_dir=workspace_dir
+        employee, prompt + _RETRY_HINT, session_id=session_id, workspace_dir=workspace_dir,
+        on_chunk=on_chunk
     )
     res2.elapsed += res.elapsed
     if res2.status == "success":
@@ -459,6 +482,10 @@ _DIRECT_CONTEXT_MAX_MESSAGES = 40
 _DIRECT_CONTEXT_MSG_CHARS = 800        # 单条消息最多展示多少字
 _DIRECT_CONTEXT_TOTAL_CHARS = 8000     # 聊天上下文总预算
 _DIRECT_DOC_READY_CHARS = 3000         # 纪要达到这个体量即视为已成稿，聊天上下文可收窄
+_DOC_TOC_TRIGGER_CHARS = 12000         # 纪要超过这个体量才改走「大纲 + 命中章节」
+_DOC_TOC_SECTION_MAX = 3               # 最多展开几节
+_DOC_TOC_SECTION_CHARS = 2500          # 单节最多带多少字（整节过长时掐断并标注）
+_DOC_TOC_TAIL_CHARS = 800              # 结尾结论段保留长度
 _DIRECT_DOC_MAX_CHARS = 16000          # 纪要正文上限（超长时掐头留尾）
 # 失败占位文案（超时/报错）不携带任何信息，混进上下文只会污染判断
 _FAILURE_NOTE_PREFIXES = ("【超时未能及时回复", "【执行出错", "【执行失败", "【进程")
@@ -559,11 +586,124 @@ def build_chat_transcript(
     return "\n".join(lines)
 
 
-def build_document_block(session: Dict[str, Any]) -> str:
+_HEADING_RE = re.compile(r"^(#{1,4})\s+(.+?)\s*$")
+
+
+def _split_doc_sections(doc: str) -> List[Dict[str, Any]]:
+    """
+    把 Markdown 纪要按标题切成节，返回 [{level, title, text, start, end}]。
+
+    没有标题的文档返回 []（调用方退回「全文」策略）。
+    """
+    lines = doc.splitlines()
+    marks: List[Tuple[int, int, str]] = []   # (行号, 级别, 标题)
+    for idx, line in enumerate(lines):
+        m = _HEADING_RE.match(line)
+        if m:
+            marks.append((idx, len(m.group(1)), m.group(2).strip()))
+    if len(marks) < 2:
+        return []
+
+    sections: List[Dict[str, Any]] = []
+    for i, (idx, level, title) in enumerate(marks):
+        end = marks[i + 1][0] if i + 1 < len(marks) else len(lines)
+        body = "\n".join(lines[idx:end]).strip()
+        sections.append({"level": level, "title": title, "text": body,
+                         "start": idx, "end": end})
+    return sections
+
+
+def _question_keywords(question: str) -> List[str]:
+    """
+    从提问里抽关键词：中文按 2~6 字连续片段、英文/编号按 ≥2 字符的片段。
+    只用于「挑相关章节」，不追求精确，命中一到两个词就足以定位。
+    """
+    text = str(question or "")
+    tokens: List[str] = []
+    tokens += re.findall(r"[\u4e00-\u9fff]{2,6}", text)
+    tokens += re.findall(r"[A-Za-z0-9][A-Za-z0-9_\-./]{1,30}", text)
+    # 提问里必然出现的泛词没有区分度，命中它们等于随机挑章节
+    stop = {"什么", "怎么", "如何", "可以", "是否", "这个", "那个", "我们", "你们",
+            "一下", "看看", "请问", "为什", "么样", "哪些", "需要", "现在"}
+    seen = set()
+    out: List[str] = []
+    for t in tokens:
+        if t in stop or t in seen:
+            continue
+        seen.add(t)
+        out.append(t)
+    return out
+
+
+def build_document_excerpt(doc: str, question: str) -> str:
+    """
+    纪要过长时不再整份塞进 prompt：给「标题大纲 + 与提问最相关的几节 + 结尾结论段」。
+
+    只有超过阈值才触发，短纪要仍走全文，避免为了省 token 把上下文切碎。
+    """
+    sections = _split_doc_sections(doc)
+    if not sections:
+        return ""
+
+    keywords = _question_keywords(question)
+    scored = []
+    for sec in sections:
+        text = sec["text"]
+        score = 0
+        for kw in keywords:
+            score += text.count(kw) * min(len(kw), 4)
+        if score > 0:
+            scored.append((score, sec))
+    scored.sort(key=lambda x: -x[0])
+    picked = [sec for _, sec in scored[:_DOC_TOC_SECTION_MAX]]
+    picked.sort(key=lambda s: s["start"])   # 按原文顺序摆，读起来才连贯
+
+    outline = "\n".join(
+        f"{'  ' * (s['level'] - 1)}- {s['title']}" for s in sections if s["level"] <= 3
+    )
+    if picked:
+        parts = []
+        for s in picked:
+            text = s["text"]
+            if len(text) > _DOC_TOC_SECTION_CHARS:
+                text = _clip_text(text, _DOC_TOC_SECTION_CHARS)
+            parts.append(text)
+        body = "\n\n".join(parts)
+        picked_heads = "、".join(f"「{s['title']}」" for s in picked)
+        note = f"（以下按本次提问挑出相关章节：{picked_heads}；其余章节未展开）"
+    else:
+        body = sections[0]["text"]
+        note = "（提问未命中具体章节，这里给出开头一节，其余仅列标题）"
+
+    head = (
+        "----- 纪要大纲开始 -----\n"
+        f"{outline}\n"
+        "----- 纪要大纲结束 -----\n"
+        f"{note}\n"
+        "----- 相关章节全文开始 -----\n"
+        f"{body}\n"
+        "----- 相关章节全文结束 -----"
+    )
+    tail = doc[-_DOC_TOC_TAIL_CHARS:].lstrip()
+    if tail and tail not in body:
+        head += (
+            f"\n（纪要结尾 {len(tail)} 字，通常是结论与行动项）\n"
+            f"----- 结尾段开始 -----\n{tail}\n----- 结尾段结束 -----"
+        )
+    return head
+
+
+def build_document_block(session: Dict[str, Any], question: str = "") -> str:
     """渲染右侧面板当前的方案纪要与正文；没有成稿时如实说明。"""
     doc = str(session.get("document") or "").strip()
     if not doc or ("等待各参会成员" in doc and len(doc) < 200):
         return "（本场会议尚未形成正式方案纪要：阶段一还在进行中，请只依据下面的聊天上下文作答。）"
+
+    # 超过阈值且有明确提问：按提问检索章节，避免整份 3 万字纪要每次都全量重发
+    if question and len(doc) > _DOC_TOC_TRIGGER_CHARS:
+        excerpt = build_document_excerpt(doc, question)
+        if excerpt:
+            return excerpt
 
     if len(doc) > _DIRECT_DOC_MAX_CHARS:
         head_len = int(_DIRECT_DOC_MAX_CHARS * 0.65)
@@ -653,7 +793,7 @@ def build_direct_prompt(
         transcript_note = ""
     transcript = transcript or "（聊天窗口里还没有可参考的历史消息，这是本场会议的第一轮交流）"
 
-    doc_block = build_document_block(session)
+    doc_block = build_document_block(session, question=question)
     role_line = (
         "你是本场会议的主持人，这条提问是群主单独找你的：直接作答即可，不需要推进会议流程。"
         if is_moderator else
@@ -675,7 +815,14 @@ def build_direct_prompt(
             "（群主是在上面这条发言的基础上追问，请紧扣它作答；如果不认同其中的说法，直接指出并说明理由。）\n"
         )
 
-    return f"""【本场会议背景】
+    # 顺序：先放大块且稳定的材料（纪要正文在整个会话里不变，同一位成员被追问多次、
+    # 或同一轮里多人被点名时，前缀可以复用并命中 provider 缓存），
+    # 再放因人而异、每次都在变的部分（身份/上下文/提问）。
+    return f"""【当前会议方案纪要（右侧面板最新正文）】
+{doc_block}
+（以上是本场会议已经确认的正式内容。回答里涉及方案结构、编号、结论时，一律以它为准，不要另立一套。）
+
+【本场会议背景】
 - 会议议题: {session_topic(session)}
 - 当前阶段: {phase_line}
 - 参会成员: {'、'.join(attendee_names)}
@@ -688,10 +835,6 @@ def build_direct_prompt(
 
 【聊天窗口最近上下文（按时间顺序，较早的在上）】
 {transcript_note}{transcript}
-
-【当前会议方案纪要（右侧面板最新正文）】
-{doc_block}
-（以上是本场会议已经确认的正式内容。回答里涉及方案结构、编号、结论时，一律以它为准，不要另立一套。）
 {quote_block}
 【群主这一次的具体提问】
 {question}
@@ -1541,20 +1684,32 @@ class MeetingEngine:
             reviewer_id = unpassed_ids[0]
             reviewer_emp = MeetingEngine.get_employee(settings, reviewer_id)
             owner_note = latest_user_message(session)
-            owner_block = f"\n【群主最新指令（必须遵守，优先级最高）】: {owner_note}\n" if owner_note else ""
+            # 群主原话可能很长（粘贴需求/路径），而纪要第一节本来就复述了议题，
+            # 这里只留能表明「最新指令」的那一段，避免整段原话每轮重发一遍。
+            owner_block = (
+                f"\n【群主最新指令（必须遵守，优先级最高）】: {_clip_text(owner_note, 600)}\n"
+                if owner_note else ""
+            )
 
             feedback = _feedback_block(session, exclude_id=reviewer_id)
             capability = capability_block(reviewer_emp)
 
-            review_prompt = f"""【方案客观审阅】
+            # 顺序很重要：方案正文是「同一版本对所有审阅人完全一致」的大块内容，
+            # 放在最前面，三位审阅人的请求才能共享同一段稳定前缀（provider 端可命中
+            # prompt 缓存，正文部分的输入通常按命中价计）；人设/意见/原则这些因人而异的
+            # 内容一律放到正文之后。
+            review_prompt = f"""【方案正文（本轮审阅对象）】
+----- 方案正文开始 -----
+{session['document']}
+----- 方案正文结束 -----
+
+【你的身份】
 你是【{reviewer_emp['name']}】。
 人设背景: {reviewer_emp.get('system_prompt', '')}
 当前工作目录: {workspace_dir}
 
-请仔细审阅最新版方案草案：
------ 方案正文开始 -----
-{session['document']}
------ 方案正文结束 -----
+【你的任务】
+审阅上面这版方案草案：判断它是否可以进入执行，指出必须修掉的硬伤。
 {feedback}{owner_block}{capability}
 【审阅原则】:
 1. 保持客观理性与专业严谨。细微修辞或非原则性小建议不作为阻断项；
