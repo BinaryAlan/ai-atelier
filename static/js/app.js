@@ -104,6 +104,11 @@ createApp({
       // 流式输出：等待期间从 /stream 拉到的实时文本
       liveStream: null,
       streamTimer: null,
+      // 自动跟随：只有用户主动往上翻时才停跟随，否则无论内容长多快都贴底。
+      // 不用「距底部多少像素」当判据——一次到达几百字就足以把距离撑过阈值，
+      // 于是跟随永久失效，用户以为「跳不到底」。
+      stickToBottom: true,
+      showJumpToLatest: false,
 
       isComposing: false, // 正在使用输入法组词或英文回车确认
       defaultWorkspaceDir: "",
@@ -425,7 +430,7 @@ createApp({
         if (token !== this.switchToken) return;
         if (res.ok) {
           this.currentSession = await res.json();
-          this.$nextTick(this.scrollToBottom);
+          this.pinToBottom();
           this.measureMsgOverflow();
           this.loadWorkspaceFiles();
         }
@@ -584,7 +589,7 @@ createApp({
         if (res.ok) {
           const updated = await res.json();
           this.currentSession = updated;
-          this.$nextTick(this.scrollToBottom);
+          this.pinToBottom();
           await this.loadSessions();
         }
       } catch (e) {
@@ -668,7 +673,7 @@ createApp({
         this.inputContent = "";
         this.replyTarget = null;
         this.currentSession = data;
-        this.$nextTick(this.scrollToBottom);
+        this.pinToBottom();
         this.measureMsgOverflow();
         await this.loadSessions();
       } catch (e) {
@@ -705,7 +710,11 @@ createApp({
             changed = true;
           }
         });
-        if (changed) this.overflowMsgs = next;
+        if (changed) {
+          this.overflowMsgs = next;
+          // 折叠会改变消息高度，贴底时补滚一次，否则会停在「差一屏」的位置
+          if (this.stickToBottom) this.$nextTick(() => this.scrollToBottom());
+        }
       });
     },
 
@@ -732,18 +741,28 @@ createApp({
       });
     },
 
-    // Markdown 渲染（AI 发言 / 定时纪要共用）：CDN 不可用时退回安全纯文本
+    // Markdown 渲染（AI 发言 / 定时纪要共用）：CDN 不可用时退回安全纯文本。
+    // 加一层结果缓存：模板里每次 re-render 都会重新调用，不缓存就等于每 1.5 秒
+    // 把整屏历史消息全部重新解析一遍（长会话下滚动会明显卡）。
     renderMdText(text) {
       const src = String(text || "");
       if (!src.trim()) return "";
+      if (!this._mdCache) this._mdCache = new Map();
+      const cached = this._mdCache.get(src);
+      if (cached !== undefined) return cached;
+      let out;
       if (!window.marked || !window.DOMPurify) {
-        return `<pre style="white-space:pre-wrap">${this.escapeHtml(src)}</pre>`;
+        out = `<pre style="white-space:pre-wrap">${this.escapeHtml(src)}</pre>`;
+      } else {
+        try {
+          out = DOMPurify.sanitize(marked.parse(src));
+        } catch (e) {
+          out = `<pre style="white-space:pre-wrap">${this.escapeHtml(src)}</pre>`;
+        }
       }
-      try {
-        return DOMPurify.sanitize(marked.parse(src));
-      } catch (e) {
-        return `<pre style="white-space:pre-wrap">${this.escapeHtml(src)}</pre>`;
-      }
+      if (this._mdCache.size > 150) this._mdCache.clear();
+      this._mdCache.set(src, out);
+      return out;
     },
 
     // 点引用块：原话还在列表里就滚过去并高亮；已经不在（被重试覆盖/清空）就弹快照预览
@@ -787,7 +806,7 @@ createApp({
           this.currentSession.current_speaker = null;
           const sRes = await fetch(`/api/sessions/${this.currentSessionId}`);
           this.currentSession = await sRes.json();
-          this.$nextTick(this.scrollToBottom);
+          this.$nextTick(() => this.scrollToBottom(false));
         }
       } catch (e) {
         console.error("暂停失败:", e);
@@ -822,7 +841,7 @@ createApp({
           }
         }
         if (data.message) this.showToast(data.message);
-        this.$nextTick(this.scrollToBottom);
+        this.pinToBottom();
       } catch (e) {
         // 服务刚重启时请求会直接失败：一定要说出来，不能只写 console
         alert(
@@ -1086,20 +1105,37 @@ createApp({
         if (this.liveStream) this.liveStream = null;
         return;
       }
-      const container = this.$refs.chatContainer;
-      const atBottom = container
-        ? container.scrollHeight - container.scrollTop - container.clientHeight < 140
-        : true;
       try {
         const res = await fetch(`/api/sessions/${this.currentSessionId}/stream`, { cache: "no-store" });
         if (!res.ok || res.status === 204) return;
         const data = await res.json();
         if (!data || !data.text) return;
-        this.liveStream = data;
-        if (atBottom) this.$nextTick(this.scrollToBottom);
+        if (this.liveStream) {
+          // 只覆盖变化的字段：整体换对象会让 Vue 重建气泡，长文本下每 700ms 抖一次
+          this.liveStream.text = data.text;
+          this.liveStream.chars = data.chars;
+          if (data.speaker) this.liveStream.speaker = data.speaker;
+        } else {
+          this.liveStream = { ...data };
+        }
+        // 用户在底部就一直跟随；正在往上翻读历史时不抢位置
+        if (this.stickToBottom) this.$nextTick(() => this.scrollToBottom());
       } catch (e) {
         // 瞬时失败忽略，下一轮再取
       }
+    },
+
+    // 只比较会被界面用到的字段：内容没变就不整体替换 session 对象。
+    // 否则等待期间每 1.5s 重渲染整屏消息（每条都要重新 markdown 解析）＝ 肉眼可见的抖动。
+    sessionSignature(s) {
+      if (!s) return "";
+      const msgs = s.messages || [];
+      const last = msgs[msgs.length - 1] || {};
+      return [
+        s.status, s.current_speaker, s.target_direct_mention, s.phase,
+        s.doc_revision, (s.document || "").length,
+        msgs.length, last.id, (last.content || "").length
+      ].join("|");
     },
 
     async pollActiveSession() {
@@ -1115,12 +1151,23 @@ createApp({
             const latest = await res.json();
             // 防止在途请求返回时用户已切换会话导致数据覆盖
             if (latest.id !== this.currentSessionId) return;
-            const hadFewerMsgs = (this.currentSession.messages?.length || 0) < (latest.messages?.length || 0);
+            if (this.sessionSignature(latest) === this.sessionSignature(this.currentSession)) return;
+            const prevCount = (this.currentSession.messages || []).length;
+            const nextCount = (latest.messages || []).length;
+            const speakerAppeared = !this.currentSession.current_speaker && !!latest.current_speaker;
             this.currentSession = latest;
-            if (hadFewerMsgs) {
-              this.$nextTick(this.scrollToBottom);
+            if (nextCount > prevCount) {
+              // 正式消息已落地，实时气泡让位，避免同一段内容显示两遍
+              this.liveStream = null;
             }
-            this.measureMsgOverflow();
+            if (speakerAppeared && this.stickToBottom) {
+              // 点名刚开始回答：贴底，否则「等待条 / 实时气泡」出现在视口外，看起来像没反应。
+              // 用户正在往上翻历史时不抢位置（角落有「回到最新」提示）
+              this.pinToBottom();
+            } else if (nextCount > prevCount) {
+              this.$nextTick(() => this.scrollToBottom(false));
+            }
+            if (nextCount !== prevCount) this.measureMsgOverflow();
           }
         } catch (e) {
           // 静默容错
@@ -1386,11 +1433,35 @@ createApp({
       }
     },
 
-    scrollToBottom() {
-      const container = this.$refs.chatContainer;
-      if (container) {
-        container.scrollTop = container.scrollHeight;
-      }
+    // 用户是否停在底部：只由用户自己的滚动行为判定，程序滚动不会把它关掉
+    onChatScroll() {
+      const c = this.$refs.chatContainer;
+      if (!c) return;
+      const dist = c.scrollHeight - c.scrollTop - c.clientHeight;
+      this.stickToBottom = dist < 80;
+      this.showJumpToLatest = dist > 240;
+    },
+
+    // follow=false 时只在「用户本来就在底部」才滚，别抢走别人正在读的位置
+    scrollToBottom(follow = true) {
+      const c = this.$refs.chatContainer;
+      if (!c) return;
+      if (!follow && !this.stickToBottom) return;
+      c.scrollTop = c.scrollHeight;
+      if (follow) this.showJumpToLatest = false;
+    },
+
+    // 强制贴底并恢复跟随：发消息、切会话、开始回答时用
+    pinToBottom() {
+      this.stickToBottom = true;
+      this.showJumpToLatest = false;
+      this.$nextTick(() => {
+        this.scrollToBottom();
+        // 字体/图片/代码块可能晚一帧才定高，再补一次，避免停在「差一点点」的位置
+        if (typeof requestAnimationFrame === "function") {
+          requestAnimationFrame(() => this.scrollToBottom());
+        }
+      });
     }
   }
 }).mount("#app");

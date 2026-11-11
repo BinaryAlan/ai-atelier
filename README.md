@@ -98,7 +98,8 @@ When a local model CLI times out or errors, the meeting pauses gracefully withou
 ### 🖥️ Responsive Three-Column Workspace
 - **Left Column (Sessions)**: Search, rename, favorite, and drag to resize or collapse;
 - **Center Column (Interactive Stream)**: Visual waterfall clearly distinguishing initial opinions, blockers, verification verdicts, and system broadcasts; AI messages render as Markdown (headings, lists, tables, code, quotes) while owner/system messages stay plain;
-- **Streaming Output**: subprocess stdout is throttled into 0.33s updates and shown live while waiting (per-token visibility depends on whether the CLI itself flushes);
+- **Streaming Output**: subprocess stdout is throttled into 0.33s updates and shown live while waiting (per-token visibility depends on whether the CLI itself flushes). While streaming the text is rendered as **plain text** on purpose — half-finished Markdown (an unclosed code fence, a half-written table) would reflow the whole block on every tick and make it unreadable; the final message takes over with full Markdown once the call returns;
+- **Follow & "Back to latest"**: auto-scroll stops only when you scroll up yourself, so a fast-growing answer never loses your position; a `Back to latest` pill appears while you read history.
 - **Collapsible Long Answers**: messages taller than the chat viewport (~30 lines) fold automatically with an `Expand / Collapse` toggle, and re-measure on window resize so short messages are never mis-folded;
 - **Right Column (Living Document)**: Real-time Markdown rendering, version history tracking, and distraction-free full-screen reading mode.
 

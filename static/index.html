@@ -68,6 +68,17 @@
       background: #2563eb; vertical-align: -2px; animation: caretBlink 1s steps(2, start) infinite;
     }
     @keyframes caretBlink { 50% { opacity: 0; } }
+
+    /* 流式正文：纯文本单调追加，不做 Markdown 解析（避免半成品语法反复重排） */
+    .stream-live {
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      word-break: break-word;
+      line-height: 1.65;
+    }
+    /* 纯文本气泡的宽度会跟着「最长那一行」变，逐段追加时横向抖一下；
+       给个稳定下限，宽度在整段生成过程中就不会跳。 */
+    .stream-bubble { min-width: min(22rem, 70%); }
   </style>
 </head>
 <body class="bg-gray-50 text-gray-800 antialiased h-screen overflow-hidden">
@@ -326,8 +337,13 @@
         </div>
       </div>
 
-      <!-- 聊天消息流 -->
-      <div ref="chatContainer" class="flex-1 overflow-y-auto p-5 space-y-4">
+      <!-- 聊天消息流：外层 relative 只用于承载「回到最新」浮动按钮 -->
+      <div class="relative flex-1 min-h-0 flex flex-col">
+      <div
+        ref="chatContainer"
+        @scroll.passive="onChatScroll"
+        class="flex-1 min-h-0 overflow-y-auto p-5 space-y-4"
+      >
         <div v-if="!currentSession?.messages?.length" class="text-center py-16 text-gray-400">
           <span class="text-4xl">💡</span>
           <p class="mt-3 text-sm font-medium text-gray-600">在此发起议题、提问或展开多方讨论</p>
@@ -492,21 +508,33 @@
           >{{ interruptBusy ? '⏳ 处理中…' : (isDirectRunning ? '✕ 取消' : '⏭ 跳过') }}</button>
         </div>
 
-        <!-- 流式预览：模型边生成边显示，完成后由正式消息接管（不留半截内容在历史里） -->
+        <!-- 流式预览：模型边生成边显示，完成后由正式消息接管（不留半截内容在历史里）。
+             关键：这里刻意按纯文本渲染，不解析 Markdown —— 半成品 Markdown（未闭合的代码块、
+             只写了一半的表格竖线）会在文本/表格/代码之间反复变形，每刷新一次整段重排，
+             读的人视线跟着乱跳。纯文本是单调追加，高度只增不变形。 -->
         <div
           v-if="liveStream && liveStream.text && currentSession?.current_speaker"
           class="flex gap-3 justify-start"
         >
           <div class="w-8 h-8 rounded-full bg-gray-300 text-white text-base flex items-center justify-center shrink-0 shadow-sm">✍️</div>
-          <div class="max-w-[85%] rounded-2xl rounded-tl-none px-4 py-3 shadow-sm text-sm leading-relaxed border bg-white border-blue-200 text-gray-800">
+          <div class="max-w-[85%] rounded-2xl rounded-tl-none px-4 py-3 shadow-sm text-sm leading-relaxed border bg-white border-blue-200 text-gray-800 stream-bubble">
             <div class="flex items-center justify-between gap-3 mb-1 text-xs opacity-80">
               <span class="font-semibold">{{ liveStream.speaker || currentSession.current_speaker }}</span>
-              <span class="text-[10px] text-blue-500">生成中 · {{ liveStream.chars }} 字</span>
+              <span class="text-[10px] text-blue-500 tabular-nums">生成中 · {{ liveStream.chars }} 字</span>
             </div>
-            <div class="markdown-body bubble-md" v-html="renderMdText(liveStream.text)"></div>
+            <div class="stream-live select-text">{{ liveStream.text }}</div>
             <span class="stream-caret"></span>
           </div>
         </div>
+      </div>
+
+      <!-- 用户往上翻看历史后，新内容还会继续产生；给一个明确的「回到最新」，别让人自己找 -->
+      <button
+        v-if="showJumpToLatest"
+        @click.stop="pinToBottom()"
+        class="absolute right-5 bottom-4 z-20 px-3 py-1.5 rounded-full bg-white/95 border border-gray-200 shadow-lg text-xs text-gray-700 hover:bg-gray-50 transition flex items-center gap-1"
+        title="滚回最新消息并恢复自动跟随"
+      >⬇ 回到最新</button>
       </div>
 
       <!-- 底部输入栏 -->
