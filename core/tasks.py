@@ -85,6 +85,27 @@ def _member_candidates(settings: Dict[str, Any]) -> List[Dict[str, Any]]:
     return [e for e in (settings.get("employees") or []) if isinstance(e, dict) and e.get("id")]
 
 
+def find_member(settings: Dict[str, Any], emp_id: str) -> Optional[Dict[str, Any]]:
+    """按 id 找成员，不看启停状态（报错时也要能取到名字）。"""
+    for emp in settings.get("employees") or []:
+        if isinstance(emp, dict) and str(emp.get("id")) == str(emp_id):
+            return emp
+    return None
+
+
+def usable_member(settings: Dict[str, Any], emp_id: str) -> Optional[Dict[str, Any]]:
+    """可用于执行的成员：已启用且配了 CLI。停用或缺 CLI 一律视为不可用。"""
+    emp = find_member(settings, emp_id)
+    if emp and emp.get("enabled", True) and emp.get("cli_cmd"):
+        return emp
+    return None
+
+
+def _member_label(settings: Dict[str, Any], emp_id: str) -> str:
+    emp = find_member(settings, emp_id) or {}
+    return str(emp.get("name") or emp_id)
+
+
 def member_aliases(emp: Dict[str, Any]) -> List[str]:
     """成员可被 @ 的别名：全名、id、以及全名括号里的短名（如 DS4 / HY4）。"""
     name = str(emp.get("name") or "")
@@ -149,6 +170,21 @@ def parse_collab(content: str, settings: Dict[str, Any]) -> Dict[str, Any]:
         return result
     if not goal:
         result["error"] = "缺少任务内容：/collab @主创 @协助成员 之后要写要做什么"
+        return result
+    # 成员可用性也在这里拦：原先只校验主创，被 @ 的协助成员若已停用，任务照样发起，
+    # 直到审核环节才落一个「成员不可用」，主创白白交付一轮
+    if not usable_member(settings, owner_id):
+        result["error"] = (
+            f"主创 {_member_label(settings, owner_id)} 已停用或缺少 CLI 配置："
+            "请先在设置里启用后再发起协助任务"
+        )
+        return result
+    unusable = [rid for rid in reviewer_ids if not usable_member(settings, rid)]
+    if unusable:
+        names = "、".join(_member_label(settings, rid) for rid in unusable)
+        result["error"] = (
+            f"协助成员 {names} 已停用或缺少 CLI 配置：请先在设置里启用后再发起协助任务"
+        )
         return result
 
     result.update(ok=True, owner_id=owner_id, reviewer_ids=reviewer_ids, goal=goal)
@@ -603,11 +639,7 @@ class TaskManager:
 
     @staticmethod
     def _employee(settings: Dict[str, Any], emp_id: str) -> Optional[Dict[str, Any]]:
-        for emp in settings.get("employees") or []:
-            if isinstance(emp, dict) and str(emp.get("id")) == str(emp_id):
-                if emp.get("enabled", True) and emp.get("cli_cmd"):
-                    return emp
-        return None
+        return usable_member(settings, emp_id)
 
     # ---------------- 每成员 FIFO worker ----------------
     def ensure_worker(self, sid: str, member_id: str) -> None:
@@ -701,7 +733,8 @@ class TaskManager:
                 if self._workers.get(key) is threading.current_thread():
                     self._workers.pop(key, None)
 
-    # 同一成员最多等这么久；超时则照常执行（宁可少见地不串行，也不要两个任务互相等成死锁）
+    # 同一成员最多等这么久；超时就不执行本次环节（宁可让用户看到失败并重试，
+    # 也不并发起两个进程写同一工作目录）。
     MEMBER_WAIT_SECONDS = 1800
 
     def _acquire_member(self, sid: str, member_id: str, timeout: Optional[float] = None) -> bool:
@@ -1262,7 +1295,10 @@ class TaskManager:
                     return {"error": "执行环节已结束，不能取消", "code": "stage_not_active"}
             emp_id = member_id or task.get("owner_id") or ""
             key = execution_key(sid, tid, stage, emp_id)
-            CANCELLED_KEYS.add(key)
+            if task.get("status") != STATUS_QUEUED:
+                # 排队中的任务根本没有进程可杀，也不会再进入执行单元（已从队列摘除且状态转已取消），
+                # 写取消标记没人消费，只会在进程级集合里长期留一个字符串
+                CANCELLED_KEYS.add(key)
             if stage == STAGE_EXEC:
                 task["part_a"]["status"] = STATUS_CANCELLED
             elif stage == STAGE_DELIVER:

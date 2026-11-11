@@ -6,7 +6,7 @@
 ## 验证方式
 
 ```bash
-# 1. 自动化测试（51 项，不调用真实 CLI、不写真实 data/）
+# 1. 自动化测试（54 项，不调用真实 CLI、不写真实 data/）
 .venv/bin/python -m unittest discover -s tests -v
 
 # 2. 语法检查
@@ -61,11 +61,11 @@ node /tmp/verify_cleanup.mjs   # 旧文案 / 旧字段 / 设置三部分 / 确�
 | A27 | 10 | 设置只有成员管理 / 界面语言 / 服务三部分，没有模式选择 | CDP：`settingsTabs = [general, members, service]`、三项中文标签正确、`hasMeetingTab=false`；`settings` 只有 `ui_language` / `employees` 两个键 | 通过 |
 | A28 | 2 / 6.1 | 长内容默认折叠；每条消息可查看完整输入与原始输出 | 原折叠/查看器逻辑保留；CDP 弹窗查看输入按钮 | 通过 |
 | A29 | 11 | Flask + Vue3、会话 JSON 落盘、CLI 子进程执行、输入拼装与结构化输出解析模块齐备 | 语法编译 + Flask test_client 接口测试 + CDP 页面挂载 | 通过（端到端用注入的 FakeRunner，未调用真实 CLI 子进程，避免真实 token 消耗） |
-| A30 | 全局 | 双语：新增界面文案有英文词条 | CDP：`stateLabel('running')='Running'`、`stateLabel('delivered')='Delivered'`；词典共 204 条，任务系统段 54 条；脚本核对 `t()` 的中文词条无遗漏、无重复键 | 通过 |
+| A30 | 全局 | 双语：新增界面文案有英文词条 | CDP：`stateLabel('running')='Running'`、`stateLabel('delivered')='Delivered'`；词典共 206 条（本轮新增「主创 / 协助成员已停用」两条中英对照）；脚本核对 `t()` 的中文词条无遗漏、无重复键 | 通过 |
 | A31 | 全局 | 旧代码与旧接口删除：`core/engine.py`、`core/streaming.py`、`core/i18n.py` 以及 `/stream`、`/pause`、`/resume`、`/interrupt`、`/skip`、`/task/stop`、旧消息 `/retry` 全部不存在 | `git status` 显示 3 个模块已删除；`app.url_map` 路由清单 21 条，逐条确认无旧路径；全仓 grep 无 `core.engine` / `core.streaming` / `core.i18n` 引用 | 通过 |
 | A32 | 全局 | 旧数据清除：`settings.json` 只有 `ui_language` 与 `employees`（3 个可用成员）；旧会话文件清空；新会话不再有 `status` / `phase` / `mode` / `document` / `current_speaker` 等旧字段 | 文件内容核对；接口冒烟：带 `moderator` / `collab` / `default_mode` 的旧配置读取后只回两个键，POST 写入也只落两个键；带 `mode` / `phase` 创建会话，返回字段里无旧字段；`data/sessions/` 只剩 `.gitkeep` | 通过 |
 | A33 | 10 | 主持人配置删除：界面无主持人卡片、设置无 `moderator`、`load_settings` 不再按旧字段做兼容 | CDP 设置面板文案无「主持人」；`settingsKeys` 无 `moderator`；`core/storage.py` 改为只按白名单字段构造设置 | 通过 |
-| A34 | 全局 | 用户可见文案与规格一致：界面、词典、启动提示、重启/停止确认、run.sh、README 都改为「会话 / 成员 / 任务 / 已取消可重试」 | CDP 首屏 + 新建会话弹窗 + 设置面板 + 服务页：旧词命中数 0；词典 204 条旧词命中 0；重启/停止确认含「已取消」「任务卡片」且不含「恢复讨论」；全仓中文旧词 grep 无业务残留 | 通过 |
+| A34 | 全局 | 用户可见文案与规格一致：界面、词典、启动提示、重启/停止确认、run.sh、README 都改为「会话 / 成员 / 任务 / 已取消可重试」 | CDP 首屏 + 新建会话弹窗 + 设置面板 + 服务页：旧词命中数 0；词典 206 条旧词命中 0；重启/停止确认含「已取消」「任务卡片」且不含「恢复讨论」；全仓中文旧词 grep 无业务残留 | 通过 |
 | A35 | 全局 | 中英 README 与 `run.sh` 同步任务系统；旧圆桌演示 GIF 移除 | README 两份按规格 11 章结构重写，目录树与真实文件一致；`run.sh status` 读 `active_tasks`、启动/重启提示改为任务表述；`git rm docs/demo.gif docs/demo-en.gif`（已备份到 `/tmp/aim-legacy-backup-20261111-184514/`） | 通过 |
 
 | A36 | 4.2 / 5.1 | 成员输入包含「会话背景」：最近 8 条消息（单条 600 字、合计 3000 字上限），被截断的更早部分压成一段进展摘要；系统播报与各环节执行记录不进背景；没点名成员的消息因此真正作为上下文生效；重试时原话之后补充的约束一并带上 | `test_recent_messages_fill_context`、`test_context_skips_system_and_records`、`test_current_message_is_not_duplicated`、`test_prompt_contains_context_section`、`test_retry_carries_later_user_constraints` | 通过 |
@@ -108,7 +108,7 @@ node /tmp/verify_cleanup.mjs   # 旧文案 / 旧字段 / 设置三部分 / 确�
   右栏只工作目录、无全局控制条、无模式徽章、`/collab` 输入校验、弹窗两部分与历次记录、
   已交付后的交付重试、输入框始终可用、设置三部分、英文词条，全部符合预期。
 - 界面（CDP `/tmp/verify_cleanup.mjs`）：页面标题为「AI-Meeting · 多 AI 协同任务工作台」；首屏、
-  新建会话弹窗、设置面板的旧词命中数均为 0；词典 204 条旧词命中 0；服务页显示「进行中任务 / 重启服务 / 停止服务」；
+  新建会话弹窗、设置面板的旧词命中数均为 0；词典 206 条旧词命中 0；服务页显示「进行中任务 / 重启服务 / 停止服务」；
   重启与停止确认文案含「已取消」「任务卡片」、不含「恢复讨论」。截图 `/tmp/aim-verify-cleanup.png`。
 
 ## 独立复核与修复记录（2026-11-11 晚）
@@ -173,7 +173,7 @@ node /tmp/verify_cleanup.mjs   # 旧文案 / 旧字段 / 设置三部分 / 确�
 回归：`Ran 51 tests in 3.0s — OK`（新增 10 项：交叉协作不死锁、取消拒绝终态、失败任务取消不篡改、
 交付需先执行成功、单任务 part_a 闭环、重试带补充约束、取消标记单次有效、等待超时改判失败、超时属终态、重跑失败不残留上一轮内容）。
 `py_compile app.py core/*.py tests/*.py`、`node --check static/js/app.js` 通过；
-CDP 界面验证 `verify_ui.mjs` / `verify_cleanup.mjs` 全项通过（词典 204 条、旧词 0 命中）。
+CDP 界面验证 `verify_ui.mjs` / `verify_cleanup.mjs` 全项通过（词典 206 条、旧词 0 命中）。
 
 7. **遗留项收尾（第三轮）**：
    - 「超时」原先只存在于成员状态，单任务超时会写出第 6 种任务状态却不在 `FINAL_TASK_STATES` 里，
@@ -184,3 +184,17 @@ CDP 界面验证 `verify_ui.mjs` / `verify_cleanup.mjs` 全项通过（词典 20
      （`test_rerun_exec_failure_does_not_keep_previous_round`）。
    - `part_a.final.changed_files` 装的是全部产物路径，与字段名和 6.2 的「终版改动说明」都不符，且无人读取。
      → 从代码与设计文档 7 的数据结构里一并移除，产物清单以 `part_a.artifacts` 为准。
+
+8. **边缘项收尾（第四轮，agy 复审提出）**：
+   - 排队中被取消的任务原本也会写 `CANCELLED_KEYS`，但它已从队列摘除、不会再进入执行单元，
+     标记无人消费，只会在进程级集合里长期留一个字符串。→ 只有真正起过执行的任务才写标记
+     （`test_cancel_queued_task_syncs_message` 增加断言）。
+   - `MEMBER_WAIT_SECONDS` 上方还留着「超时则照常执行」的旧注释，与实现（超时不执行、标失败可重试）相反，
+     已改为与实现一致的说明。
+   - 协助成员已停用或缺 CLI 时，原先只在审核环节落一个「成员不可用」，主创仍白跑一轮。
+     → `parse_collab` 在解析阶段就拒绝（主创与协助成员一视同仁），`api_validate_collab` 与提交走同一套判定；
+     前端输入提示同步检查 `enabled` 与 `cli_cmd`，输入时就给「协助成员 HY4 已停用或缺少 CLI 配置」，
+     不再显示「格式正确」后再失败（`test_disabled_reviewer_is_rejected_before_submit`、
+     `test_reviewer_without_cli_is_rejected`、`test_disabled_owner_is_rejected`；CDP 实测提示文案正确，词典 206 条）。
+
+回归：`Ran 54 tests in 3.0s — OK`。

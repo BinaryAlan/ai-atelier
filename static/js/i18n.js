@@ -194,6 +194,8 @@ window.AIM_I18N = {
     "缺少协助成员：主创之后至少再指定一位协助成员": "Missing reviewer: specify at least one reviewer after the owner",
     "请写上任务内容": "Please add a task description",
     "格式正确：将发起一轮协助任务": "Valid format: one collaborative round will start",
+    "主创 {name} 已停用或缺少 CLI 配置：请先在设置里启用": "Owner {name} is disabled or has no CLI command — enable it in Settings first",
+    "协助成员 {name} 已停用或缺少 CLI 配置：请先在设置里启用": "Reviewer {name} is disabled or has no CLI command — enable it in Settings first",
     "输入任务：@ 一位成员，或 /collab @主创 @协助成员 任务内容… (Enter 发送)": "Enter a task: @ a member, or /collab @owner @reviewer task… (Enter to send)",
     "用 @ 把任务交给一位成员，或用 /collab 发起协助任务": "Assign a task with @, or start a collaborative task with /collab",
     "/collab @主创 @协助成员 任务内容；结果会落在右侧工作目录": "/collab @owner @reviewer task description; output goes to the workspace on the right",

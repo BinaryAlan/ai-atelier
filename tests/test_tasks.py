@@ -230,6 +230,37 @@ class TestCollabParsing(TaskCase):
         self.assertEqual(len(session["messages"]), 1)
         self.assertEqual(session["messages"][0]["sender"], "user")
 
+    def test_disabled_reviewer_is_rejected_before_submit(self):
+        # 协助成员停用时就该拦在输入阶段：否则任务照样发起，审核环节才落一个「成员不可用」
+        for emp in self.settings["employees"]:
+            if emp["id"] == "emp_hy4":
+                emp["enabled"] = False
+        parsed = T.parse_collab("/collab @agy @DS4 @HY4 写方案", self.settings)
+        self.assertFalse(parsed["ok"])
+        self.assertIn("HY4", parsed["error"])
+        self.assertIn("停用", parsed["error"])
+        # 被点名的协助成员中只要有一位不可用就不创建任务
+        result = self._submit("/collab @agy @DS4 @HY4 写方案")
+        self.assertTrue(result.get("validation_error"))
+        self.assertIn("HY4", result["error"])
+        self.assertEqual(len(self.store.get_session("s1")["tasks"]), 0)
+
+    def test_reviewer_without_cli_is_rejected(self):
+        for emp in self.settings["employees"]:
+            if emp["id"] == "emp_ds4":
+                emp["cli_cmd"] = ""
+        parsed = T.parse_collab("/collab @agy @DS4 写方案", self.settings)
+        self.assertFalse(parsed["ok"])
+        self.assertIn("DS4", parsed["error"])
+
+    def test_disabled_owner_is_rejected(self):
+        for emp in self.settings["employees"]:
+            if emp["id"] == "emp_agy":
+                emp["enabled"] = False
+        parsed = T.parse_collab("/collab @agy @DS4 写方案", self.settings)
+        self.assertFalse(parsed["ok"])
+        self.assertIn("主创", parsed["error"])
+
 
 class TestTaskCreation(TaskCase):
     def test_single_task_structure(self):
@@ -736,6 +767,8 @@ class TestRegressions(TaskCase):
                if m.get("kind") == "task_result" and m.get("task_id") == r2["task_id"]][0]
         self.assertEqual(msg["status"], T.STATUS_CANCELLED)
         self.assertEqual(session["task_queues"]["emp_agy"], [r1["task_id"]])
+        # 排队中被取消：没有进程可杀，也不该在进程级集合里留一个没人消费的标记
+        self.assertNotIn(f"s1:{r2['task_id']}:exec:emp_agy", T.CANCELLED_KEYS)
         gate.set()
         self._wait(r1["task_id"])
         self.manager.wait_idle()

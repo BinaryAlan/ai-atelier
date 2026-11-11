@@ -206,34 +206,44 @@ createApp({
         t.status === "running" || t.status === "queued" || inflight(t)
       ));
     },
-    // 输入时的 /collab 严格校验：主创 + 至少一位协助成员 + 任务内容
+    // 输入时的 /collab 严格校验：主创 + 至少一位协助成员 + 任务内容 + 成员可用
     collabHint() {
       const text = (this.inputContent || "").trim();
       if (!/^\/collab(\s|$)/i.test(text)) return null;
       const rest = text.replace(/^\/collab\s*/i, "").trim();
-      const aliases = (this.settings.employees || [])
-        .flatMap(e => {
-          const name = String(e.name || "");
-          const short = (name.match(/[（(][^（）()]+[）)]/g) || []).map(s => s.slice(1, -1));
-          return [name, String(e.id || ""), ...short];
-        })
-        .filter(Boolean)
-        .sort((a, b) => b.length - a.length);
-      let mentions = 0;
+      const pool = (this.settings.employees || []).map(e => {
+        const name = String(e.name || "");
+        const short = (name.match(/[（(][^（）()]+[）)]/g) || []).map(s => s.slice(1, -1));
+        const aliases = [name, String(e.id || ""), ...short].filter(Boolean)
+          .sort((a, b) => b.length - a.length);
+        return { emp: e, aliases };
+      });
+      const picked = [];
       let cursor = 0;
       while (true) {
         const rawTail = rest.slice(cursor);
         const tail = rawTail.trimStart();
         if (!tail.startsWith("@")) break;
-        const alias = aliases.find(n => tail.startsWith("@" + n));
-        if (!alias) break;
-        mentions += 1;
+        const hit = pool.find(m => m.aliases.some(n => tail.startsWith("@" + n)));
+        if (!hit) break;
+        const alias = hit.aliases.find(n => tail.startsWith("@" + n));
+        picked.push(hit.emp);
         cursor += (rawTail.length - rawTail.trimStart().length) + alias.length + 1;
       }
       const goal = rest.slice(cursor).trim();
-      if (mentions === 0) return { ok: false, text: this.t("缺少主创：请用 /collab @主创 @协助成员 任务内容") };
-      if (mentions < 2) return { ok: false, text: this.t("缺少协助成员：主创之后至少再指定一位协助成员") };
+      if (picked.length === 0) return { ok: false, text: this.t("缺少主创：请用 /collab @主创 @协助成员 任务内容") };
+      if (picked.length < 2) return { ok: false, text: this.t("缺少协助成员：主创之后至少再指定一位协助成员") };
       if (!goal) return { ok: false, text: this.t("请写上任务内容") };
+      // 停用或缺 CLI 的成员在这里就提示：否则格式看着正确，发出去才在审核环节变成「成员不可用」
+      const usable = e => e && e.enabled !== false && String(e.cli_cmd || "").trim() !== "";
+      const label = e => String(e.name || e.id || "");
+      if (!usable(picked[0])) {
+        return { ok: false, text: this.t("主创 {name} 已停用或缺少 CLI 配置：请先在设置里启用", { name: label(picked[0]) }) };
+      }
+      const unusable = picked.slice(1).filter(e => !usable(e));
+      if (unusable.length) {
+        return { ok: false, text: this.t("协助成员 {name} 已停用或缺少 CLI 配置：请先在设置里启用", { name: unusable.map(label).join("、") }) };
+      }
       return { ok: true, text: this.t("格式正确：将发起一轮协助任务") };
     },
     // 卡片弹窗里的「历次执行记录」：取消 / 重试产生的旧记录也保留，可按记录查看完整输入与原始输出
