@@ -97,11 +97,18 @@ class FakeRunner:
         self.killed = set()
         self.fail_for = []
         self.empty_for = []
+        # 每位成员同时在跑的调用数（不变量：任意成员永远不超过 1）
+        self.per_member = {}
+        self.max_per_member = {}
 
     def __call__(self, employee, prompt, session_id, workspace_dir):
         with self.lock:
             self.active += 1
             self.max_active = max(self.max_active, self.active)
+            member = employee.get("id")
+            live = self.per_member.get(member, 0) + 1
+            self.per_member[member] = live
+            self.max_per_member[member] = max(self.max_per_member.get(member, 0), live)
             self.calls.append({
                 "employee": dict(employee),
                 "prompt": prompt,
@@ -139,6 +146,8 @@ class FakeRunner:
         finally:
             with self.lock:
                 self.active -= 1
+                member = employee.get("id")
+                self.per_member[member] = self.per_member.get(member, 1) - 1
 
 
 class TaskCase(unittest.TestCase):
@@ -459,10 +468,27 @@ class TestCancelRetry(TaskCase):
         self.manager.wait_idle()
 
     def test_cancel_one_reviewer_does_not_stop_delivery(self):
-        self.runner.review_barrier = threading.Barrier(2)
+        # 让 DS4 的审核真的停在「进行中」，再取消（直接点太快会撞上「已结束不能取消」）
+        gate = threading.Event()
+        original = self.runner
+
+        def gated(employee, prompt, session_id, workspace_dir):
+            if ":review:emp_ds4" in session_id:
+                original.gates.setdefault(session_id, gate)
+            return original(employee, prompt, session_id, workspace_dir)
+
+        self.manager.runner = gated
         result = self._submit("/collab @agy @DS4 @HY4 写方案")
-        self._wait_calls(3, timeout=6)
-        self.manager.cancel("s1", result["task_id"], T.STAGE_REVIEW, "emp_ds4")
+        deadline = time.time() + 6
+        while time.time() < deadline:
+            task = self._task(result["task_id"])
+            if any(i["member_id"] == "emp_ds4" and i["status"] == T.MEMBER_IN_PROGRESS
+                   for i in task["part_b"]):
+                break
+            time.sleep(0.02)
+        out = self.manager.cancel("s1", result["task_id"], T.STAGE_REVIEW, "emp_ds4")
+        self.assertTrue(out["ok"])
+        gate.set()
         task = self._wait(result["task_id"])
         self.assertEqual(task["status"], T.STATUS_DELIVERED)
         statuses = {i["member_id"]: i["status"] for i in task["part_b"]}
@@ -511,11 +537,16 @@ class TestCancelRetry(TaskCase):
         self.manager.wait_idle()
 
     def test_retry_review_only_updates_that_member(self):
+        # 审核失败 → 重试该成员：只更新这一位，不重做交付
+        self.runner.fail_for = [":review:emp_ds4"]
         result = self._submit("/collab @agy @DS4 @HY4 写方案")
         self._wait(result["task_id"])
         with self.runner.lock:
             before_deliver = len([c for c in self.runner.calls if ":deliver:" in c["key"]])
-        self.manager.retry("s1", result["task_id"], T.STAGE_REVIEW, "emp_ds4")
+        self.runner.fail_for = []
+        retry = self.manager.retry("s1", result["task_id"], T.STAGE_REVIEW, "emp_ds4")
+        self.assertTrue(retry["ok"])
+        # 重试必须真的跑起来（旧实现里重试线程会等自己空闲，永久卡住）
         deadline = time.time() + 6
         while time.time() < deadline:
             with self.runner.lock:
@@ -526,9 +557,15 @@ class TestCancelRetry(TaskCase):
             time.sleep(0.02)
         with self.runner.lock:
             after_deliver = len([c for c in self.runner.calls if ":deliver:" in c["key"]])
+            reviews = len([c for c in self.runner.calls if ":review:emp_ds4" in c["key"]])
+        self.assertEqual(reviews, 2)
         self.assertEqual(after_deliver, before_deliver)  # 不自动重做交付
         task = self._task(result["task_id"])
         self.assertEqual(task["status"], T.STATUS_DELIVERED)
+        self.assertEqual(
+            next(i["status"] for i in task["part_b"] if i["member_id"] == "emp_ds4"),
+            T.STATUS_DONE,
+        )
         self.manager.wait_idle()
 
     def test_history_records_preserved_after_retry(self):
@@ -615,6 +652,288 @@ class TestRecoveryAndProtocol(TaskCase):
         self.assertEqual(parsed["artifacts"], [])
 
 
+class TestRegressions(TaskCase):
+    """复核阶段发现并修掉的几处缺陷，防止回归。"""
+
+    def _wait_status(self, tid, status, timeout=6):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if (self._task(tid) or {}).get("status") == status:
+                return True
+            time.sleep(0.02)
+        return False
+
+    def test_retry_single_reruns_single_stage(self):
+        # 单任务重试必须走单任务路径：结果消息要更新，且不该多跑一次交付环节
+        self.runner.fail_for = [":exec:"]
+        result = self._submit("@agy 做一件事")
+        tid = result["task_id"]
+        self._wait(tid)
+        self.runner.fail_for = []
+        self.manager.retry("s1", tid, T.STAGE_EXEC)
+        self._wait_calls(2)
+        self.assertTrue(self._wait_status(tid, T.STATUS_DELIVERED))
+        session = self.store.get_session("s1")
+        msg = [m for m in session["messages"] if m.get("kind") == "task_result"][0]
+        self.assertEqual(msg["status"], T.STATUS_DELIVERED)
+        self.assertTrue(msg["content"])
+        self.assertTrue(msg["raw_response"])
+        with self.runner.lock:
+            stages = [c["key"].split(":")[2] for c in self.runner.calls]
+        self.assertEqual(stages, ["exec", "exec"])
+        self.assertEqual(self._task(tid)["part_a"].get("final"), {})
+        self.manager.wait_idle()
+
+    def test_recover_cancels_inflight_stages(self):
+        # 审核进行中服务重启：环节状态要一起转已取消，否则卡片上的位置既不能取消也不能重试
+        gate = threading.Event()
+        original = self.runner
+
+        def gated(employee, prompt, session_id, workspace_dir):
+            if ":review:" in session_id:
+                original.gates.setdefault(session_id, gate)
+            return original(employee, prompt, session_id, workspace_dir)
+
+        self.manager.runner = gated
+        result = self._submit("/collab @agy @DS4 @HY4 写方案")
+        tid = result["task_id"]
+        deadline = time.time() + 6
+        while time.time() < deadline:
+            task = self._task(tid)
+            if any(i["status"] == T.MEMBER_IN_PROGRESS for i in task["part_b"]):
+                break
+            time.sleep(0.02)
+        self.assertEqual(self.manager.recover_on_startup(), 1)
+        task = self._task(tid)
+        self.assertEqual(task["status"], T.STATUS_CANCELLED)
+        # 执行环节早已完成，不该被改写；只有进行中的审核位置转已取消
+        self.assertEqual(task["part_a"]["status"], T.STATUS_DONE)
+        self.assertTrue(all(i["status"] == T.STATUS_CANCELLED for i in task["part_b"]))
+        # 被中断的审核位置重新可重试（旧实现会一直卡在「进行中」，返回「当前环节不需要重试」）
+        self.assertTrue(self.manager.retry("s1", tid, T.STAGE_REVIEW, "emp_ds4")["ok"])
+        gate.set()
+        self.manager.wait_idle()
+
+    def test_cancel_queued_task_syncs_message(self):
+        # 排队中被取消的单任务：消息不能永远停在「排队中」，队列里也不该留死条目
+        gate = threading.Event()
+        original = self.runner
+
+        def gated(employee, prompt, session_id, workspace_dir):
+            original.gates.setdefault(session_id, gate)
+            return original(employee, prompt, session_id, workspace_dir)
+
+        self.manager.runner = gated
+        r1 = self._submit("@agy 第一件")
+        r2 = self._submit("@agy 第二件")
+        self._wait_calls(1)
+        self.assertTrue(self.manager.cancel("s1", r2["task_id"], T.STAGE_EXEC)["ok"])
+        session = self.store.get_session("s1")
+        msg = [m for m in session["messages"]
+               if m.get("kind") == "task_result" and m.get("task_id") == r2["task_id"]][0]
+        self.assertEqual(msg["status"], T.STATUS_CANCELLED)
+        self.assertEqual(session["task_queues"]["emp_agy"], [r1["task_id"]])
+        gate.set()
+        self._wait(r1["task_id"])
+        self.manager.wait_idle()
+
+    def test_review_and_queue_task_do_not_overlap(self):
+        # 同一成员串行：成员在审核时，派给它的队列任务要等审核结束再执行
+        gate = threading.Event()
+        original = self.runner
+
+        def gated(employee, prompt, session_id, workspace_dir):
+            if ":review:emp_ds4" in session_id:
+                original.gates.setdefault(session_id, gate)
+            return original(employee, prompt, session_id, workspace_dir)
+
+        self.manager.runner = gated
+        r1 = self._submit("/collab @agy @DS4 写方案")
+        self._wait_calls(2)  # 主创执行 + DS4 审核都已进入
+        r2 = self._submit("@DS4 另外做一份")
+        time.sleep(0.3)
+        with self.runner.lock:
+            ds4_exec = [c for c in self.runner.calls
+                        if ":exec:emp_ds4" in c["key"]]
+        self.assertEqual(ds4_exec, [])  # 审核还没结束，队列任务不得开跑
+        gate.set()
+        self.assertEqual(self._wait(r1["task_id"])["status"], T.STATUS_DELIVERED)
+        self.assertEqual(self._wait(r2["task_id"])["status"], T.STATUS_DELIVERED)
+        self.manager.wait_idle()
+
+
+class TestPromptContext(unittest.TestCase):
+    """会话背景：最近若干条 + 更早的进展摘要，不进系统播报与环节记录。"""
+
+    def _msg(self, i, sender, content, **kw):
+        data = {
+            "id": f"m_{i}", "sender": sender, "sender_name": sender,
+            "content": content, "in_chat": True,
+        }
+        data.update(kw)
+        return data
+
+    def test_recent_messages_fill_context(self):
+        messages = [self._msg(i, "user" if i % 2 == 0 else "emp_agy", f"第 {i} 条") for i in range(12)]
+        context = T.build_context(messages)
+        self.assertEqual(len(context["messages"]), T.CONTEXT_MAX_MSGS)
+        self.assertEqual(context["messages"][-1]["content"], "第 11 条")
+        self.assertEqual(context["dropped"], 4)
+        self.assertTrue(context["summary"])
+
+    def test_context_skips_system_and_records(self):
+        messages = [
+            self._msg(1, "user", "背景一"),
+            self._msg(2, "system", "服务重启", kind="task_card"),
+            self._msg(3, "emp_ds4", "环节记录", in_chat=False, kind="task_record"),
+            self._msg(4, "user", "背景二"),
+        ]
+        context = T.build_context(messages)
+        contents = [m["content"] for m in context["messages"]]
+        self.assertEqual(contents, ["背景一", "背景二"])
+
+    def test_current_message_is_not_duplicated(self):
+        messages = [self._msg(1, "user", "上一句"), self._msg(2, "user", "这一句")]
+        context = T.build_context(messages, "m_2")
+        self.assertEqual([m["content"] for m in context["messages"]], ["上一句"])
+
+    def test_prompt_contains_context_section(self):
+        context = T.build_context([
+            self._msg(1, "user", "先看这段背景"),
+            self._msg(2, "emp_agy", "背景的结论是 X"),
+        ])
+        prompt = T.build_prompt(T.STAGE_EXEC, "接着做", T.TYPE_SINGLE, context=context)
+        self.assertIn("【会话背景", prompt)
+        self.assertIn("先看这段背景", prompt)
+        self.assertIn("背景的结论是 X", prompt)
+        # 用户原话仍然单独成段
+        self.assertIn("【用户原话】\n接着做", prompt)
+
+
+class TestBusinessInvariants(TaskCase):
+    """按业务不变量回归（business-code-review）：
+
+    I2 同一成员任意时刻只有一个进程；I3 终态不可逆；I5 不存在无法脱身的停留态；
+    I6 任务 / 消息 / 卡片口径一致；I7 交付只在执行成功之后。
+    """
+
+    def test_crossed_collab_tasks_do_not_deadlock(self):
+        # A：主创 agy / 审核 DS4；B：主创 DS4 / 审核 agy —— 早期实现会互等对方占用的成员
+        r1 = self._submit("/collab @agy @DS4 做方案A")
+        r2 = self._submit("/collab @DS4 @agy 做方案B")
+        t1 = self._wait(r1["task_id"], timeout=8)
+        t2 = self._wait(r2["task_id"], timeout=8)
+        self.assertEqual(t1["status"], T.STATUS_DELIVERED)
+        self.assertEqual(t2["status"], T.STATUS_DELIVERED)
+        self.assertTrue(all(v <= 1 for v in self.runner.max_per_member.values()),
+                        self.runner.max_per_member)
+        self.manager.wait_idle()
+
+    def test_cancel_is_rejected_on_finished_task(self):
+        result = self._submit("/collab @agy @DS4 写方案")
+        self._wait(result["task_id"])
+        out = self.manager.cancel("s1", result["task_id"], T.STAGE_EXEC)
+        self.assertEqual(out.get("code"), "task_finished")
+        task = self._task(result["task_id"])
+        self.assertEqual(task["status"], T.STATUS_DELIVERED)
+        self.assertEqual(task["part_a"]["status"], T.STATUS_DONE)
+        self.assertTrue(task["artifacts"])
+
+    def test_cancel_failed_task_keeps_failure(self):
+        self.runner.fail_for = [":exec:"]
+        result = self._submit("@agy 做一件事")
+        self._wait(result["task_id"])
+        out = self.manager.cancel("s1", result["task_id"], T.STAGE_EXEC)
+        self.assertEqual(out.get("code"), "task_finished")
+        task = self._task(result["task_id"])
+        msg = [m for m in self.store.get_session("s1")["messages"]
+               if m.get("kind") == "task_result"][0]
+        self.assertEqual(task["status"], T.STATUS_FAILED)
+        self.assertEqual(msg["status"], T.STATUS_FAILED)  # 三处口径一致
+
+    def test_deliver_retry_requires_successful_exec(self):
+        self.runner.fail_for = [":exec:"]
+        result = self._submit("/collab @agy @DS4 写方案")
+        self._wait(result["task_id"])
+        out = self.manager.retry("s1", result["task_id"], T.STAGE_DELIVER)
+        self.assertIn("error", out)
+        self.assertEqual(self._task(result["task_id"])["status"], T.STATUS_FAILED)
+        with self.runner.lock:
+            self.assertEqual(len([c for c in self.runner.calls if ":deliver:" in c["key"]]), 0)
+
+    def test_single_task_closes_part_a_and_recover_ignores_finished(self):
+        result = self._submit("@agy 做一件事")
+        task = self._wait(result["task_id"])
+        self.assertEqual(task["part_a"]["status"], T.STATUS_DELIVERED)
+        self.manager.recover_on_startup()
+        task = self._task(result["task_id"])
+        self.assertEqual(task["part_a"]["status"], T.STATUS_DELIVERED)
+        self.assertFalse(any("服务重启" in f["text"] for f in task["flow"]))
+
+    def test_retry_carries_later_user_constraints(self):
+        self.runner.fail_for = [":exec:"]
+        result = self._submit("@agy 写一份季度总结")
+        self._wait(result["task_id"])
+        self._submit("补充：数据用 2026 Q3 的")  # 没点名：只作为上下文保留
+        self.runner.fail_for = []
+        self.assertTrue(self.manager.retry("s1", result["task_id"], T.STAGE_EXEC)["ok"])
+        self._wait(result["task_id"])
+        with self.runner.lock:
+            prompt = [c for c in self.runner.calls if ":exec:" in c["key"]][-1]["prompt"]
+        self.assertIn("2026 Q3", prompt)
+        self.assertIn("【用户原话】\n@agy 写一份季度总结", prompt)  # 原话不重复进背景
+
+    def test_cancel_flag_lives_only_for_one_attempt(self):
+        gate = threading.Event()
+        original = self.runner
+
+        def gated(employee, prompt, session_id, workspace_dir):
+            original.gates.setdefault(session_id, gate)
+            return original(employee, prompt, session_id, workspace_dir)
+
+        self.manager.runner = gated
+        result = self._submit("@agy 做一件事")
+        self._wait_calls(1)
+        self.manager.cancel("s1", result["task_id"], T.STAGE_EXEC)
+        gate.set()
+        self.manager.wait_idle()  # 等这次执行真正收尾（清理标记与落库在同一段）
+        self._wait(result["task_id"])
+        self.assertNotIn(f"s1:{result['task_id']}:exec:emp_agy", T.CANCELLED_KEYS)
+
+    def test_member_wait_timeout_fails_instead_of_running_concurrently(self):
+        # DS4 手上有长任务，另一任务的审核需要 DS4：等不到就标失败可重试，绝不并发开两个进程
+        gate = threading.Event()
+        original = self.runner
+
+        def gated(employee, prompt, session_id, workspace_dir):
+            if ":exec:emp_ds4" in session_id:
+                original.gates.setdefault(session_id, gate)
+            return original(employee, prompt, session_id, workspace_dir)
+
+        self.manager.runner = gated
+        self.manager.MEMBER_WAIT_SECONDS = 0.6
+        long_task = self._submit("@DS4 长任务")
+        self._wait_calls(1)
+        reviewed = self._submit("/collab @agy @DS4 写方案")
+        deadline = time.time() + 6
+        while time.time() < deadline:
+            item = next(i for i in self._task(reviewed["task_id"])["part_b"]
+                        if i["member_id"] == "emp_ds4")
+            if item["status"] == T.STATUS_FAILED:
+                break
+            time.sleep(0.02)
+        item = next(i for i in self._task(reviewed["task_id"])["part_b"]
+                    if i["member_id"] == "emp_ds4")
+        self.assertEqual(item["status"], T.STATUS_FAILED)
+        self.assertIn("等待该成员空闲超时", item["summary"])
+        self.assertTrue(all(v <= 1 for v in self.runner.max_per_member.values()),
+                        self.runner.max_per_member)
+        gate.set()
+        self._wait(long_task["task_id"])
+        self._wait(reviewed["task_id"])
+        self.manager.wait_idle()
+
+
 class TestHttpApi(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -665,15 +984,16 @@ class TestHttpApi(unittest.TestCase):
                 break
             time.sleep(0.02)
 
+        # 已交付任务：取消必须被拒（终态不可逆），重新生成交付内容应放行
         cancelled = self.client.post(
             f"/api/sessions/{sid}/tasks/{tid}/cancel", json={"stage": "exec"}
         )
-        self.assertEqual(cancelled.status_code, 200)
+        self.assertEqual(cancelled.status_code, 409)
+        self.assertEqual(cancelled.get_json().get("code"), "task_finished")
         retried = self.client.post(
             f"/api/sessions/{sid}/tasks/{tid}/retry", json={"stage": "exec"}
         )
-        self.assertEqual(retried.status_code, 200)
-        self.assertTrue(retried.get_json()["ok"])
+        self.assertEqual(retried.status_code, 400)
 
 
 if __name__ == "__main__":

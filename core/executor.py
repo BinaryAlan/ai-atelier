@@ -200,6 +200,27 @@ class Executor:
         return killed_any
 
     @staticmethod
+    def kill_session_processes(session_id: str) -> int:
+        """
+        终止某会话名下的全部 CLI 进程：既包括以 session_id 为键的调用，
+        也包括任务系统的执行单元键（`{session_id}:{task_id}:{stage}:{member_id}`）。
+
+        删除会话时必须走这个入口：只按 session_id 精确匹配会漏掉正在执行的任务，
+        子进程会跑完、白烧 token，而且没人接收结果。
+        """
+        prefix = session_id + ":"
+        with _PROCESS_LOCK:
+            keys = [k for k in ACTIVE_PROCESSES if k == session_id or k.startswith(prefix)]
+        killed = 0
+        for key in keys:
+            try:
+                if Executor.kill_session_process(key):
+                    killed += 1
+            except Exception as e:
+                print(f"终止会话 {key} 的进程组失败:", e)
+        return killed
+
+    @staticmethod
     def kill_all_processes() -> int:
         """
         终止所有会话正在运行的 CLI 进程组（服务停止/重启前调用）。

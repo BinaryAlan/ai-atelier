@@ -195,7 +195,16 @@ createApp({
     },
     hasActiveTasks() {
       const tasks = this.currentSession?.tasks || {};
-      return Object.values(tasks).some(t => t && (t.status === "running" || t.status === "queued"));
+      // 任务终态之后仍可能有环节在跑（重试审核 / 重新生成交付）：这些状态下也要继续轮询，
+      // 否则点了「重试」关掉弹窗，卡片就停在「进行中」不再更新
+      const inflight = (t) => {
+        const a = t.part_a || {};
+        if (a.status === "in_progress" || a.final_status === "in_progress") return true;
+        return (t.part_b || []).some(i => i && i.status === "in_progress");
+      };
+      return Object.values(tasks).some(t => t && (
+        t.status === "running" || t.status === "queued" || inflight(t)
+      ));
     },
     // 输入时的 /collab 严格校验：主创 + 至少一位协助成员 + 任务内容
     collabHint() {
@@ -1135,8 +1144,17 @@ createApp({
         .map(t => `${t.task_id}:${t.status}:${t.step}:${(t.flow || []).length}`).join(",");
       const resultSig = msgs.filter(m => m.kind === "task_result")
         .map(m => `${m.id}:${m.status}`).join(",");
+      // 卡片签名要含各环节状态：审核陆续进入「进行中」时卡片与流水都可能不变，
+      // 漏掉这两项，界面就会在整个审核期间显示「等待」，直到完成才跳到「已完成」
+      const stageSig = (card) => {
+        if (!card) return "";
+        const a = card.part_a || {};
+        const b = (card.part_b || []).map(i => `${i.member_id}=${i.status}`).join("/");
+        return `${a.status}>${a.final_status}>${b}`;
+      };
       const cardSig = msgs.filter(m => m.kind === "task_card")
-        .map(m => `${m.id}:${(m.card && m.card.status) || ""}:${((m.card && m.card.flow) || []).length}`).join(",");
+        .map(m => `${m.id}:${(m.card && m.card.status) || ""}:${((m.card && m.card.flow) || []).length}:${stageSig(m.card)}`)
+        .join(",");
       const queueSig = Object.entries(s.task_queues || {})
         .map(([k, v]) => `${k}:${(v || []).length}`).join(",");
       return [taskSig, resultSig, cardSig, queueSig,

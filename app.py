@@ -304,7 +304,9 @@ def api_delete_session(session_id):
     if not is_valid_session_id(session_id):
         return jsonify({"error": "非法 session_id"}), 400
 
-    Executor.kill_session_process(session_id)
+    # 任务系统的执行键是 `{session_id}:{task_id}:{stage}:{member_id}`，
+    # 只按 session_id 精确匹配会漏杀正在执行的 CLI 子进程
+    Executor.kill_session_processes(session_id)
     success = delete_session(session_id)
     return jsonify({"success": success})
 
@@ -458,7 +460,8 @@ def api_cancel_task(session_id, tid):
     member_id = str(data.get("member_id") or "")
     result = task_manager.cancel(session_id, tid, stage, member_id)
     if result.get("error"):
-        return jsonify(result), 404
+        # 任务已结束 / 环节已结束 → 409（可重试的冲突），不是「找不到」
+        return jsonify(result), 409 if result.get("code") else 404
     return jsonify(result)
 
 

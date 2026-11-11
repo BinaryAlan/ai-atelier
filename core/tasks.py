@@ -44,6 +44,10 @@ STATUS_DONE = "done"
 MEMBER_WAITING = "waiting"
 MEMBER_IN_PROGRESS = "in_progress"
 
+# 等不到成员空闲时的处理：不执行、把环节标成失败并允许重试。
+# 早期实现是「超时就照跑」，那会让同一成员同时跑两个 CLI 进程、并发写同一工作目录。
+MEMBER_BUSY_SUMMARY = "等待该成员空闲超时，本次未执行；可稍后重试"
+
 FINAL_TASK_STATES = (STATUS_DELIVERED, STATUS_CANCELLED, STATUS_FAILED)
 RETRYABLE_STATES = (STATUS_FAILED, STATUS_CANCELLED, STATUS_TIMEOUT, STATUS_NO_OPINION)
 
@@ -181,6 +185,89 @@ ROLE_FILES = {
     STAGE_REVIEW: "roles/reviewer.md",
 }
 
+# 会话背景的预算：最近 8 条、单条 600 字、合计 3000 字。
+# 成员每次都是一个新的 CLI 子进程（无状态），所以「带多少历史」完全由这里决定：
+# 全量历史既不必要也太贵，按主流 agent 的做法取「最近若干条 + 更早的摘要 + 产物指针」。
+CONTEXT_MAX_MSGS = 8
+CONTEXT_MSG_CHARS = 600
+CONTEXT_TOTAL_CHARS = 3000
+CONTEXT_SUMMARY_CHARS = 400
+
+
+def _truncate(text: Any, limit: int) -> str:
+    text = str(text or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + "…"
+
+
+def context_eligible(msg: Any) -> bool:
+    """能不能进「会话背景」：系统播报、任务卡片、各环节执行记录都不进。
+
+    `in_chat: false` 的环节记录是给审计和「历次执行记录」看的，塞进背景只会挤占预算。
+    """
+    if not isinstance(msg, dict):
+        return False
+    if msg.get("in_chat") is False:
+        return False
+    if msg.get("kind") in ("task_card", "task_record"):
+        return False
+    if msg.get("sender") == "system":
+        return False
+    return bool(str(msg.get("content") or "").strip())
+
+
+def build_context(
+    messages: Optional[List[Dict[str, Any]]],
+    current_msg_id: str = "",
+    include_after: bool = False,
+) -> Dict[str, Any]:
+    """把会话消息压成一段合格的上下文：最近若干条 + 被截断部分的进展摘要。
+
+    返回 {"messages": [{"name","content"}], "dropped": int, "summary": str}。
+    默认只取当前这条用户消息之前的消息，避免把「用户原话」重复两遍。
+
+    include_after=True 时保留这条消息之后的全部消息（仍然排除它自己）：
+    重试沿用的是最初的用户原话，但那之后用户补充的约束必须一起带上，
+    否则「点重试」等于按旧输入再烧一次 token。
+    """
+    eligible = [m for m in (messages or []) if context_eligible(m)]
+    idx = None
+    if current_msg_id:
+        for i, msg in enumerate(eligible):
+            if msg.get("id") == current_msg_id:
+                idx = i
+                break
+    if idx is None:
+        before = eligible
+    elif include_after:
+        before = [m for i, m in enumerate(eligible) if i != idx]
+    else:
+        before = eligible[:idx]
+
+    # 从新到旧取，超总预算就丢弃更早的
+    picked: List[Dict[str, str]] = []
+    total = 0
+    for msg in reversed(before[-CONTEXT_MAX_MSGS:]):
+        content = _truncate(msg.get("content"), CONTEXT_MSG_CHARS)
+        if picked and total + len(content) > CONTEXT_TOTAL_CHARS:
+            break
+        picked.append({
+            "name": "我" if msg.get("sender") == "user" else str(msg.get("sender_name") or msg.get("sender") or "成员"),
+            "content": content,
+        })
+        total += len(content)
+    picked.reverse()
+
+    dropped = before[:len(before) - len(picked)]
+    summary = ""
+    if dropped:
+        # 复用成员已经产出过的内容当摘要，不额外调一次模型
+        produced = [m for m in dropped if m.get("sender") not in ("user", "system")]
+        if produced:
+            summary = _truncate(produced[-1].get("content"), CONTEXT_SUMMARY_CHARS)
+    return {"messages": picked, "dropped": len(dropped), "summary": summary}
+
 
 def build_prompt(
     stage: str,
@@ -190,8 +277,12 @@ def build_prompt(
     opinions: Optional[List[Dict[str, Any]]] = None,
     workspace_dir: str = "",
     quoted: str = "",
+    context: Optional[Dict[str, Any]] = None,
 ) -> str:
-    """拼装某环节的完整输入；规程文件随软件提供，服务端读取后注入。"""
+    """拼装某环节的完整输入；规程文件随软件提供，服务端读取后注入。
+
+    context 见 build_context()：会话背景 + 产物清单一起构成规格 4.2 的「会话背景、产物索引」。
+    """
     if stage == STAGE_REVIEW:
         role_key = STAGE_REVIEW
         stage_label = "协助审核（只读）"
@@ -208,6 +299,14 @@ def build_prompt(
     parts = [_read_protocol("protocol/task-flow.md"), _read_protocol(ROLE_FILES[role_key])]
     parts.append(f"【当前环节】{stage_label}")
     parts.append(f"【工作目录】{workspace_dir or '（未指定）'}")
+    if context and context.get("messages"):
+        head = f"【会话背景（最近 {len(context['messages'])} 条）】"
+        if context.get("dropped"):
+            head = f"【会话背景（最近 {len(context['messages'])} 条，更早的 {context['dropped']} 条已省略）】"
+        lines = [f"[{item['name']}] {item['content']}" for item in context["messages"]]
+        if context.get("summary"):
+            lines.append(f"更早的进展：{context['summary']}")
+        parts.append(head + "\n" + "\n".join(lines))
     parts.append(f"【用户原话】\n{goal}")
     if quoted:
         parts.append(f"【被引用的原话】\n{quoted}")
@@ -328,8 +427,15 @@ class TaskManager:
         self._lock = threading.RLock()
         self._cond = threading.Condition(self._lock)
         self._workers: Dict[Tuple[str, str], threading.Thread] = {}
+        # 每成员「正在执行」的占用标记：队列任务与审核、重试都要先占用它，保证同一成员串行
         self._busy: Dict[Tuple[str, str], bool] = {}
+        self._busy_owner: Dict[Tuple[str, str], int] = {}
+        self._busy_depth: Dict[Tuple[str, str], int] = {}
+        # worker 代号：队列空时用它确认「没有新的任务在我退出前入队」
+        self._gen: Dict[Tuple[str, str], int] = {}
         self._active_keys: Dict[str, Dict[str, Any]] = {}
+        # 正在重跑的环节：挡住连点两次「重试」造成的重复执行
+        self._retries: set = set()
 
     # ---------------- 会话读写小工具 ----------------
     def _get(self, sid: str) -> Optional[Dict[str, Any]]:
@@ -504,24 +610,28 @@ class TaskManager:
     def ensure_worker(self, sid: str, member_id: str) -> None:
         key = (sid, member_id)
         with self._lock:
+            # 每次呼叫都推进代号：正在退出的 worker 会看到代号变化，回去再查一次队列，
+            # 避免「它判断队列空了 → 新任务入队 → ensure_worker 看到线程还活着就不新开」导致任务永远排队
+            self._gen[key] = self._gen.get(key, 0) + 1
+            gen = self._gen[key]
             thread = self._workers.get(key)
             if thread and thread.is_alive():
                 return
             thread = threading.Thread(
-                target=self._worker_loop, args=(sid, member_id),
+                target=self._worker_loop, args=(sid, member_id, gen),
                 name=f"task-worker-{sid}-{member_id}", daemon=True,
             )
             self._workers[key] = thread
             thread.start()
 
-    def _worker_loop(self, sid: str, member_id: str) -> None:
+    def _worker_loop(self, sid: str, member_id: str, gen: int = 0) -> None:
         key = (sid, member_id)
         try:
             while True:
                 with self.store.session_lock(sid):
                     session = self._get(sid)
                     if not session:
-                        break
+                        return
                     ensure_task_fields(session)
                     queue = session["task_queues"].get(member_id) or []
                     tid = ""
@@ -536,26 +646,42 @@ class TaskManager:
                             if t in session["tasks"] and session["tasks"][t].get("status") not in FINAL_TASK_STATES
                         ]
                         self._save(session)
-                        break
-                    task = session["tasks"][tid]
-                    task["status"] = STATUS_RUNNING
-                    task["started_at"] = int(time.time())
-                    self._add_flow(task, f"{member_id} 开始执行")
-                    if task.get("result_msg_id"):
-                        self._update_message(session, task["result_msg_id"], {"status": STATUS_RUNNING})
-                    self._update_card(session, task)
-                    self._save(session)
 
-                self._mark_busy(sid, member_id, True)
-                try:
-                    self._run_task(sid, tid)
-                finally:
-                    self._mark_busy(sid, member_id, False)
+                if not tid:
+                    with self._lock:
+                        if self._gen.get(key, 0) != gen:
+                            # 退出前有人入队并呼叫了 ensure_worker，回去再查一次
+                            gen = self._gen[key]
+                            continue
+                        if self._workers.get(key) is threading.current_thread():
+                            self._workers.pop(key, None)
+                        return
+
+                # 队列任务之间由这个 worker 线程天然串行；与审核 / 重试的互斥改由
+                # 每个执行单元自己占用成员（见 _execute）。早期版本在这里持有主创占用直到
+                # 整个任务（含审核）结束，交叉协作（A 主创 agy/审 DS4 × B 主创 DS4/审 agy）
+                # 会互相等对方手里的成员，死锁到等待上限。
+                with self.store.session_lock(sid):
+                    session = self._get(sid)
+                    if not session:
+                        return
+                    task = (session.get("tasks") or {}).get(tid)
+                    started = bool(task and task.get("status") == STATUS_QUEUED)
+                    if started:
+                        task["status"] = STATUS_RUNNING
+                        task["started_at"] = int(time.time())
+                        self._add_flow(task, f"{member_id} 开始执行")
+                        if task.get("result_msg_id"):
+                            self._update_message(session, task["result_msg_id"], {"status": STATUS_RUNNING})
+                        self._update_card(session, task)
+                        self._save(session)
+                if started:
+                    self._run_task_safe(sid, tid)
 
                 with self.store.session_lock(sid):
                     session = self._get(sid)
                     if not session:
-                        break
+                        return
                     ensure_task_fields(session)
                     queue = session["task_queues"].get(member_id) or []
                     if tid in queue:
@@ -565,23 +691,52 @@ class TaskManager:
                         (session["tasks"].get(t) or {}).get("status") == STATUS_QUEUED for t in queue
                     )
                 if not has_more:
-                    break
+                    # 回到循环顶部走「队列为空」分支，那里有代号校验，不会被新入队的任务绕过
+                    continue
         finally:
             with self._lock:
                 if self._workers.get(key) is threading.current_thread():
                     self._workers.pop(key, None)
 
-    def _mark_busy(self, sid: str, member_id: str, busy: bool) -> None:
-        with self._cond:
-            self._busy[(sid, member_id)] = busy
-            if not busy:
-                self._cond.notify_all()
+    # 同一成员最多等这么久；超时则照常执行（宁可少见地不串行，也不要两个任务互相等成死锁）
+    MEMBER_WAIT_SECONDS = 1800
 
-    def _wait_member_idle(self, sid: str, member_id: str) -> None:
-        """审核不占用成员队列位置，但要等该成员当前任务跑完（串行）。"""
+    def _acquire_member(self, sid: str, member_id: str, timeout: Optional[float] = None) -> bool:
+        """占用某位成员（等待它空闲）。同一线程可重入，靠计数释放。"""
+        key = (sid, member_id)
+        ident = threading.get_ident()
+        deadline = time.time() + (self.MEMBER_WAIT_SECONDS if timeout is None else timeout)
         with self._cond:
-            while self._busy.get((sid, member_id)):
-                self._cond.wait(timeout=0.2)
+            if self._busy_owner.get(key) == ident:
+                self._busy_depth[key] = self._busy_depth.get(key, 1) + 1
+                return True
+            while self._busy.get(key):
+                remain = deadline - time.time()
+                if remain <= 0:
+                    # 绝不为了「不死锁」就并发起进程：同一成员两个 CLI 同时写同一工作目录
+                    # 会互相覆盖产物。放弃本次执行，由调用方把环节标成失败并允许重试。
+                    print(f"[TaskManager] 等 {member_id} 空闲超时，本次不执行")
+                    return False
+                self._cond.wait(timeout=min(0.2, remain))
+            self._busy[key] = True
+            self._busy_owner[key] = ident
+            self._busy_depth[key] = 1
+            return True
+
+    def _release_member(self, sid: str, member_id: str) -> None:
+        key = (sid, member_id)
+        ident = threading.get_ident()
+        with self._cond:
+            if self._busy_owner.get(key) != ident:
+                return
+            depth = self._busy_depth.get(key, 1) - 1
+            if depth > 0:
+                self._busy_depth[key] = depth
+                return
+            self._busy[key] = False
+            self._busy_depth.pop(key, None)
+            self._busy_owner.pop(key, None)
+            self._cond.notify_all()
 
     def wait_idle(self, timeout: float = 10.0) -> bool:
         """测试辅助：等所有执行单元结束。"""
@@ -594,6 +749,29 @@ class TaskManager:
         return False
 
     # ---------------- 任务执行 ----------------
+    def _run_task_safe(self, sid: str, tid: str) -> None:
+        """worker 里调用：异常不能让线程静默死掉、把任务永远留在「执行中」。"""
+        try:
+            self._run_task(sid, tid)
+        except Exception as exc:
+            print(f"[TaskManager] 任务 {tid} 执行异常: {exc}")
+            with self.store.session_lock(sid):
+                session = self._get(sid)
+                if not session:
+                    return
+                task = (session.get("tasks") or {}).get(tid)
+                if not task or task.get("status") != STATUS_RUNNING:
+                    return
+                task["status"] = STATUS_FAILED
+                task["finished_at"] = int(time.time())
+                self._add_flow(task, "执行异常，任务失败")
+                self._update_message(session, task.get("result_msg_id"), {
+                    "status": STATUS_FAILED,
+                    "content": f"执行异常：{exc}",
+                })
+                self._update_card(session, task)
+                self._save(session)
+
     def _run_task(self, sid: str, tid: str) -> None:
         with self.store.session_lock(sid):
             session = self._get(sid)
@@ -632,6 +810,9 @@ class TaskManager:
                 status = STATUS_TIMEOUT
             elif result.get("status") == STATUS_FAILED:
                 status = STATUS_FAILED
+            elif task.get("status") == STATUS_CANCELLED:
+                # 取消发生在「进程刚跑完、结果还没落库」的窗口里：以取消为准，终态不回退
+                status = STATUS_CANCELLED
             else:
                 status = STATUS_DELIVERED
             task["status"] = status
@@ -639,6 +820,9 @@ class TaskManager:
             task["artifacts"] = scan_artifacts(workspace_dir, result.get("artifacts") or [])
             task["part_a"]["brief"] = result.get("summary", "")
             task["part_a"]["artifacts"] = task["artifacts"]
+            # 单任务的 part_a 也要收尾，否则交付后仍停在 in_progress，
+            # 服务重启时会被恢复逻辑误判成「被中断的环节」
+            task["part_a"]["status"] = status
             self._add_flow(task, f"单任务{self._state_label(status)}")
             self._update_message(session, task.get("result_msg_id"), {
                 "content": result.get("summary", ""),
@@ -661,6 +845,9 @@ class TaskManager:
             if not task:
                 return False
             part_a = task.setdefault("part_a", {})
+            if not result.get("cancelled") and task.get("status") == STATUS_CANCELLED:
+                # 取消落在「进程已返回、结果未落库」的窗口：以取消为准，终态不回退
+                result = dict(result, cancelled=True)
             if result.get("cancelled"):
                 task["status"] = STATUS_CANCELLED
                 part_a["status"] = STATUS_CANCELLED
@@ -726,15 +913,12 @@ class TaskManager:
         self, sid: str, tid: str, member_id: str,
         settings: Dict[str, Any], workspace_dir: str,
     ) -> None:
-        self._wait_member_idle(sid, member_id)
-        self._mark_busy(sid, member_id, True)
-        try:
-            result = self._execute(
-                sid, tid, STAGE_REVIEW, member_id, settings, workspace_dir,
-                read_only=True,
-            )
-        finally:
-            self._mark_busy(sid, member_id, False)
+        # 占用由 _execute 统一处理（同一成员串行）；这里不再重复占用，
+        # 重复占用会让「重试线程先占用 → 审核内部再等自己空闲」的自我等待问题重现
+        result = self._execute(
+            sid, tid, STAGE_REVIEW, member_id, settings, workspace_dir,
+            read_only=True,
+        )
 
         with self.store.session_lock(sid):
             session = self._get(sid)
@@ -748,6 +932,10 @@ class TaskManager:
                     continue
                 if result.get("cancelled"):
                     item["status"] = STATUS_CANCELLED
+                elif item.get("status") == STATUS_CANCELLED:
+                    # 用户在这次审核返回前点了取消：状态以取消为准（意见不参与交付），
+                    # 输出仍留在「历次执行记录」里可查
+                    pass
                 elif result.get("status") == STATUS_TIMEOUT:
                     item["status"] = STATUS_TIMEOUT
                 elif result.get("status") == STATUS_FAILED:
@@ -778,6 +966,8 @@ class TaskManager:
             if not task:
                 return
             part_a = task.setdefault("part_a", {})
+            if not result.get("cancelled") and task.get("status") == STATUS_CANCELLED:
+                result = dict(result, cancelled=True)
             if result.get("cancelled"):
                 task["status"] = STATUS_CANCELLED
                 part_a["final_status"] = STATUS_CANCELLED
@@ -805,7 +995,44 @@ class TaskManager:
             self._save(session)
 
     # ---------------- 单个执行单元 ----------------
+    def _task_owner(self, sid: str, tid: str, member_id: Optional[str] = None) -> str:
+        """这个执行单元要占用哪位成员：审核用被指派的成员，其余用主创。"""
+        if member_id:
+            return member_id
+        with self.store.session_lock(sid):
+            session = self._get(sid)
+            task = ((session or {}).get("tasks") or {}).get(tid) or {}
+            return str(task.get("owner_id") or "")
+
     def _execute(
+        self,
+        sid: str,
+        tid: str,
+        stage: str,
+        member_id: Optional[str],
+        settings: Dict[str, Any],
+        workspace_dir: str,
+        read_only: bool = False,
+    ) -> Dict[str, Any]:
+        """占用成员后执行一个环节；占用不成功就不执行（绝不并发跑同一成员）。"""
+        owner = self._task_owner(sid, tid, member_id)
+        if owner and not self._acquire_member(sid, owner):
+            return {
+                "status": STATUS_FAILED,
+                "cancelled": False,
+                "summary": MEMBER_BUSY_SUMMARY,
+                "raw": "",
+                "prompt": "",
+                "record_msg_id": "",
+                "member_busy": True,
+            }
+        try:
+            return self._execute_unit(sid, tid, stage, member_id, settings, workspace_dir, read_only)
+        finally:
+            if owner:
+                self._release_member(sid, owner)
+
+    def _execute_unit(
         self,
         sid: str,
         tid: str,
@@ -826,10 +1053,23 @@ class TaskManager:
             emp = self._employee(settings, emp_id or "")
             if not emp:
                 return {"status": STATUS_FAILED, "summary": "成员不可用", "raw": "", "prompt": ""}
+            key = execution_key(sid, tid, stage, emp_id or "")
+            if key in CANCELLED_KEYS:
+                # 排队 / 等成员期间已被取消：不要再起进程白烧一次 token；
+                # 标记由本次执行消费掉，避免长期堆积
+                with self._lock:
+                    CANCELLED_KEYS.discard(key)
+                return {
+                    "status": "cancelled", "cancelled": True, "summary": "",
+                    "raw": "", "prompt": "", "record_msg_id": "",
+                }
             opinions = [
                 item for item in (task.get("part_b") or [])
                 if item.get("status") == STATUS_DONE and item.get("summary")
             ] if stage == STAGE_DELIVER else None
+            attempt_key = f"{stage}:{member_id or task.get('owner_id')}"
+            # 重试沿用的是最初的用户原话，但那之后用户补充的约束必须一起带上
+            is_retry = task.setdefault("attempts", {}).get(attempt_key, 0) > 0
             prompt = build_prompt(
                 stage=stage,
                 goal=task.get("goal", ""),
@@ -838,6 +1078,11 @@ class TaskManager:
                 opinions=opinions,
                 workspace_dir=workspace_dir,
                 quoted=task.get("quoted") or "",
+                context=build_context(
+                    session.get("messages"),
+                    task.get("source_msg_id") or "",
+                    include_after=is_retry,
+                ),
             )
             record = {
                 "id": msg_id(),
@@ -863,13 +1108,10 @@ class TaskManager:
                 task["part_a"]["status"] = MEMBER_IN_PROGRESS
             elif stage == STAGE_DELIVER:
                 task["part_a"]["final_status"] = MEMBER_IN_PROGRESS
-            task.setdefault("attempts", {})[
-                f"{stage}:{member_id or task.get('owner_id')}"
-            ] = task["attempts"].get(f"{stage}:{member_id or task.get('owner_id')}", 0) + 1
+            task.setdefault("attempts", {})[attempt_key] = task["attempts"].get(attempt_key, 0) + 1
             self._update_card(session, task)
             self._save(session)
 
-        key = execution_key(sid, tid, stage, emp_id or "")
         with self._lock:
             self._active_keys[key] = {"sid": sid, "tid": tid, "stage": stage, "member_id": member_id}
 
@@ -878,6 +1120,7 @@ class TaskManager:
             runner_emp["write_access"] = False  # 审核环节一律只读
 
         started = time.time()
+        cancelled_flag = False
         try:
             res = self.runner(
                 runner_emp,
@@ -893,13 +1136,17 @@ class TaskManager:
         finally:
             with self._lock:
                 self._active_keys.pop(key, None)
+                # 取消标记只对「这一次执行」有效：早期实现把它留在进程级集合里，
+                # 同一个 key 下一轮执行会被无条件判成已取消（真的调了模型却不认结果）
+                cancelled_flag = key in CANCELLED_KEYS
+                CANCELLED_KEYS.discard(key)
 
         status = str(getattr(res, "status", "") or "")
         raw = str(getattr(res, "raw_output", "") or "") or str(getattr(res, "output", "") or "")
         parsed = parse_output(str(getattr(res, "output", "") or ""))
         elapsed = round(time.time() - started, 2)
 
-        if status in ("interrupted",) or key in CANCELLED_KEYS:
+        if status in ("interrupted",) or cancelled_flag:
             mapped = "cancelled"
         elif status in ("timeout",):
             mapped = STATUS_TIMEOUT
@@ -950,8 +1197,15 @@ class TaskManager:
         }.get(status, status)
 
     # ---------------- 取消 / 重试 ----------------
+    # 可取消的环节状态：还没开始（waiting）、正在跑（in_progress / running）
+    CANCELLABLE_STAGE_STATES = (MEMBER_WAITING, MEMBER_IN_PROGRESS, STATUS_RUNNING)
+
     def cancel(self, sid: str, tid: str, stage: str, member_id: str = "") -> Dict[str, Any]:
-        """静默取消：终止进程、状态转已取消、不追加系统消息、不弹窗。"""
+        """静默取消：终止进程、状态转已取消、不追加系统消息、不弹窗。
+
+        只受理「还没结束的任务 + 还没结束的环节」：终态任务不可逆转，
+        已经跑完的环节也不能被打回已取消（那会让卡片与磁盘产物互相矛盾）。
+        """
         with self.store.session_lock(sid):
             session = self._get(sid)
             if not session:
@@ -959,6 +1213,27 @@ class TaskManager:
             task = (session.get("tasks") or {}).get(tid)
             if not task:
                 return {"error": "任务不存在"}
+            if task.get("status") in FINAL_TASK_STATES:
+                return {
+                    "error": f"任务已{self._state_label(task.get('status'))}，不能取消",
+                    "code": "task_finished",
+                }
+            part_a = task.get("part_a") or {}
+            if stage == STAGE_REVIEW:
+                item = next(
+                    (i for i in task.get("part_b") or [] if i.get("member_id") == member_id),
+                    None,
+                )
+                if not item:
+                    return {"error": "该成员不在这次协助审核里", "code": "stage_not_active"}
+                if item.get("status") not in self.CANCELLABLE_STAGE_STATES:
+                    return {"error": "这位成员的审核已结束，不能取消", "code": "stage_not_active"}
+            elif stage == STAGE_DELIVER:
+                if part_a.get("final_status") not in self.CANCELLABLE_STAGE_STATES:
+                    return {"error": "交付环节已结束，不能取消", "code": "stage_not_active"}
+            else:
+                if part_a.get("status") not in self.CANCELLABLE_STAGE_STATES:
+                    return {"error": "执行环节已结束，不能取消", "code": "stage_not_active"}
             emp_id = member_id or task.get("owner_id") or ""
             key = execution_key(sid, tid, stage, emp_id)
             CANCELLED_KEYS.add(key)
@@ -980,7 +1255,27 @@ class TaskManager:
                     print(f"[TaskManager] 终止进程失败: {exc}")
                 return {"ok": True, "status": STATUS_CANCELLED}
             task["status"] = STATUS_CANCELLED
+            task["finished_at"] = int(time.time())
             self._add_flow(task, "已取消")
+            # 单任务的结果消息要跟着转「已取消」：排队中被取消的任务不会再被执行，
+            # 不在这里同步，消息就会永远停在「排队中」且带一个点不动的取消按钮
+            if task.get("result_msg_id"):
+                msg = next(
+                    (m for m in session.get("messages") or []
+                     if isinstance(m, dict) and m.get("id") == task["result_msg_id"]),
+                    None,
+                )
+                if msg and msg.get("status") in (
+                    STATUS_QUEUED, STATUS_RUNNING, MEMBER_WAITING, MEMBER_IN_PROGRESS,
+                ):
+                    patch: Dict[str, Any] = {"status": STATUS_CANCELLED}
+                    if not str(msg.get("content") or "").strip():
+                        patch["content"] = "已取消（未执行）"
+                    self._update_message(session, task["result_msg_id"], patch)
+            # 已取消的任务不再占队列位置
+            owner_queue = session.get("task_queues", {}).get(task.get("owner_id")) or []
+            if tid in owner_queue:
+                owner_queue.remove(tid)
             self._update_card(session, task)
             self._save(session)
 
@@ -1005,10 +1300,15 @@ class TaskManager:
                 # 执行：只在失败 / 超时 / 已取消后提供重试
                 allowed = current in RETRYABLE_STATES or task.get("status") in RETRYABLE_STATES
             elif stage == STAGE_DELIVER:
-                current = task["part_a"].get("final_status")
-                # 交付：完成后也可重试，用于重新生成交付内容
-                allowed = current in (STATUS_DONE, *RETRYABLE_STATES) or \
-                    task.get("status") in (STATUS_DELIVERED, *RETRYABLE_STATES)
+                part_a = task.get("part_a") or {}
+                current = part_a.get("final_status")
+                # 交付只能发生在「执行成功」之后：执行失败还允许重跑交付，
+                # 会产出一个没有产物、没有审核意见却显示「已交付」的任务
+                executed = part_a.get("status") == STATUS_DONE
+                allowed = executed and (
+                    current in (STATUS_DONE, *RETRYABLE_STATES)
+                    or task.get("status") in (STATUS_DELIVERED, *RETRYABLE_STATES)
+                )
             else:
                 current = next(
                     (item.get("status") for item in task.get("part_b") or []
@@ -1023,6 +1323,9 @@ class TaskManager:
                 # 重跑执行=这一轮从头推进；重跑交付=重新生成终版
                 task["status"] = STATUS_RUNNING
                 task["finished_at"] = None
+                if stage == STAGE_EXEC and task.get("type") == TYPE_SINGLE and task.get("result_msg_id"):
+                    # 单任务重跑期间消息转「执行中」，避免还挂着失效的「重试」按钮
+                    self._update_message(session, task["result_msg_id"], {"status": STATUS_RUNNING})
             if stage == STAGE_EXEC:
                 # 重跑主创执行：之前的审核与交付作废，从审核环节重新推进
                 task["part_a"]["status"] = MEMBER_WAITING
@@ -1036,35 +1339,52 @@ class TaskManager:
             self._update_card(session, task)
             self._save(session)
 
+        retry_key = execution_key(sid, tid, stage, member_id or task.get("owner_id") or "")
+        with self._lock:
+            if retry_key in self._retries:
+                return {"error": "该环节正在重试中"}
+            self._retries.add(retry_key)
+
         thread = threading.Thread(
-            target=self._retry_worker, args=(sid, tid, stage, member_id),
+            target=self._retry_worker_guarded,
+            args=(sid, tid, stage, member_id, retry_key),
             name=f"task-retry-{tid}-{stage}", daemon=True,
         )
         thread.start()
         return {"ok": True}
 
+    def _retry_worker_guarded(self, sid: str, tid: str, stage: str, member_id: str, retry_key: str) -> None:
+        try:
+            self._retry_worker(sid, tid, stage, member_id)
+        except Exception as exc:
+            print(f"[TaskManager] 重试 {stage} 失败: {exc}")
+        finally:
+            with self._lock:
+                self._retries.discard(retry_key)
+
     def _retry_worker(self, sid: str, tid: str, stage: str, member_id: str) -> None:
         settings = self.store.load_settings()
         with self.store.session_lock(sid):
             session = self._get(sid)
-            workspace_dir = (session or {}).get("workspace_dir", "")
+            if not session:
+                return
+            task = (session.get("tasks") or {}).get(tid) or {}
+            workspace_dir = session.get("workspace_dir", "")
+            task_type = task.get("type")
+
         if stage == STAGE_EXEC:
-            ok = self._run_exec(sid, tid, settings, workspace_dir)
-            if ok:
-                with self.store.session_lock(sid):
-                    session = self._get(sid)
-                    if session and tid in (session.get("tasks") or {}):
-                        self._save(session)
-                self._run_reviews(sid, tid, settings, workspace_dir)
-                self._run_deliver(sid, tid, settings, workspace_dir)
+            # 单任务重跑的还是单任务：走协助任务流水线会把结果消息漏掉，还会多跑一次交付。
+            # 占用交给 _execute：这里再占用会让审核阶段一直握着主创，交叉协作会成环
+            if task_type == TYPE_SINGLE:
+                self._run_single(sid, tid, settings, workspace_dir)
+            else:
+                ok = self._run_exec(sid, tid, settings, workspace_dir)
+                if ok:
+                    self._run_reviews(sid, tid, settings, workspace_dir)
+                    self._run_deliver(sid, tid, settings, workspace_dir)
         elif stage == STAGE_REVIEW:
-            self._wait_member_idle(sid, member_id)
-            self._mark_busy(sid, member_id, True)
-            try:
-                self._run_review_one(sid, tid, member_id, settings, workspace_dir)
-            finally:
-                self._mark_busy(sid, member_id, False)
-            # 重试审核只更新该成员的意见，不重做交付，也不改任务终态
+            # _run_review_one 内部的 _execute 会占用该成员；这里再占用一次会等自己
+            self._run_review_one(sid, tid, member_id, settings, workspace_dir)
             with self.store.session_lock(sid):
                 session = self._get(sid)
                 if session and tid in (session.get("tasks") or {}):
@@ -1094,13 +1414,32 @@ class TaskManager:
                 for task in (session.get("tasks") or {}).values():
                     if not isinstance(task, dict):
                         continue
+                    if task.get("status") in FINAL_TASK_STATES:
+                        # 已经结束的任务不再动：早期实现会把已交付单任务的 part_a 从
+                        # in_progress 改成 cancelled，还追加一条「进行中的环节已取消」的假流水
+                        continue
+                    # 不只把任务打成已取消：三个环节的「进行中」标记也要一起收掉，
+                    # 否则卡片上那些位置既没有取消（进程已没了）也没有重试（状态不可重试），用户被卡死
+                    touched = False
+                    part_a = task.get("part_a")
+                    if isinstance(part_a, dict):
+                        for field in ("status", "final_status"):
+                            if part_a.get(field) in (MEMBER_IN_PROGRESS, STATUS_RUNNING):
+                                part_a[field] = STATUS_CANCELLED
+                                touched = True
+                    for item in task.get("part_b") or []:
+                        if isinstance(item, dict) and item.get("status") in (MEMBER_IN_PROGRESS, STATUS_RUNNING):
+                            item["status"] = STATUS_CANCELLED
+                            touched = True
                     if task.get("status") == STATUS_RUNNING:
                         task["status"] = STATUS_CANCELLED
                         task["finished_at"] = int(time.time())
-                        self._add_flow(task, "服务重启，进行中的任务已取消，可重试")
+                        recovered += 1
+                        touched = True
+                    if touched:
+                        self._add_flow(task, "服务重启，进行中的环节已取消，可重试")
                         self._update_card(session, task)
                         changed = True
-                        recovered += 1
                 if changed:
                     self._save(session)
                 queued_members = set()
