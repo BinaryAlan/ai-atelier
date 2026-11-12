@@ -12,7 +12,13 @@
 import unittest
 from unittest import mock
 
-from core.executor import Executor, build_cli_env, is_port_conflict
+from core.executor import (
+    Executor,
+    apply_access_mode,
+    build_cli_env,
+    is_port_conflict,
+    normalize_cli_tools,
+)
 
 
 class FakeProc:
@@ -180,6 +186,95 @@ class TestPortConflict(unittest.TestCase):
         self.assertEqual(result.status, "error")
         self.assertEqual(len(made), 1)
         self.assertNotIn("端口", result.output)
+
+
+class TestAccessMode(unittest.TestCase):
+    """读权限与写权限是两个独立开关。
+
+    历史 bug：新建成员时只有「写权限」一个勾选框（默认不勾），模型扫描缓存里
+    又是 `--tools ""`，于是成员连产物都读不到，只会回一句「我先读取一下」就结束。
+    这里锁住：只读成员也必须有 Read/Glob/Grep；写权限才追加 Write/Edit/Bash。
+    """
+
+    def test_read_only_role_gets_read_tools(self):
+        out = apply_access_mode(
+            ["codebuddy", "--model", "x", "--tools", "", "-p", "{prompt}"],
+            write_access=False, read_access=True,
+        )
+        self.assertEqual(out[out.index("--tools") + 1], "Read,Glob,Grep")
+        self.assertNotIn("-y", out)
+
+    def test_write_role_gets_full_toolset(self):
+        out = apply_access_mode(
+            ["codebuddy", "--model", "x", "--tools", "", "-p", "{prompt}"],
+            write_access=True, read_access=True,
+        )
+        self.assertEqual(
+            out[out.index("--tools") + 1], "Read,Glob,Grep,Write,Edit,Bash"
+        )
+        self.assertIn("-y", out)
+
+    def test_both_off_disables_tools(self):
+        out = apply_access_mode(
+            ["codebuddy", "--tools", "Read,Glob,Grep", "-p", "{prompt}"],
+            write_access=False, read_access=False,
+        )
+        self.assertEqual(out[out.index("--tools") + 1], "")
+
+    def test_write_only_drops_read_tools(self):
+        out = apply_access_mode(
+            ["codebuddy", "--tools", "Read,Glob,Grep", "-p", "{prompt}"],
+            write_access=True, read_access=False,
+        )
+        self.assertEqual(out[out.index("--tools") + 1], "Write,Edit,Bash")
+
+    def test_agy_only_gains_flag_when_writable(self):
+        self.assertEqual(
+            apply_access_mode(["agy", "-p", "{prompt}"], False, True),
+            ["agy", "-p", "{prompt}"],
+        )
+        self.assertIn(
+            "--dangerously-skip-permissions",
+            apply_access_mode(["agy", "-p", "{prompt}"], True, True),
+        )
+
+    def test_template_heals_empty_tools(self):
+        """模板里遗留的 --tools "" 要按读权限就地修好，否则界面上看到的就是假的。"""
+        cmd = normalize_cli_tools(
+            'codebuddy --model hy4std --tools "" -p "{prompt}"', True, False
+        )
+        self.assertIn('--tools "Read,Glob,Grep"', cmd)
+
+    def test_template_keeps_explicit_default(self):
+        cmd = normalize_cli_tools('codebuddy --tools "default" -p "{p}"', False, False)
+        self.assertIn('--tools "default"', cmd)
+
+
+class TestScannedModelsCacheHeal(unittest.TestCase):
+    """旧扫描缓存（纯列表格式、--tools ""）不能直接把死模板喂给新建成员。"""
+
+    def test_legacy_cache_is_healed(self):
+        import json
+        import os
+        import tempfile
+        from unittest import mock
+        from core import scanner
+
+        legacy = [{
+            "key": "codebuddy:hy4std",
+            "cli": "codebuddy",
+            "model_id": "hy4std",
+            "display_name": "hy4std",
+            "cli_cmd": 'codebuddy --model hy4std --tools "" -p "{prompt}"',
+        }]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "scanned_models.json")
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(legacy, f)
+            with mock.patch.object(scanner, "CACHE_FILE", path):
+                models = scanner._load_cache()
+        self.assertEqual(len(models), 1)
+        self.assertIn('--tools "Read,Glob,Grep"', models[0]["cli_cmd"])
 
 
 if __name__ == "__main__":

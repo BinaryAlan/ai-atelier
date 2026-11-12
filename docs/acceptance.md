@@ -34,7 +34,7 @@ node /tmp/verify_cleanup.mjs   # 旧文案 / 旧字段 / 设置三部分 / 确�
 | :-- | :--- | :--- | :--- | :--- |
 | A1 | 1 / 5.3 | 右侧面板只保留工作目录文件树与浏览；界面不设全局控制条 | CDP：`工作目录预览` 存在、`会议方案 / 纪要` 不存在、无暂停/恢复/结束任务/跳过此人 | 通过 |
 | A2 | 2 / 4.2 | `@` 一位成员 → 单任务入该成员队列，独立完成并输出一条结果消息 | `test_single_task_structure`、`test_no_mention_is_context_only` | 通过 |
-| A3 | 2 | 没点名成员的消息只作为上下文保留，不产生任务 | `test_no_mention_is_context_only` | 通过 |
+| A3 | 2 | 没点名成员的消息：会话里已有 AI 回过话时默认交给最近那一位（A71.4）；一条 AI 消息都没有时只作为上下文保留，不产生任务 | `test_no_mention_is_context_only`、`TestDefaultRouteToLastAi` 4 项 | 通过 |
 | A4 | 2 / 5.1 | 引用回复把被引用的原话交给被回复的成员 | `test_reply_targets_quoted_member`（HTTP 层 `forced_owner_id`） | 通过 |
 | A5 | 4.1 | `/collab @主创 @协助成员... 任务内容` 发起协助任务，去掉指令前缀作为上下文 | `test_valid_collab_strips_prefix_and_dedupes`、`test_collab_validation_endpoint` | 通过 |
 | A6 | 4.1 | 严格验证：缺主创、缺协助成员、缺任务内容一律拦截提示，不创建任务 | 6 项解析测试 + 前端输入时提示 + 后端 400 `validation_error` + CDP 校验 | 通过 |
@@ -380,3 +380,284 @@ A45 验收（`/tmp/verify_inspect_note.mjs`，6/6）：提示条出现、渲染�
 - 场景覆盖：片头 → 单任务结果消息 + `/collab` 指令 + 卡片（同类画面里两类任务同框）→ 单任务输入输出弹窗（开始/返回/用时）→ 卡片头部与创建时间 → 四段简报慢速滚动 → 完整任务详情弹窗 → 「↻ 审核补全后重新生成」标签 → 文件预览弹窗（Markdown 表格 + Mermaid 流程图）→ 收尾 → 片尾要点卡。
 - 生成链路：`/tmp/make_demo.mjs`（Node + CDP 截帧）→ `ffmpeg` palettegen/paletteuse（160 色、`diff_mode=rectangle`）合成；成片 4.1 MB / 3.9 MB。程序滚动会触发「回到最新」浮动按钮，已在演示样式里隐藏；过渡白场由 0.9 降到 0.55，避免出现近乎空白的帧。
 - 校验：成片抽帧目视（第 60 / 225 / 299 帧）文字清晰、Mermaid 已出图、片尾完整；两版 ffprobe 均为 1200×750 / 306 帧 / 51.0 秒。
+
+## A58 · 协助审核的四条标准与 [通过] 判定
+
+用户要求给审核 AI 定一套标准，避免发散随机：① 审视隐患与漏洞（逻辑自洽性 / 边界条件 / 实操可用性）② 鼓励新意与巧思 ③ 精简实用、言之有物（篇幅不设上限，杜绝套话空泛理论）④ 达标即过（`[通过]` + 简述亮点，严禁硬挤琐碎细节）。讨论中用户追问并修正两处：删掉会禁掉巧思的「不要求用户没提过的新功能 / 不对未落盘设想发表意见」；边界条件从程序清单扩展成适用于方案、产品设计等产物的通用内核。
+
+- `prompts/roles/reviewer.md` 全量重写：四条要求 + 判定基准优先级（用户原话 > 产物自述 > 通用底线，软件仍不设置任务级验收标准）+ 首行 `[通过]` / `[意见]` 契约 + 每条「现状 / 影响 / 怎么改」三要素 + 末尾 `review` 登记块。**不限条数、不限篇幅、不给重大改进设门槛**，肯定项也按用户第 4 条收成 `[通过]` + 一句亮点。
+- `prompts/protocol/task-flow.md` 同步把「不对未落盘的设想发表意见」改成「审核对象限于已落盘产物；尚未落盘的替代思路可作为巧思提出，但不能当成评价现有产物的依据」，避免两份规程互相打架。
+- `prompts/roles/owner.md` 交付段补三类意见处理：`[通过]` 按无需改动、隐患逐条说明修没修及理由、巧思可采纳可不采纳但要说明取舍依据。
+- 后端：`parse_output` 的登记块识别集合加 `review`；`_clean_review()` 只认 `verdict=pass/issues` 与 issues/ideas 条数，漏写登记块时按正文首行 `[通过]` / `[意见]` 兜底判定；`_execute` 回传 review；`_run_review_one` 落 `review_verdict` / `review_counts`，pass 时流水写「XX 审核通过」；`build_prompt` 给主创的【审核意见】标注「[通过]，无需改动」；重跑审核 / 执行时清掉上一轮判定，避免挂旧标签。
+- 前端：`cardBriefRows` 带 `reviewVerdict`，审核段状态标签旁挂绿色「通过」标签；i18n 加 2 条；资源版本 `?v=20261112p`。
+- 测试 `TestReviewStandard` 7 项：规程四条标准与两条禁用文案不回归、登记块剥离与 verdict 解析、首行兜底、非法 verdict 不采信、主创 prompt 标注与老会话兼容、完整一轮 pass 链路落到卡片与交付 prompt、issues 不误挂通过。全量 `Ran 103 tests — OK`。
+- 文档：协议 §4.3 新增「审核标准」小节、§9 表格同步；README 中英文补审核标准、通过标签、103 项测试与 A1–A58。
+
+## A59 · 重审是否用最新规程 + 输入快照清理
+
+用户问「现在点重新审核会不会使用最新的规则？如果不会，把输入快照里面的内容处理一下，我要测试效果」。
+
+**结论：会用。** `_read_protocol()` 每次从磁盘读 `prompts/protocol/task-flow.md` 与 `prompts/roles/reviewer.md`，无缓存；`retry(STAGE_REVIEW) → _run_review_one → _execute → _execute_unit → build_prompt()` 现场重拼整份输入，并把 `part_b[].sent_prompt` 与新 `task_record.sent_prompt` 覆盖成新输入。历史快照只留档，从不作为模型输入复用。现场构造的审核输入 3088 字，含四条标准与 `review` 登记要求，不含旧规程措辞。
+
+但输入快照里有 3 处会干扰测试观感，已清理：
+
+- `task-flow.md` 流程概述第 2 步仍写「独立给出审核意见或优化建议」、第 3 步没提 `[通过]` 分类 → 改成「按审核规程的四条标准独立给出意见」与三类意见处理；「输出」段补审核环节必附 `review` 登记块。
+- `build_prompt` 的【输出要求】原本对四个环节统一写「**如果产出了文件**才附登记块」，只读审核不产文件，模型会以为不必写登记块 → 审核环节改成专用输出要求：首行 `[通过]` / `[意见]`、分节、末尾务必附 `{"artifacts":…, "review": {"verdict":…, "issues":…, "ideas":…}}`；执行 / 交付段保持原文案。
+- `retry()` 的 REVIEW 分支原先只清 `summary / raw_output / 耗时`，不清 `sent_prompt / msg_id / review_verdict / review_counts` → 点击瞬间到新 Prompt 落库之间仍挂旧规程输入，成员占用失败时还会残留。EXEC 分支同步补齐。
+
+**存量数据的处理**：不删不改原文（保留审计、可复制排查），也不在界面加规程版本说明——这类研发过程信息不该出现在用户界面（A60）。旧快照打开就是原文；重审后新输入落库，内容里出现四条标准即可判断新规程生效。端口冲突 / 登录失效的排障解释保留，仍在两个页签之上。
+
+- 测试新增 2 项（`TestReviewStandard`）：当前审核输入含四条标准 + `review` 登记要求、不含旧措辞且执行 / 交付段输出要求不变；存量会话挂旧快照后点重审，新 `sent_prompt` 与三次发给 CLI 的输入都是当前规程、旧判定不残留。全量 `Ran 105 tests — OK`。
+- 初版曾在弹窗加旧规程提示条（`verify_review_prompt_snapshot.mjs` 4/4）；该提示已按 A60 移除。
+- i18n 286 条、`t()` 未收录 0；资源版本 `?v=20261112r`；`touch app.py` 触发热重载，服务已加载新代码。README 中英、协议 §4.3 同步。
+
+## A60 · 界面不展示研发过程提示
+
+用户指出「这是旧版审核规程留下的输入快照……提示条也会自动消失」属于研发过程说明，不该出现在界面上。A59 的旧规程提示条就此撤掉。
+
+- `static/js/app.js` 的 `inspectNote` 只保留 EADDRINUSE / 登录失效两类面向用户的排障解释；按旧 `reviewer.md` 文案识别的分支整段删除，`i18n.js` 对应词条一并移除（287 → 286 条）。
+- 弹窗顶部提示条容器保留：端口冲突与登录失效说明仍在两个页签之上可见；普通记录、旧规程快照都不再出现任何解释条，也不显示「旧版规程」「提示条会消失」这类实现细节。
+- 资源版本 `?v=20261112r`。
+- 验证 CDP `verify_no_dev_note.mjs` 5/5：旧规程文本进弹窗无解释条、页面无「旧版审核规程」字样、真实卡片重审输入已是当前规程、端口冲突解释仍在、普通记录无解释条。回归 `Ran 105 tests — OK`；i18n 286 条、未收录 0。
+- 实证：用户此前已自行点过重审，DS4 返回 `[意见]`（issues=2 / ideas=1），输入 3216 字含四条标准、不含旧措辞；HY4 那轮被取消但输入同样是新规程 —— 重审确实用当前规程。
+
+## A61 · 单任务结果消息在执行中即展示 Prompt（交互详情审查）
+
+用户给 agy 发消息后，点 ℹ️「交互详情审查」看不到发送给 AI 的 Prompt。根因：单任务的 `task_result` 消息只在**执行完成后**才被写回 `sent_prompt`，执行中点开是空的。
+
+- `core/tasks.py` `_execute` 的 EXEC 分支：环节一开始（拼好 Prompt、进程未起前）就把 `sent_prompt` 与 `started_at` 同步写进 `task_result` 结果消息，并把状态置 `running`；`_run_single` 收尾补 `started_at` / `finished_at`。
+- `openInspectModal` 直接以消息对象为 `inspectingMsg`，结果消息带上 `sent_prompt` 后，执行中点 ℹ️ 即能看到「发送给 AI 的 Prompt」，不用等跑完。
+- 新增回归 `test_single_result_msg_shows_prompt_while_running`：用 gate 把 worker 卡在「执行中」，断言结果消息 `status=running` 且 `sent_prompt` / `started_at` 已就位，放行后 `finished_at` 补齐。
+
+## A62 · 消息头部显示发送时间
+
+用户消息此前不显示发送时刻。 `static/index.html` 的消息头部（非 system）追加 `{{ formatFlowTime(msg.created_at) }}`（墙钟时间），用户 / AI / 单任务结果消息统一带时间戳；`task_card` 自身已有「🕒 创建」不重复。
+
+## A63 · 单任务结果消息显示「正在思考中」与实时计时
+
+协作卡片顶部本就有计时与步骤进度；单任务的 `task_result` 消息此前运行中没有「思考中」提示、也没有顶部计时。
+
+- 结果消息在 `running` / `queued` 且无正文时，气泡内显示 `🤔 正在思考中…`（排队时显示 `⏳ 排队中`）。
+- 头部在 `running` 且已有 `started_at` 时显示 `⏱ {taskElapsed(msg)}` 实时计时（由 `nowTick` 每秒心跳驱动，与协作卡片同一套机制），完成后切回 `elapsed_time`。
+- i18n 增补「正在思考中…」英文；资源版本 `?v=20261112r3`。
+- 验证：`node --check` 通过；`Ran 82 tests — OK`（test_tasks）；服务热重载，刷新即可见。
+
+## A64 · 单任务结果消息耗时统一进阶成分钟
+
+agy（单任务）结果消息头部的耗时此前两种显示不一致：运行中用 `taskElapsed`（会进阶分钟），完成后却用原始 `elapsed_time + "s"`（超过 60 秒只显示 `120s`，不进阶分钟）。
+
+- 新增 `msgElapsed(msg)`：`started_at` 存在时按 started/finished（或 nowTick）算实时/真实耗时并统一进阶成 `Nm Ns`；老消息无 `started_at` 则退回 `elapsed_time`。
+- 头部计时改为单一 `<span v-if="msgElapsed(msg) !== ''">⏱ {{ msgElapsed(msg) }}</span>`，运行中点 ℹ️ 实时跳动、完成后统一显示为分钟，且老会话（只有 `elapsed_time`）仍可显示。
+- 资源版本 `?v=20261112r4`。
+
+## A65 · 文件预览改为右侧面板内就地展开（覆盖整个工作目录预览）
+
+此前点文件是 `fixed inset-0` 居中弹窗，离开右侧面板。用户要求：在当前窗口（右侧面板）内就地预览、不要弹出；预览顶部带全屏与关闭；打开的预览要盖住整个工作目录预览，而不是挤在目录下面。
+
+- 删除 `fixed inset-0` 弹窗；改为右侧面板（`relative`）内的 `absolute inset-0 z-20` 覆盖层：打开后盖住「📁 工作目录预览」标题、面包屑与文件列表；关闭（`closeFilePreview` / Esc）后回到原来的目录列表。
+- 预览顶部新增「复制路径 / 全屏 / 关闭」三枚按钮：`togglePreviewFullscreen()` 用 Fullscreen API 把预览面板本身请求全屏（非整页）；`×` 关闭；`copyFilePath` 保留。
+- 提示语改为「点击文件夹进入，点击文件在此面板内预览；面包屑可返回上级」。
+- i18n 增补「全屏」「全屏查看」；资源版本 `?v=20261112r4`。
+
+## A66 · 审核「只回开场白」的语义层重试与结论有效性（回归修复）
+
+会话 `6373f3ce` 任务 `t_60f4c7b0`：审核成员 hy4-std 整段输出只有一句 `I'll read the actual artifact and surrounding context before judging.`（70 字节，耗时 24.66s），却被记成 `done`「完成」，并作为一条意见 `- hy4-std: I'll read…` 混进主创交付 prompt。
+
+- 根因：`17d6e8a` 旧圆桌系统用 `run_with_retry()`（空/开场白/只剩工具标记 → 强指令重试一次 → 仍失败报错并提示 `--tools`）修过同类问题；`913232d` 删旧引擎、`6a68034` 重建任务系统时只保留了 `sanitize_model_output`，重试逻辑丢失（回归）。且 `hy4-std` 配的是 `--tools ""`，审核 prompt 却要读产物。
+- `core/executor.py`：补回 `looks_like_incomplete()`（中英文开场白 + 空 + 极短；带 `[通过]/[意见]` 标记不算）、`employee_has_tools()`、`capability_block()`。
+- `core/tasks.py`：`_execute_unit` 在**审核环节**（只读、可安全重跑）做语义层重试一次（`_review_needs_retry` + `REVIEW_RETRY_HINT`），复用同一执行单元与记录，不额外产生 `task_record`；只读环节把 `capability_block` 写进 prompt，如实说明有没有工具。`_run_review_one` 对「无 verdict 且像开场白」的回答记 `no_opinion`，并把气泡正文换成「本轮未给出有效结论…」；原始输出仍留在 `raw_output` 供「交互详情」查看。无效结论不进 `opinions` 筛选，不再污染主创交付。
+- 配置：`hy4-std` / `hy3` 的 `--tools ""` 改为 `--tools "Read,Glob,Grep"`（只读；写权限仍为 False）。`data/settings.json` 已备份为 `.bak`。
+- 与既有网络/系统层重试（`CLI_PORT_CONFLICT_RETRIES` 处理 EADDRINUSE）并列：这是**语义层**重试，针对「进程正常退出但没给出实质结论」。
+- 验证：`tests/test_tasks.py::TestReviewSemanticRetry` 4 项（识别英文/中文开场白、只回开场白→重试后无意见且不进交付 prompt、开场白后重试成功采用后答、内容充实无标记不重试）；全量 `Ran 110 tests — OK`。
+
+
+## A67 · 成员权限拆成「读 / 写」两个开关，新建成员默认全开
+
+新建的成员即便什么都没勾，也不该连产物都读不到——这是 `--tools ""` 的直接后果。
+
+- 根因（两处）：
+  1. `data/scanned_models.json` 是**旧列表格式**缓存，里面每条 `cli_cmd` 都是 `codebuddy --model X --tools "" ...`，而 `_load_cache()` 对列表格式不做 TTL 判断、也不修模板 → 「添加成员」下拉里选出来的就是死模板，与写权限勾选框无关。
+  2. UI 只有一个勾选框，文案在「只读 / 可写」之间翻转，默认不勾 = 只读；而只读成员的模板若带 `--tools ""`，运行时也没有任何补读工具的逻辑 → 成员读不到文件，只会回一句「我先读取一下」。
+- 权限模型：`read_access`（新字段，默认 True）与 `write_access` 并存。
+  - 读：`Read,Glob,Grep`；写：再加 `Write,Edit,Bash` 与 CLI 自动放行参数（agy `--dangerously-skip-permissions`，codebuddy `-y`）。
+  - 两个都关：`--tools ""`，即完全不借助工具（`capability_block` 会告知模型不要回「我先去读」）。
+- `core/executor.py`：新增 `compose_tools_value()` / `normalize_cli_tools()`（模板级修补）与 `apply_access_mode(args, write, read)`（运行时补参数）；只读角色也会补 `Read/Glob/Grep`，`--tools default/all` 视为用户显式放开、不动。
+- `core/scanner.py`：读缓存时统一按只读权限修补模板，历史缓存自愈（旧列表格式里的 `--tools ""` → `Read,Glob,Grep`）。
+- `core/storage.py`：默认模板改为带读工具；`load_settings` 为老配置补 `read_access=True`（缺失即视为有读权限，避免升级后成员突然读不到产物）。
+- `app.py`：`_sanitize_agent` 持久化 `read_access`，并在落库前按权限规范化模板 —— 界面上看到的模板 = 实际执行用的模板。
+- `static/index.html` + `app.js`：成员列表行改为「👁 读 / ✍️ 写」两个勾选框；添加/编辑成员弹窗拆成两个带说明的勾选框，**新建默认两个都勾**；勾选变化时 `syncEditingEmpCli()` 立刻把 `--tools` 同步到模板输入框。资源版本 `?v=20261112r5`。
+- 验证：`TestAccessMode` 7 项（只读补读工具、写全开、全关、写开读关、agy 只补开关、模板自愈、`default` 不动）+ `TestScannedModelsCacheHeal`（旧缓存自愈）；全量 `Ran 118 tests — OK`。CDP 实测：列表两勾选框均为勾选态，弹窗两个勾选框默认勾选，模板随勾选联动为 `Read,Glob,Grep,Write,Edit,Bash` → `Write,Edit,Bash` → `""`。
+
+## A68 · 进行中的卡片一律显示开始时刻 + 实时计时；设置默认进「成员管理」
+
+用户反馈：点「重新生成」后 hy4-std 那一段既没有开始时间也没有计时；顺带设置打开时默认停在「界面语言」而不是常改的「成员管理」。
+
+- 根因（计时）：
+  1. `part_b` 的审核项与 `part_a.final_started_at` 都只在**跑完**才写 `started_at`，进行中这段时间字段是空的 → `briefWhen()` 无内容、无法计时。
+  2. 「重新审核」只把 `task.status` 置 running，没刷新 `task.started_at`，头部 `taskElapsed` 会接着整条任务最早的开始时刻算（看起来像跑了半小时）。
+  3. 进行中的占位文案是静态句号串，没有「在跑」的动感。
+- 后端 `core/tasks.py`：
+  - `_execute_unit` 在 EXEC / REVIEW / DELIVER 起点分别写入 `started_at` / `final_started_at`（并把对应 `finished_at` 清空），进行中即可读。
+  - `retry()` 三个环节都重置 `task["started_at"]`，本轮计时从点下去那一刻算。
+- 前端：
+  - 新增 `cardIsBusy()` / `cardClockStart()`：优先取「正在跑的那一段」的开始时刻；`taskElapsed()` 改为按它算，运行中由 `nowTick` 心跳驱动。
+  - 卡片头部在 `cardIsBusy` 时多一行 `▶ HH:MM:SS`（本轮开始时间），计时文字转蓝色；每段标题后的 `briefWhen()` 改为实时计算（`briefElapsedSec()`）。
+  - 新增 `.thinking-dots`（三点依次亮起 + 轻微上浮，`prefers-reduced-motion` 下静止）；「正在执行，简报生成后会显示在这里」「排队等待中」「正在思考中」三处统一去掉静态省略号、改挂动画点。
+  - `openSettings()` 与 `settingsTab` 默认值改为 `members`。
+  - 资源版本 `?v=20261112r6`。
+- 验证：新增 `TestRunningCardClock` 2 项（审核进行中即有 `started_at` 且 `finished_at` 为空；重新审核会重置卡片计时）；全量 `Ran 120 tests — OK`；i18n 297 条未收录 0。CDP 注入一张运行中卡片实测：头部 `▶ 20:42:04` + `⏱ 1m 16s`，hy4-std 段 `20:42:04 · 1m16s` + 进行中 + 动画占位；设置默认页签为「成员管理」；`.thinking-dots` 动画 `dotBlink 1.2s` 生效。
+
+## A69 · 聊天里的文件名可直接点开预览；卡片每位成员独立成块
+
+- 需求：① 聊天气泡里的文件名点一下就能在工作目录预览面板里读到，不用先去目录树里找；② 协作卡片里几位成员的内容挨在一起，看起来像一整段密密麻麻的文字，要能一眼分出「谁说了什么」。
+- 文件名可点（`static/js/app.js`）：
+  - `renderMdText()` 渲染后统一过一遍 `linkifyFilePaths()`：行内代码 `` `A01.md` `` 与**裸文本**两种写法都认（模型实际输出几乎都不写反引号，还会把名字夹在《》里、后面跟 `:65-83` 行号）。裸文本走 `findFileTokens()`：以「行首/空白/中英标点」为左右边界，只包住文件名本身，行号留在可点范围之外；URL（`https://…` 的尾部、`//` 开头）、`Node.js` 这类框架名、`write_access` 这类标识符都不包。
+  - 点击用 `document` **捕获阶段**的委托（`onDocFileClick`）接管并 `stopPropagation()`，否则点文件名会连带触发父级的「展开/收起」。
+  - `openWorkspacePath()`：相对路径按 `currentSession.workspace_dir` 解析，`normalizeFsPath()` 处理 `./ ../`，绝对路径必须仍在工作目录内，否则提示「这个文件不在当前工作目录里」。
+  - 裸文本里常粘着「参考」「见」这类前缀（`参考亲子教育手册.md`）：先按整串找不到时，用 `matchFileBySuffix()` 到同级目录里按「目录项是它的后缀」再匹配一次，取最长命中。找不到才提示「找不到这个文件」。
+  - 打开前 `focusWorkspaceDir()` 把右侧列表切到该文件所在目录（面包屑同步），关掉预览看到的就是文件所在的地方。
+  - 单任务结果消息新增产物 chips（`msg.artifacts`），卡片详情弹窗的「产物清单」也从纯文本改成可点。`openArtifact()` 会先关掉盖在上面的弹窗，避免「点了没反应」。
+  - `.file-link` 用淡蓝文字 + 虚线下划线（不是整块底色），长中文文件名不会糊成一片蓝。
+- 卡片分块（`static/index.html`）：三段简报的容器改为 `bg-slate-50/80 p-2 space-y-2`，每位成员一个 `rounded-lg border bg-white` 的小块，左侧 3px 状态色条（`rowBarClass()`：进行中蓝 / 失败红 / 取消灰 / 无意见黄 / 完成绿），段头加头像圆点（`rowAvatar()`）+ 角色 chip，操作行（展开全文 / 输入输出 / 重跑）用虚线分隔。`cardBriefRows()` 给主创的两段补上 `memberId` 以便取头像。
+- 验证：全量 `Ran 120 tests — OK`；i18n 301 条未收录 0；资源版本 `?v=20261112r9`。CDP 实测（注入真实格式的回复）：`《…计划.md:65-83》`、`产物 …A01….md（主要产物）`、`docs/README.md` 均成为可点，`https://example.com/a.md` 保持普通链接，`Node.js` 不误判；点 `参考亲子教育硬核手册_八个内容组完整目录.md` 经后缀兜底打开真实文件（8325 字），面包屑停在 `social skill`；产物 chips 点击打开 3827 字；卡片截图确认 4 段各自成块、色条与角色 chip 正常。
+
+## A70 · 恢复流式输出：执行中就能看到「正在写什么」
+
+用户反馈：之前有流式输出，重构后没了，任务跑几十秒只有「正在思考中」，感觉很慢。
+
+- 根因：`913232d` 清旧圆桌系统时把 `core/streaming.py` 与 `Executor._stream_process` 一起删掉了，
+  新的任务系统只走 `p.communicate()`（进程结束才拿到整段 stdout），所以界面在整个等待期只能显示占位。
+- 还有个更深的原因：两边 CLI 的 `-p` 默认输出格式都是 `text`，本来就「跑完才吐」。
+  只恢复增量读取没用，必须同时把输出格式换成流式：
+  - `codebuddy`：`--output-format stream-json --include-partial-messages --verbose`
+  - `agy`：`--output-format stream-json`（它没有 `--include-partial-messages`，多给会报错）
+  - 只在模板自己没写 `--output-format`、且是 `-p/--print` 模式时注入，模板本身不改。
+- 后端：
+  - 新增 `core/streaming.py`：进程内暂存区（`{tid}:{stage}:{member_id}` → 文本 / 阶段 / 工具活动），
+    `for_session()` 取整场并顺手清过期项，单条上限 20 万字符；会话删除时 `clear_session()`。
+  - `core/executor.py`：恢复 `_stream_process()`（双线程抽干 stdout/stderr、`read1` 增量解码、回调限流 0.33s）
+    并新增 `StreamJsonParser`：兼容两家的形状 —— codebuddy 的 `stream_event/thinking_delta/text_delta`、
+    `assistant.tool_use`（把「读哪个文件、跑什么命令」显示成活动）与 `result`；
+    agy 的 `step_update.text_delta` 与 `result.response`。最终文本一律取 `result` 事件，
+    与界面看到的完全一致；非 NDJSON（模板另有打算 / 版本差异）自动退回纯文本。
+  - `run_employee` / `_run_cli` 透传 `on_chunk`；端口冲突重试时换新解析器，不把上一轮的半截文本带过来。
+  - `core/tasks.py`：`_execute_unit` 按执行 key 发布流、`finally` 里清空；审核语义重试前先清一次；
+    执行器不支持 `on_chunk`（假执行器）时自动关闭流式，老测试夹具不受影响。
+  - `app.py`：新增 `GET /api/sessions/<id>/live`（204/空对象都很轻），只回正在生成的文本。
+- 前端：
+  - `app.js`：`liveStreams` / `liveLast` 状态，500ms 轮询（只在有活动任务时发请求）；`liveKeyOf()` 把
+    卡片每一段映射回 `{tid}:{stage}:{member}`，`liveTail()` 只留尾部 900 字，`liveForRow()` / `liveForMsg()`
+    分别服务协作卡片与单任务气泡；`liveLast` 兜住「刚跑完、正式结果还没轮询回来」的一瞬，不闪回占位。
+  - `index.html`：卡片每段与单任务气泡新增实时块 —— 阶段 chip（正在思考 / 正在输出 / 正在读取 · 工具名）+
+    字数 + 纯文本尾部 + 闪烁光标（`.stream-live` 顶部淡出、`.typing-caret`）；没有实时文本时才显示原来的动画省略号。
+    流式内容按纯文本渲染：半成品 Markdown（未闭合代码块、只写一半的表格）会让整块反复变形。
+  - 资源版本 `?v=20261112r10`。
+- 验证：
+  - 新增 `tests/test_streaming.py` 16 项（暂存区隔离/过期/上限、两种事件形状、半行重组、注入规则、
+    透传与清理、假执行器兼容）；全量 `Ran 136 tests — OK`。
+  - 真实 CLI：codebuddy 首段文本 5.0s 到达、13.1s 完成，`/live` 轮询看到 19 次增长（thinking → writing），
+    结束后 `streams` 立刻为空；agy 8.3s 起逐段到达、最终文本与 `result.response` 一致。
+  - CDP 实测：单任务气泡在 16s 显示「正在输出 53 字」+ 正文 + 光标，结束后只剩正式回答；
+    协助任务卡片在交付段显示「正在思考 2618 字」+ 实时文本，三段状态与计时正常。
+  - 顺带修掉一个偶发失败：`test_retry_review_only_updates_that_member` 在 `wait_idle()` 后立刻断言终态，
+    而「审核齐了自动补一次交付」是异步线程，机器负载高时会读到 `running`。改为等终态（`_wait`），
+    连跑 8 轮全绿。
+
+## A71 · 预览实时刷新 / 就地编辑、单任务气泡折叠、默认接话成员、刷新不影响执行
+
+用户一次提了五件事：
+
+1. **预览中的文件被改写要能实时刷新，并且能直接改、直接存**
+   - 后端 `/api/workspace/file` 增加 `meta=1`：只回 `mtime / size`，不读正文。
+     预览面板每 1.2s 探一次指纹（一本几百 KB 的文档不会每秒读一遍盘），
+     变了才重新取正文；图片则用 `&t=<mtime>` 换 URL，绕过浏览器缓存。
+   - 新增 `POST /api/workspace/file` 保存：只允许纯文本白名单后缀（`EDITABLE_EXTS`），
+     写「同目录临时文件 + `os.replace`」保证原子性，保留原文件权限；
+     带 `base_mtime` 做冲突检测，期间被 AI / 编辑器改过返回 409 + `code=conflict`，
+     前端二次确认后带 `force=1` 覆盖。
+   - 前端：面板顶部「✏️ 编辑 / 全屏 / 复制路径」（A73 去掉了「刷新」与「实时刷新」两个按钮，
+     自动刷新保持常开）；编辑态是等宽 textarea，⌘/Ctrl+S 保存、Esc 取消（不会顺手关掉整个面板），
+     未保存时标题旁标 `● 未保存`；自动刷新时右上角显示「刚刚已更新 / N 秒前已更新」。
+     编辑期间暂停自动刷新，避免把草稿冲掉。
+
+2. **拖右栏改变宽度后，长气泡被切掉却看不到后面的内容**
+   - 根因：折叠限高 `.msg-clamped` 一直生效，但「有没有被截断」只在消息**条数增加**时测量。
+     单任务回答是先建一条空消息、正文随后填进去（条数没变）→ 从不测量 →
+     内容被切掉、`展开全文` 按钮也不出现，看起来就是「挤下去了又翻不到」。
+   - 修法：`pollActiveSession` 只要会话签名变化就重新测量；`ResizeObserver` 监听聊天区
+     （拖右栏、缩放窗口都会触发），合并 120ms 内多次触发；拖拽结束同样补一次。
+   - 顺带把中间列补上 `min-h-0`、聊天区加 `overscroll-contain`；
+     拖拽改用 blur 兜底清理（鼠标在窗口外松开时 `mouseup` 收不到，页面会卡在
+     `col-resize` + 不能选字的状态继续跟着鼠标改宽度）。
+
+3. **单任务回答也要能展开 / 收起，高度约 20 行**
+   - 新增 `.msg-clamped-task`：`max-height: min(calc(20 * 1.7em), 64vh)`；
+     `msgClampClass(msg)` 按消息类型选档，卡片里的长文仍是原来的一屏；
+     正在跑、还没有正文的消息不折叠。
+
+4. **消息里没 @ 任何人时，默认跟最近沟通过的 AI 说话**
+   - `core/tasks.py` 新增 `last_ai_member()`：从后往前找本场会话里回过话、
+     且现在仍可用（enabled + 有 CLI 配置）的成员；没有 @ 时用它作为 owner。
+     引用回复 / 显式 @ 仍然优先；一个可用成员都没有时，消息只作上下文保留。
+   - 用户消息写入 `auto_to = {id, name}`（只作数据留痕，A73 起不再在气泡上显示提示）。
+
+5. **刷新页面会不会影响正在跑的 AI；为什么刷新后出现「● tool」**
+   - 任务跑在服务端线程里，状态与会话都落盘，刷新只重建界面，不会终止执行；
+     `/live` 是进程内暂存，刷新后下一轮 500ms 轮询就能重新接上。
+   - 「tool」是因为 agy 的 `step_type` 只有笼统的 `"tool"`，旧代码把它当活动文案直出。
+     现在解析 `tool_name` + `tool_info.parameters`（`read_file · /tmp/note.md`），
+     前端 `toolLabel()` 再翻成人话（读取文件 / 执行命令……），
+     认不出的泛型词统一显示「正在调用工具」。
+   - 实测：agy 读文件时活动为 `read_file · /tmp/agy_probe_note.md`（13.4s 完成）。
+
+验证：
+- 新增测试 9 项（meta 指纹、保存/冲突/force/二进制拒绝/越界拒绝、默认接话 4 项、
+  agy 工具名解析 2 项）；全量 `Ran 148 tests — OK`。
+- 无头浏览器实测：长回答限高 476px（20 行）+「展开全文」，展开后 963px；
+  外部进程改写 `notes.md` 后 1.2s 内面板内容与「刚刚已更新」同步；
+  面板内编辑保存后磁盘内容一致、toast「已保存」；
+  回答「稍后到达」时（条数不变）也能在下一轮轮询后出现展开按钮。
+- 资源版本 `?v=20261112r11`；i18n 338 条，未收录 0。
+
+## A72 · 修复 agy 回答「同一句话重复三遍、链接被截断」
+
+用户反馈：一条 agy 的回复开头变成
+
+```
+已按要求完成对 [亲子教育硬核手册_…A01_一
+已按照要求完成对 [亲子教育硬核手册_…_标杆场景_
+已按要求完成对 [A01 实操指南：开工防磨蹭清障法](file:///…E4%BA%B2…md) 的全面修订，具体改动如下：
+```
+
+- 定位：`raw_response` 本身就是错的（不是渲染问题）。该任务跑在 agy 上（`emp_agy`，293 秒）。
+- 根因：agy 的 stream-json 里，模型每次「说到一半去读写文件」都会结束当前 `agent_response` step、
+  换一个 `step_index` 重新开口。旧解析器把所有 step 的 `text_delta` 首尾相接放到 `self.text`，
+  `result` 事件缺失时 `final_text` 用这个拼接结果 → 两段半截草稿 + 一段完整回答串成一条。
+  三条证据：① 三段 URL 写法各不相同（未编码 / 未编码 / 百分号编码），是三次独立生成而非流式重发；
+  ② 每段都以完整句子开头、中间没有连接词；③ 只有中间两段「话没说完」。
+- 修法（`core/executor.py`）：
+  - `StreamJsonParser` 增加分段缓冲 `_segments`：agy 按 `step_index`、codebuddy 按 `message_start`
+    切换段落，`text_delta` / `thinking_delta` 只写进当前段。
+  - `live_text` / `final_text` 都只暴露**最后一段**；`result` 事件存在时仍以它为准（权威答复）。
+  - `self.text` 保留全量，只用于调试与兼容旧断言，不再参与最终输出。
+- 历史数据：把这条消息、以及同一任务的 `task_record` 副本按「最后一次出现的开头」截取
+  （1110 → 898 字），改动前备份在 `/tmp/6373f3ce.bak.json`。
+- 验证：新增 3 项回归测试（agy 多 step 只留最后一段、codebuddy 第二条消息覆盖第一条草稿、
+  result 优先于 step 草稿）；全量 `Ran 151 tests — OK`；真实 agy 改文档（257 秒，含 edit_file）
+  输出 408 字、无重复开头；界面复查该消息只显示一段完整回答。
+- 另外扫了全部会话：其余「重复前缀」命中都是正文里的列表项（`- **版本 A`、`- \`A01…\``），
+  不是解析问题，未改动。
+
+## A73 · 去掉「默认发给」提示与预览顶部的两个刷新按钮
+
+- 聊天气泡：用户消息下方不再显示「↪ 默认发给 XXX」。默认接话逻辑完全保留
+  （`last_ai_member()` 仍决定 owner），`auto_to` 字段继续写入会话，只作数据留痕。
+  同时清掉「默认发给」「这条消息没有 @ 成员…」两条 i18n 词条。
+- 文件预览顶部：去掉「🔄 刷新」与「⚡ 实时刷新（可暂停）」两个按钮，只留
+  「✏️ 编辑 / 全屏 / 复制路径 / ×」。自动刷新改为常开（1.2s 探一次 mtime，变了才读正文），
+  编辑期间照旧暂停；「刚刚已更新 / N 秒前已更新」提示保留。
+  随之删掉 `togglePreviewAutoRefresh()` / `refreshPreviewNow()` 与 `previewAutoRefresh` 状态，
+  以及 4 条不再使用的词条。
+- 验证：无头浏览器实测 `pageHasLabel=false`、`msgHasAutoTo=true`（数据在、提示不在）；
+  预览面板按钮列表里 `hasRefresh=false`、`hasLive=false`，编辑/全屏/复制路径仍在。
+  i18n 331 条、未收录 0；资源版本 `?v=20261112r12`。

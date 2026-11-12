@@ -108,6 +108,8 @@ The instruction and the mentions decide the type.
 
 **Single task** — `@` one member and ask it to do something. The task joins that member's queue, runs independently, and produces one result message (Markdown body + artifact info). Cancel / Retry / Regenerate live directly on that message.
 
+You can also skip the `@`: the message goes to the member you last talked to in this session (shown as "Sent to X" on the bubble), so follow-up questions don't need re-mentioning. If no AI has spoken in the session yet, the message is kept as context only.
+
 **Collaborative task** — start with `/collab`. Exactly **one round** of three stages: owner executes → reviewers work in parallel → owner delivers. Input is validated strictly: one explicit owner, at least one reviewer after it, and a task description; anything missing is rejected with a hint. Mentions may appear anywhere in the sentence, and forms such as `@DS4`, `@//agy/` or `@DeepSeek-V4 (DS4)` are recognised.
 
 ```mermaid
@@ -134,6 +136,8 @@ flowchart TD
 
 The user's original wording (minus the command prefix and mentions) is passed along as-is; the software does not parse the goal or invent acceptance criteria. Reviewers are always **read-only** and never modify the owner's artifacts. If a reviewer fails, times out, is cancelled, or gives no opinion, the card records its status and the owner still delivers.
 
+**Review standard** (`prompts/roles/reviewer.md`): (1) **Find real risks** — flaws in logical consistency, boundary conditions and practical usability; boundaries are not code-only: a plan is checked against changed constraints / rollout gaps, a product design against user segments / edge flows. (2) **Offer better ideas** — if the owner's solution is merely adequate, propose a cleverer or more efficient alternative; it may be an unwritten idea, but must be marked optional with its preconditions and cost. (3) **Be concrete** — no length cap, yet no filler, courtesy phrases or vague theory; every item must point to a file or location and say what to change. (4) **Pass when it is good enough** — write a leading `[通过]` (pass) with a one-line highlight, and never pad the review with trivial nits. The yardstick is ordered "user's wording > the artifact's own stated goals > general correctness"; the software defines review methodology, not task acceptance criteria. A `[通过]` verdict flows to the card (green Pass tag), the flow log and the owner's prompt ("no changes required"), so the owner does not invent work for a reviewer who already passed. Protocol files are read from disk on every run: clicking **Review again** rebuilds the full input with the current standards instead of replaying a saved prompt. Older input snapshots are kept for history only and are never sent to the model; the UI adds no protocol-version annotations — the rebuilt input itself shows the current standards.
+
 ---
 
 <a id="card"></a>
@@ -143,7 +147,7 @@ The user's original wording (minus the command prefix and mentions) is passed al
 A collaborative task creates a card in the chat stream immediately — you can read a whole round **without opening a dialog**:
 
 - **Header**: goal, overall status, creation time, elapsed time, member count, artifact count, three-step progress and "n/m complete". Clicking the header folds / expands the whole card; the header and the latest flow line stay visible, and the collapsed layout keeps the same ~8-line typography as the expanded one.
-- **One row per role**: 🎯 owner execution, 🤝 one row per reviewer, 📦 owner delivery. Each row shows status, start time and duration, a Markdown brief (long ones clamp to ~8 lines while keeping headings and lists), and three actions: `Show more/less`, `Input / output ›`, and `Execute again / Review again / Regenerate delivery` (or `Cancel` while running). Clicking the body only folds; only "Input / output" opens a dialog.
+- **One row per role**: 🎯 owner execution, 🤝 one row per reviewer, 📦 owner delivery. Each row shows status, start time and duration, a Markdown brief (long ones clamp to ~8 lines while keeping headings and lists), and three actions: `Show more/less`, `Input / output ›`, and `Execute again / Review again / Regenerate delivery` (or `Cancel` while running). A reviewer who passes gets an extra green Pass tag on that row. Clicking the body only folds; only "Input / output" opens a dialog.
 - **Footer**: the latest flow entry and "Full task details".
 
 **One auto-supplemented delivery after reviews conclude** — after any review is rerun, once every reviewer has a conclusion (`done` / `no opinion`), the system regenerates the final version against the latest feedback and tags the delivery row "↻ Regenerated after reviews" (hover for the exact time). The flow log states that this delivery was auto-supplemented. Parallel reruns of two reviewers still trigger only one delivery. If any review failed, timed out or was cancelled, nothing is auto-supplemented; the card shows "Comments updated · final version pending" and the user decides via "Regenerate delivery". A manual regeneration clears the auto label.
@@ -210,7 +214,7 @@ A set of protocol texts ships with the app; the server adds them to a member's i
 | `prompts/protocol/task-flow.md` | Collaboration flow and stage order |
 | `prompts/roles/single.md` | Single-task member: finish the job, output prose and an artifact registry |
 | `prompts/roles/owner.md` | Owner: do the work, register artifacts, revise from feedback and deliver |
-| `prompts/roles/reviewer.md` | Reviewer: read-only, read the real artifacts, give an opinion |
+| `prompts/roles/reviewer.md` | Reviewer: read-only, four review standards, `[通过]` verdict and registry block |
 
 ---
 
@@ -239,7 +243,7 @@ Built as a **local-first, single-user** tool:
 .venv/bin/python -m unittest discover -s tests -v
 ```
 
-All **96 tests pass**, covering instruction parsing, queues and parallelism, the three-stage flow, cancel / retry, auto-supplemented delivery, restart recovery, read-only reviews, the CLI environment allow-list, message deletion and context, file-preview endpoints and HTTP APIs. Line-by-line verification is in the [acceptance record](docs/acceptance.md) (A1–A56); design detail lives in the [design notes](docs/task-review-protocol.md).
+All **105 tests pass**, covering instruction parsing, queues and parallelism, the three-stage flow, cancel / retry, auto-supplemented delivery, the four review standards, the `[通过]` verdict path and prompts rebuilt from the current protocol, restart recovery, read-only reviews, the CLI environment allow-list, message deletion and context, file-preview endpoints and HTTP APIs. Line-by-line verification is in the [acceptance record](docs/acceptance.md) (A1–A59); design detail lives in the [design notes](docs/task-review-protocol.md).
 
 ---
 

@@ -6,6 +6,8 @@ import shutil
 import subprocess
 from typing import List, Dict, Any
 
+from core.executor import normalize_cli_tools
+
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(BASE_DIR, "data")
 CACHE_FILE = os.path.join(DATA_DIR, "scanned_models.json")
@@ -51,7 +53,17 @@ def _load_cache() -> List[Dict[str, Any]]:
 
     if not isinstance(models, list):
         return []
-    return [m for m in models if isinstance(m, dict) and m.get("cli_cmd")]
+    # 旧缓存（以及旧版列表格式）里存的是 `--tools ""` 模板，直接拿来建成员会得到
+    # 一个「读不到任何文件」的只读成员 —— 这是新建成员后只会回开场白的根因之一。
+    # 这里统一按只读权限补回 Read/Glob/Grep，让历史缓存也能自愈。
+    healed = []
+    for m in models:
+        if not isinstance(m, dict) or not m.get("cli_cmd"):
+            continue
+        m = dict(m)
+        m["cli_cmd"] = normalize_cli_tools(m["cli_cmd"], read_access=True, write_access=False)
+        healed.append(m)
+    return healed
 
 
 def scan_local_models(force_refresh: bool = False) -> List[Dict[str, Any]]:

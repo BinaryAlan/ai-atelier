@@ -1,5 +1,25 @@
 const { createApp } = Vue;
 
+// 聊天里「像个文件」的判定：只认带已知扩展名的单个 token。
+// 名字起得再像也不认（比如 write_access），否则正文里满屏都会变成可点链接。
+const FILE_EXT_ALT = "md|markdown|mdx|txt|json|jsonl|ya?ml|toml|ini|conf|env|xml|csv|tsv|log|py|js|mjs|cjs|jsx|ts|tsx|vue|html?|css|scss|less|sh|bash|zsh|sql|java|kt|go|rs|rb|php|swift|cc|cpp|hpp|png|jpe?g|gif|webp|bmp|svg|ico|pdf|docx?|xlsx?|pptx?";
+const FILE_EXT_RE = new RegExp("\\.(?:" + FILE_EXT_ALT + ")$", "i");
+// 「Node.js / Next.js」这类框架名不是工作目录里的文件，别包成可点
+const FILE_TOKEN_DENY = /^(node|next|nuxt|vue|react|angular|svelte|ember|express|nest|three|d3|chart|moment|alpine|jquery|backbone|knex|prisma|vite|webpack)\.js$/i;
+
+// 预览面板里允许「直接编辑并保存」的后缀：与后端 EDITABLE_EXTS 保持一致。
+// 二进制文件（docx / 图片 / 压缩包）绝不能当文本写回去。
+const EDITABLE_EXTS = new Set([
+  "md", "markdown", "mdx", "txt", "text", "log",
+  "json", "jsonl", "yml", "yaml", "toml", "ini", "conf", "cfg",
+  "csv", "tsv", "html", "htm", "css", "scss", "less",
+  "js", "mjs", "cjs", "ts", "tsx", "jsx", "vue", "svelte",
+  "py", "sh", "bash", "zsh", "sql", "xml", "java", "go", "rs", "rb", "php",
+]);
+
+// 实时刷新轮询间隔：AI 正在写文件时，面板里能跟着变；1.2s 足够快又不至于压满磁盘
+const PREVIEW_POLL_MS = 1200;
+
 createApp({
   data() {
     return {
@@ -36,12 +56,22 @@ createApp({
       // 哪些消息真的被限高截断了（渲染后实测，决定是否给「展开全文」按钮）
       overflowMsgs: {},
       workspaceItems: [],
+      workspaceCurrentDir: "",           // 当前正列出的目录（默认是会话根目录）
+      workspacePathStack: [],            // 面包屑栈：[{ name, path }]，末项即当前目录，支持回跳上级
       selectedWorkspaceFile: null,
       selectedFileContent: "",
       // 文件预览弹窗：右侧面板只列目录，点文件在这里看，md 走渲染、图片走 img、其余按等宽文本
       showFilePreview: false,
-      filePreview: null,          // { name, path, size, kind, content, error }
+      // { name, path, size, mtime, kind, content, url, error, updatedAt, external }
+      filePreview: null,
       filePreviewLoading: false,
+      previewUpdatedAt: 0,       // 最近一次因外部改写而重新读取的时刻（毫秒）
+      // 预览面板的「就地编辑」：draft 是草稿，dirty 用于确认是否放弃
+      previewEditing: false,
+      previewDraft: "",
+      previewDirty: false,
+      previewSaving: false,
+      previewPollTimer: null,
 
       showMemberDropdown: false,
 
@@ -71,7 +101,8 @@ createApp({
 
       // 设置中心：成员管理 / 界面语言 / 服务
       showSettings: false,
-      settingsTab: "general",
+      // 设置默认落在「成员管理」：日常最常改的就是这个，界面语言基本一次设完
+      settingsTab: "members",
       settingsTabs: [
         { key: "general", icon: "🎛️", label: "界面语言" },
         { key: "members", icon: "👥", label: "成员管理" },
@@ -94,7 +125,10 @@ createApp({
         system_prompt: "",
         enabled: true,
         timeout: 0,
-        write_access: false
+        // 新建成员默认「读 + 写」都开：只勾读不足以做实际交付，
+        // 两个都不勾则连产物都读不到（只会回一句「我先读取一下」）。
+        write_access: true,
+        read_access: true
       },
       presetAvatars: ["🤖", "🧠", "⚡", "🦉", "🛡️", "🚀", "💻", "🔬", "🎯", "🎨", "👑", "🕵️", "🔧", "💡", "⚖️", "📊"],
 
@@ -133,6 +167,12 @@ createApp({
       defaultWorkspaceDir: "",
       switchToken: 0,     // 会话切换请求序号，用于丢弃过期的在途响应
       pollInterval: null,
+      // 正在生成的文本（服务端进程内暂存，不落库）：key = `{task_id}:{stage}:{member_id}`
+      liveStreams: {},
+      // 刚结束、正式结果还没轮询回来的一小段时间里，先用上一份文本兜着，
+      // 免得卡片从「正在写」闪回「正在思考中」
+      liveLast: {},
+      liveInterval: null,
 
       // 服务进程控制（状态 / 重启 / 停止）
       systemStatus: null,
@@ -201,12 +241,8 @@ createApp({
     // 起因：端口冲突修复上线后，用户点开一条旧记录看到满屏 EADDRINUSE，
     // 会以为「修了还在报」。原文一个字不改（可复制、可排查），只在上面加一句说明。
     inspectNote() {
-      const text = String(
-        (this.inspectingMsg &&
-          (this.inspectingMsg.raw_response || this.inspectingMsg.content)) ||
-          ""
-      );
-      if (!text) return "";
+      const msg = this.inspectingMsg || {};
+      const text = String(msg.raw_response || msg.content || "");
       if (/EADDRINUSE|address already in use/i.test(text)) {
         return this.t(
           "这是命令行的端口冲突：CLI 启动时要监听的本机端口被别的程序占了，进程随即退出，所以这一环节没有产出。当前版本会在干净环境里启动 CLI，撞端口还会自动重试；若这条是较早的记录，点该环节的「重试」跑一次即可确认。"
@@ -348,15 +384,29 @@ createApp({
     this.restoreLayout();
     this.init();
     this.pollInterval = setInterval(this.pollActiveSession, 1500);
+    // 正在生成的文本单独轮询：会话接口 1.5s 一次且整份重渲染，做不了「逐句增长」
+    this.liveInterval = setInterval(this.pollLiveStreams, 500);
     // 卡片外壳的「实时耗时」流水：每秒只更新一个时间戳，不重拉接口
     this.tickTimer = setInterval(() => { this.nowTick = Date.now(); }, 1000);
     // 全局点击关闭成员下拉框
     document.addEventListener("click", this.handleGlobalClick);
+    // 聊天气泡里的文件名：v-html 里挂不了 Vue 事件，用捕获阶段的委托来接管，
+    // 免得点了文件名还顺带触发父级的「展开全文 / 收起」
+    document.addEventListener("click", this.onDocFileClick, true);
     // 拖拽调宽
     window.addEventListener("mousemove", this.onDragMove);
     window.addEventListener("mouseup", this.onDragEnd);
+    window.addEventListener("blur", this.onDragEnd);
     window.addEventListener("resize", this.onWindowResize);
     window.addEventListener("keydown", this.onGlobalKeydown);
+    // 预览面板里的文件可能正被 AI 改写：低频轮询 mtime，变了才重读正文
+    this.previewPollTimer = setInterval(this.pollPreviewFile, PREVIEW_POLL_MS);
+    // 拖拽右栏 / 缩放窗口都会让气泡重新排版：高度变了要重新量「有没有被截断」，
+    // 否则一条长回答会被限高切掉、却因为没有「展开全文」按钮而看不到后半段
+    if (typeof ResizeObserver === "function" && this.$refs.chatContainer) {
+      this.chatResizeObserver = new ResizeObserver(() => this.scheduleMsgOverflowMeasure());
+      this.chatResizeObserver.observe(this.$refs.chatContainer);
+    }
     // markdown 里的 mermaid 图要在 v-html 落地后再换成 SVG。
     // 聊天流、预览弹窗、任务详情都会插入新节点，统一用观察器兜住，不用每处都插一次调用。
     this.mermaidObserver = new MutationObserver(this.scheduleMermaid);
@@ -365,12 +415,18 @@ createApp({
   },
   beforeUnmount() {
     if (this.pollInterval) clearInterval(this.pollInterval);
+    if (this.liveInterval) clearInterval(this.liveInterval);
     if (this.tickTimer) clearInterval(this.tickTimer);
+    if (this.previewPollTimer) clearInterval(this.previewPollTimer);
+    if (this._overflowTimer) clearTimeout(this._overflowTimer);
+    if (this.chatResizeObserver) this.chatResizeObserver.disconnect();
     if (this.mermaidObserver) this.mermaidObserver.disconnect();
     if (this._mermaidTimer) clearTimeout(this._mermaidTimer);
     document.removeEventListener("click", this.handleGlobalClick);
+    document.removeEventListener("click", this.onDocFileClick, true);
     window.removeEventListener("mousemove", this.onDragMove);
     window.removeEventListener("mouseup", this.onDragEnd);
+    window.removeEventListener("blur", this.onDragEnd);
     window.removeEventListener("resize", this.onWindowResize);
     window.removeEventListener("keydown", this.onGlobalKeydown);
   },
@@ -378,7 +434,9 @@ createApp({
     // Esc 关掉最上面那层弹窗（文件预览 → 输入输出 → 任务详情），输入框里按 Esc 不受影响
     onGlobalKeydown(e) {
       if (e.key !== "Escape") return;
-      if (this.showFilePreview) { this.closeFilePreview(); return; }
+      // 正在编辑文件时按 Esc 只退出编辑，别把整个预览面板关掉（草稿还在，可以再来）
+      if (this.previewEditing) { this.cancelPreviewEdit(); return; }
+      if (this.filePreview) { this.closeFilePreview(); return; }
       if (this.showInspectModal) { this.showInspectModal = false; return; }
       if (this.showCardModal) { this.showCardModal = false; }
     },
@@ -420,6 +478,7 @@ createApp({
         key: "exec",
         icon: "🎯",
         name: ownerName,
+        memberId: (card.owner && card.owner.id) || "",
         role: this.t("主创"),
         stage: this.t("执行"),
         status: a.status || "waiting",
@@ -447,6 +506,9 @@ createApp({
           role: this.t("协助审核"),
           stage: this.t("审核"),
           status: st,
+          // 审核规程的「达标即过」：verdict=pass 时卡片挂一个「通过」标签，
+          // 让「没有改动要求」和「提了意见」一眼可分
+          reviewVerdict: item.review_verdict || "",
           elapsed: Number(item.elapsed) || 0,
           started_at: item.started_at || null,
           finished_at: item.finished_at || null,
@@ -467,6 +529,7 @@ createApp({
         key: "deliver",
         icon: "📦",
         name: ownerName,
+        memberId: (card.owner && card.owner.id) || "",
         role: this.t("主创"),
         stage: this.t("交付"),
         status: a.final_status || "waiting",
@@ -509,8 +572,8 @@ createApp({
           : this.t("已超时，点击查看已产出的内容");
       }
       if (raw) return raw;
-      if (["running", "in_progress"].includes(st)) return this.t("正在执行，简报生成后会显示在这里…");
-      if (["waiting", "queued"].includes(st)) return this.t("排队等待中…");
+      if (["running", "in_progress"].includes(st)) return this.t("正在执行，简报生成后会显示在这里");
+      if (["waiting", "queued"].includes(st)) return this.t("排队等待中");
       if (st === "failed") return this.t("执行失败，点击查看报错详情");
       if (st === "timeout") return this.t("已超时，点击查看已产出的内容");
       if (st === "no_opinion") return this.t("未提出意见");
@@ -548,19 +611,31 @@ createApp({
       const text = this.briefText(row);
       return text.length > 96 || text.split("\n").length > 3;
     },
+    // 这一段的秒数：运行中按心跳实时算（卡片计时才会动），其余用落库的 elapsed
+    briefElapsedSec(row) {
+      const st = String((row && row.status) || "");
+      const start = Number((row && row.started_at) || 0);
+      if (["running", "in_progress"].includes(st) && start) {
+        return Math.max(0, Math.floor(this.nowTick / 1000) - start);
+      }
+      return Number((row && row.elapsed) || 0);
+    },
+    fmtSec(sec) {
+      const s = Math.max(0, Math.round(Number(sec) || 0));
+      if (!s) return "";
+      return s >= 60 ? `${Math.floor(s / 60)}m${Math.round(s % 60)}s` : `${s}s`;
+    },
     briefElapsed(row) {
-      const sec = Number((row && row.elapsed) || 0);
-      if (!sec) return "";
-      return sec >= 60 ? `${Math.floor(sec / 60)}m${Math.round(sec % 60)}s` : `${Math.round(sec)}s`;
+      return this.fmtSec(this.briefElapsedSec(row));
     },
     // 卡片每段标题后的时间：几点开始 + 跑了多久。
     // 老任务没有 started_at（这个字段是后加的），退回只显示耗时，不显示 "Invalid Date"
     briefWhen(row) {
       const ts = Number((row && row.started_at) || 0);
-      const sec = Number((row && row.elapsed) || 0);
-      if (!ts) return sec ? this.briefElapsed(row) : "";
+      const text = this.fmtSec(this.briefElapsedSec(row));
+      if (!ts) return text;
       const clock = this.formatFlowTime(ts);
-      return sec ? `${clock} · ${this.briefElapsed(row)}` : clock;
+      return text ? `${clock} · ${text}` : clock;
     },
     briefWhenTitle(row) {
       const s = Number((row && row.started_at) || 0);
@@ -589,6 +664,111 @@ createApp({
     },
     briefBusy(row) {
       return ["running", "in_progress"].includes((row && row.status) || "");
+    },
+
+    // 每段左侧的状态色条：谁在跑、谁失败、谁通过，不读文字也能分出来。
+    // 用独立色条而不是给容器加 border-l，避免和容器的统一边框抢颜色。
+    rowBarClass(row) {
+      const st = String((row && row.status) || "");
+      if (["running", "in_progress"].includes(st)) return "bg-blue-400";
+      if (["failed", "timeout"].includes(st)) return "bg-rose-400";
+      if (st === "cancelled") return "bg-gray-300";
+      if (st === "no_opinion") return "bg-amber-400";
+      if (["done", "delivered"].includes(st)) return "bg-emerald-400";
+      return "bg-slate-300";
+    },
+
+    // 段头的头像：优先用成员的 emoji 头像，查不到就退回环节图标
+    rowAvatar(row) {
+      const id = (row && row.memberId) || "";
+      const emp = id ? (this.settings.employees || []).find(e => e.id === id) : null;
+      return (emp && emp.avatar) || (row && row.icon) || "🤖";
+    },
+    // 还没有正文、但这一轮正在跑（或排队）：显示带动画省略号的占位，而不是渲染空 markdown
+    briefLivePlaceholder(row) {
+      const has = String((row && row.brief) || "").trim();
+      return !has && ["running", "in_progress", "waiting", "queued"].includes((row && row.status) || "");
+    },
+
+    // ---------------- 实时输出（流式） ----------------
+    // 服务端的 key 是 `{task_id}:{stage}:{member_id}`（见 core/streaming.py），
+    // 卡片上每一段的 row.key 要映射回这个三元组才能对上号
+    liveKeyOf(card, row) {
+      const tid = (card && card.task_id) || "";
+      const key = (row && row.key) || "";
+      if (!tid || !key) return "";
+      const stage = key === "deliver" ? "deliver" : (key.indexOf("review:") === 0 ? "review" : "exec");
+      return `${tid}:${stage}:${row.memberId || ""}`;
+    },
+    liveTail(text, limit) {
+      const body = String(text || "");
+      const max = limit || 900;
+      if (body.length <= max) return body;
+      // 只显示尾部：长回答要看到「现在写到哪」，而不是最早那几段
+      return "…" + body.slice(body.length - max);
+    },
+    // CLI 的工具名大多是英文 / 下划线（read_file、run_command），直接显示成
+    // 「● tool」这种谁也不知道在干什么的标签。这里翻成人话，认不出来的保留原名，
+    // 但一定带上「正在调用工具」的上下文。
+    toolLabel(activity) {
+      const raw = String(activity || "").trim();
+      if (!raw) return "";
+      const parts = raw.split(" · ");
+      const name = parts[0] || "";
+      const detail = parts.slice(1).join(" · ");
+      const map = {
+        read_file: "读取文件", read: "读取文件", readfile: "读取文件", read_multiple_files: "读取文件",
+        write_file: "写入文件", write: "写入文件", writefile: "写入文件",
+        edit_file: "修改文件", edit: "修改文件", str_replace: "修改文件", apply_patch: "修改文件",
+        list_dir: "浏览目录", ls: "浏览目录", list_directory: "浏览目录",
+        glob: "查找文件", grep: "搜索内容", search: "搜索内容", codebase_search: "搜索内容",
+        run_command: "执行命令", bash: "执行命令", shell: "执行命令", terminal: "执行命令",
+        web_search: "联网搜索", webfetch: "抓取网页", web_fetch: "抓取网页", fetch: "抓取网页",
+        todo_write: "整理计划", task: "派发子任务",
+      };
+      const raw0 = map[String(name).toLowerCase()] || name;
+      const zh = map[String(name).toLowerCase()] ? this.t(raw0) : raw0;
+      return detail ? `${zh} · ${detail}` : zh;
+    },
+    livePhaseText(stream) {
+      const phase = (stream && stream.phase) || "";
+      if (phase === "tool") {
+        // 工具阶段直接显示在干什么（读取文件 · docs/plan.md / 执行命令 · npm test），
+        // 比一句笼统的「正在思考」更能解释这段时间
+        const act = String((stream && stream.activity) || "").trim();
+        // 后端在拿不到具体工具名时会退化成步骤类型（tool / step / observation），
+        // 这种词对用户没有信息量，统一说「正在调用工具」
+        if (!act || /^(tool|tool_use|tool_call|step|observation|action|function|unknown)$/i.test(act)) {
+          return this.t("正在调用工具");
+        }
+        return this.toolLabel(act);
+      }
+      if (phase === "thinking") return this.t("正在思考");
+      if (phase === "writing") return this.t("正在输出");
+      return this.t("正在输出");
+    },
+    // 卡片某一段的实时文本：优先取当前流；刚结束那一瞬用上一份兜住，避免闪回占位。
+    // 还没有正文、但模型正在读文件 / 跑命令时也算「有进展」：把工具活动放出来，
+    // 比一直显示「正在思考中」更能解释这段时间在干什么。
+    liveForRow(card, row) {
+      const key = this.liveKeyOf(card, row);
+      if (!key) return null;
+      const cur = this.liveStreams[key];
+      if (cur && (cur.text || (cur.activity && cur.phase === "tool"))) return cur;
+      const last = this.liveLast[key];
+      if (last && last.text && this.briefBusy(row)) return last;
+      return null;
+    },
+    // 单任务结果消息：执行阶段永远是主创本人，key 与卡片执行段同源
+    liveForMsg(msg) {
+      const tid = (msg && msg.task_id) || "";
+      if (!tid) return null;
+      const key = `${tid}:exec:${msg.sender || ""}`;
+      const cur = this.liveStreams[key];
+      if (cur && (cur.text || (cur.activity && cur.phase === "tool"))) return cur;
+      const last = this.liveLast[key];
+      if (last && last.text && ["running", "queued"].includes(msg.status)) return last;
+      return null;
     },
 
     // 「输入输出」弹窗的入参：从卡片直接取那一段（补齐起止时刻，
@@ -777,12 +957,60 @@ createApp({
       if (card.step === 3) return this.t("主创交付中");
       return this.t("排队中");
     },
+    // 卡片是否有环节正在跑：头部要据此显示「开始时刻 + 实时计时」
+    cardIsBusy(card) {
+      if (!card) return false;
+      const a = card.part_a || {};
+      if (["running", "in_progress"].includes(String(a.status || ""))) return true;
+      if (["running", "in_progress"].includes(String(a.final_status || ""))) return true;
+      return (card.part_b || []).some(i =>
+        ["running", "in_progress"].includes(String(i.status || ""))
+      );
+    },
+    // 这一轮到底从哪一刻开始：优先用「正在跑的那一段」的 started_at。
+    // 单条重审 / 重新生成交付都不该沿用整条任务最早的 started_at（那会显示成跑了半小时）。
+    cardClockStart(card) {
+      if (!card) return 0;
+      const a = card.part_a || {};
+      if (["running", "in_progress"].includes(String(a.status || "")) && a.started_at) {
+        return Number(a.started_at);
+      }
+      if (["running", "in_progress"].includes(String(a.final_status || "")) && a.final_started_at) {
+        return Number(a.final_started_at);
+      }
+      const busy = (card.part_b || []).find(i =>
+        ["running", "in_progress"].includes(String(i.status || "")) && i.started_at
+      );
+      if (busy) return Number(busy.started_at);
+      return Number(card.started_at || 0);
+    },
     taskElapsed(card) {
-      if (!card || !card.started_at) return "0s";
+      const start = this.cardClockStart(card);
+      if (!start) return "0s";
       const end = card.finished_at || Math.floor(this.nowTick / 1000);
-      const sec = Math.max(0, end - card.started_at);
+      const sec = Math.max(0, end - start);
       if (sec < 60) return `${sec}s`;
       return `${Math.floor(sec / 60)}m ${sec % 60}s`;
+    },
+    // 单任务结果消息（如给 agy 发消息）顶部的时间：
+    // 执行中实时跳动（nowTick 驱动），完成后按 started_at/finished_at 算真实耗时，
+    // 全都统一进阶成分钟；老消息没有 started_at 就退回 elapsed_time。
+    msgElapsed(msg) {
+      if (!msg) return "";
+      const s = Number(msg.started_at || 0);
+      const f = Number(msg.finished_at || 0);
+      let sec;
+      if (s) {
+        const end = f || Math.floor(this.nowTick / 1000);
+        sec = Math.max(0, Math.round(end - s));
+      } else {
+        sec = Math.round(Number(msg.elapsed || msg.elapsed_time || 0));
+        if (!sec) return "";
+      }
+      if (sec < 60) return `${sec}s`;
+      const m = Math.floor(sec / 60);
+      const r = sec % 60;
+      return r ? `${m}m ${r}s` : `${m}m`;
     },
     // 同一成员多个任务排队时，外壳上显示它在队列里的位置
     queueHint(taskId, memberId) {
@@ -875,7 +1103,7 @@ createApp({
     },
 
     // ------------------- 设置中心 -------------------
-    openSettings(tab = "general") {
+    openSettings(tab = "members") {
       this.settingsTab = tab;
       this.showSettings = true;
       if (tab === "service") this.fetchSystemStatus();
@@ -891,7 +1119,8 @@ createApp({
     // 结束当前的自主任务（负责人不再自动往下跑，已产出的内容都保留）
     onWindowResize() {
       this.clampPanels();
-      this.measureMsgOverflow();
+      // 连续缩放窗口时 resize 每秒能来几十次，合并成一帧后再量
+      this.scheduleMsgOverflowMeasure();
     },
 
     handleGlobalClick(e) {
@@ -933,6 +1162,7 @@ createApp({
       this.dragStartX = e.clientX;
       this.dragStartW = target === "sidebar" ? this.sidebarWidth : this.rightWidth;
       document.body.style.cursor = "col-resize";
+      document.documentElement.style.cursor = "col-resize";
       document.body.style.userSelect = "none";
     },
     onDragMove(e) {
@@ -964,12 +1194,17 @@ createApp({
       this.clampPanels();
     },
     onDragEnd() {
-      if (!this.dragTarget) return;
+      // 鼠标在窗口外松开时 mouseup 可能收不到：blur / 重新回到窗口时也走一遍，
+      // 否则页面会一直停在「col-resize + 不能选中文字」的状态，继续跟着鼠标改宽度
+      const wasDragging = !!this.dragTarget;
       this.dragTarget = null;
       document.body.style.cursor = "";
       document.body.style.userSelect = "";
+      document.documentElement.style.cursor = "";
+      if (!wasDragging) return;
       this.clampPanels();
       this.persistLayout();
+      this.scheduleMsgOverflowMeasure();
     },
     toggleSidebar() {
       this.sidebarCollapsed = !this.sidebarCollapsed;
@@ -1084,6 +1319,7 @@ createApp({
           this.currentSession = await res.json();
           this.pinToBottom();
           this.measureMsgOverflow();
+          this.resetWorkspaceDir();
           this.loadWorkspaceFiles();
         }
       } catch (e) {
@@ -1154,6 +1390,7 @@ createApp({
           await this.loadSessions();
           if (this.currentSessionId === sid) {
             this.currentSession = updated;
+            this.resetWorkspaceDir();
             this.loadWorkspaceFiles();
           }
         } else {
@@ -1361,7 +1598,9 @@ createApp({
         kind: "member",
         label: emp.name || emp.id,
         avatar: emp.avatar || "🤖",
-        desc: emp.write_access ? this.t("可读写") : this.t("只读"),
+        desc: emp.write_access
+          ? this.t("可读写")
+          : (emp.read_access === false ? this.t("无工具") : this.t("只读")),
         // 缺 CLI 的成员点了也发不出去，这里直接置灰，别让人选完才发现
         disabled: !String(emp.cli_cmd || "").trim(),
         hint: this.t("缺少 CLI 配置"),
@@ -1519,12 +1758,30 @@ createApp({
     msgIsCollapsed(msg) {
       return !!(msg && msg.id) && !this.expandedMsgs[msg.id];
     },
+    // 折叠用哪一档限高：
+    // - 单任务回答给 ~20 行（用户要求「一眼能扫完，想看再展开」）
+    // - 其余 AI 长文仍是「一屏内」
+    // - 正在跑、还没有正文的消息不折叠：正文还没落定，切一半反而更难看
+    msgClampClass(msg) {
+      if (!msg || !msg.content) return "";
+      if (!this.msgIsCollapsed(msg)) return "";
+      return msg.kind === "task_result" ? "msg-clamped msg-clamped-task" : "msg-clamped";
+    },
     toggleMsgExpand(msg) {
       const id = msg && msg.id;
       if (!id) return;
       // 整体替换对象，确保 Vue 3 的响应式一定被触发
       this.expandedMsgs = { ...this.expandedMsgs, [id]: !this.expandedMsgs[id] };
       this.$nextTick(this.measureMsgOverflow);
+    },
+    // 合并同一帧里的多次触发（拖拽 + 轮询 + 图片加载可能同时发生），
+    // 避免一次缩放就把几十条消息量好几遍
+    scheduleMsgOverflowMeasure() {
+      if (this._overflowTimer) return;
+      this._overflowTimer = setTimeout(() => {
+        this._overflowTimer = null;
+        this.measureMsgOverflow();
+      }, 120);
     },
     measureMsgOverflow() {
       this.$nextTick(() => {
@@ -1595,8 +1852,230 @@ createApp({
         }
       }
       if (this._mdCache.size > 150) this._mdCache.clear();
+      out = this.linkifyFilePaths(out);
       this._mdCache.set(src, out);
       return out;
+    },
+
+    // 正文里的文件名标成可点：记 data-file-path，交给 mounted 里注册的
+    // 捕获阶段点击处理器打开右侧预览面板。
+    // 两种写法都认：行内代码 `A01.md`，以及裸文本（模型的回复大多不写反引号，
+    // 甚至夹在《》里、后面跟 :65-83 行号）。代码块 <pre> 与链接 <a> 一律不动。
+    linkifyFilePaths(html) {
+      if (!html) return html;
+      let doc;
+      try {
+        doc = new DOMParser().parseFromString(`<div id="__mdroot">${html}</div>`, "text/html");
+      } catch (e) {
+        return html;
+      }
+      const root = doc.getElementById("__mdroot");
+      if (!root) return html;
+      let touched = false;
+
+      // 1) 行内代码：整段就是路径才认，避免 `a.md 和 b.md` 这种被当成一个文件
+      root.querySelectorAll("code").forEach(el => {
+        if (el.closest("pre") || el.querySelector("*")) return;
+        const path = this.filePathFromText(el.textContent);
+        if (!path) return;
+        el.setAttribute("data-file-path", path);
+        el.classList.add("file-link");
+        el.setAttribute("title", this.t("点击在右侧预览面板打开"));
+        touched = true;
+      });
+
+      // 2) 裸文本：按「边界 + 已知扩展名」切出文件名，只包这一小段
+      const SKIP = ["CODE", "PRE", "A", "SCRIPT", "STYLE", "TEXTAREA"];
+      const nodes = [];
+      const walker = doc.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+        acceptNode(node) {
+          if (!node.nodeValue || !node.nodeValue.trim()) return NodeFilter.FILTER_REJECT;
+          for (let p = node.parentNode; p && p !== root; p = p.parentNode) {
+            if (SKIP.includes(p.tagName)) return NodeFilter.FILTER_REJECT;
+          }
+          return NodeFilter.FILTER_ACCEPT;
+        },
+      });
+      while (walker.nextNode()) nodes.push(walker.currentNode);
+      nodes.forEach(node => {
+        if (this.wrapFileTokens(node)) touched = true;
+      });
+
+      return touched ? root.innerHTML : html;
+    },
+
+    // 把一段文本里像文件名的片段包成 <code class="file-link">
+    wrapFileTokens(node) {
+      const text = node.nodeValue || "";
+      const tokens = this.findFileTokens(text);
+      if (!tokens.length) return false;
+      const doc = node.ownerDocument;
+      const frag = doc.createDocumentFragment();
+      let cursor = 0;
+      tokens.forEach(t => {
+        if (t.start > cursor) frag.appendChild(doc.createTextNode(text.slice(cursor, t.start)));
+        const code = doc.createElement("code");
+        code.className = "file-link";
+        code.setAttribute("data-file-path", t.path);
+        code.setAttribute("title", this.t("点击在右侧预览面板打开"));
+        code.textContent = t.text;
+        frag.appendChild(code);
+        cursor = t.end;
+      });
+      if (cursor < text.length) frag.appendChild(doc.createTextNode(text.slice(cursor)));
+      node.parentNode.replaceChild(frag, node);
+      return true;
+    },
+
+    // 从纯文本里挑出文件名片段。
+    // 左边界必须是行首 / 空白 / 常见标点（含中文标点与《》，模型爱把文件名括起来），
+    // 右边界同理——文件名后面跟的是「（说明）」「，」还是「:65-83」都算结束，
+    // 行号本身不进可点范围。
+    findFileTokens(text) {
+      const out = [];
+      // 边界字符：空白 + 中英文里会出现「名字前后」的标点
+      const B = "[\\s()（）【】\\[\\]《》<>\\\"'`「」『』：:,，。、；;！!？?]";
+      const re = new RegExp(
+        "(^|" + B + ")" +
+        "([^\\s()（）【】\\[\\]《》<>\\\"'`「」『』：:，,。；;！!？?]{1,160}?\\.(?:" + FILE_EXT_ALT + "))" +
+        "(?::\\d+(?:-\\d+)?)?" +
+        "(?=$|" + B + ")",
+        "gi"
+      );
+      let m;
+      while ((m = re.exec(text)) !== null) {
+        const name = m[2];
+        const start = m.index + (m[1] ? m[1].length : 0);
+        // URL 的尾巴（https 之后那段）不是文件；框架名同理
+        if (name.includes("://") || name.startsWith("//")) continue;
+        if (text[start - 1] === ":") continue;
+        if (FILE_TOKEN_DENY.test(name)) continue;
+        out.push({ start, end: start + name.length, text: name, path: name });
+      }
+      return out;
+    },
+
+    // 一段文本是不是「工作目录里的某个文件」：是就返回可用的路径，不是返回空串。
+    // 判据偏保守：单个不含空格的 token + 已知扩展名，且不是 URL / 接口路径 / @成员。
+    filePathFromText(text) {
+      let raw = String(text || "").trim();
+      if (!raw || raw.length > 200) return "";
+      if (/[\s"'`<>|*？?]/.test(raw)) return "";
+      if (/^[a-z][a-z0-9+.-]*:\/\//i.test(raw)) return "";
+      if (/^(mailto|data|javascript):/i.test(raw)) return "";
+      if (raw.startsWith("/api/")) return "";
+      raw = raw.replace(/[),;，。；、】）]+$/, "");
+      raw = raw.replace(/:\d+(?:-\d+)?$/, "");   // 允许编译器式写法：a.js:12
+      if (!raw) return "";
+      const base = raw.split(/[\\/]/).pop() || "";
+      if (!base || /[{}%$]/.test(base)) return "";
+      return FILE_EXT_RE.test(base) ? raw : "";
+    },
+
+    // 捕获阶段的文件点击：命中 data-file-path 就打开右侧预览，并拦住向上冒泡
+    onDocFileClick(e) {
+      const target = e.target;
+      const el = target && target.closest ? target.closest("[data-file-path]") : null;
+      if (!el) return;
+      const path = el.getAttribute("data-file-path") || "";
+      if (!path) return;
+      e.preventDefault();
+      e.stopPropagation();
+      this.openWorkspacePath(path);
+    },
+
+    fileBaseName(p) {
+      const segs = String(p || "").split(/[\\/]/).filter(Boolean);
+      return segs.length ? segs[segs.length - 1] : String(p || "");
+    },
+
+    // 产物清单里的文件名：点开即看。
+    // 任务详情弹窗盖在最上面，先关掉它再打开预览，否则看着像「点了没反应」
+    openArtifact(a) {
+      const p = (a && (a.path || a)) || "";
+      if (!p) return;
+      if (this.showCardModal) this.showCardModal = false;
+      if (this.showInspectModal) this.showInspectModal = false;
+      this.openWorkspacePath(p);
+    },
+
+    // 点聊天里的文件名：解析成绝对路径后在右侧预览面板打开。
+    // 相对路径按当前会话的工作目录解析；跑出工作目录的路径一律拒绝。
+    async openWorkspacePath(rawPath) {
+      let p = String(rawPath || "").trim();
+      if (!p) return;
+      if (/^file:\/\//i.test(p)) {
+        const stripped = p.replace(/^file:\/\//i, "");
+        try { p = decodeURIComponent(stripped); } catch (e) { p = stripped; }
+      }
+      const root = String((this.currentSession && this.currentSession.workspace_dir) || "").replace(/[/\\]+$/, "");
+      const abs = this.normalizeFsPath(p.startsWith("/") ? p : (root ? `${root}/${p.replace(/^\.\//, "")}` : ""));
+      if (!abs) { this.showToast(this.t("这个会话还没设置工作目录")); return; }
+      // 绝对路径也可能指到工作目录之外：那种文件不该借这个入口被读出来
+      const inRoot = !p.startsWith("/") || !root || abs === root || abs.startsWith(root + "/");
+      if (!inRoot) { this.showToast(this.t("这个文件不在当前工作目录里")); return; }
+      this.focusWorkspaceDir(abs);
+      if (await this.openFilePreview({ name: this.fileBaseName(abs), path: abs, size: 0 }, { fromChat: true })) return;
+      // 裸文本里文件名常和中文粘在一起（「参考亲子教育手册.md」）：到同级目录里
+      // 按「文件名后缀」再找一次，唯一命中就用它
+      const alt = await this.matchFileBySuffix(abs);
+      if (alt) {
+        this.focusWorkspaceDir(alt);
+        const item = { name: this.fileBaseName(alt), path: alt, size: 0 };
+        if (await this.openFilePreview(item, { fromChat: true })) return;
+      }
+      this.showToast(this.t("找不到这个文件") + "：" + this.fileBaseName(abs));
+    },
+
+    // 目录清单里找「被给定基名包含、且落在末尾」的真实文件：
+    // 裸文本常把「参考」「见」这类词粘在文件名前面，直接按整串查是查不到的
+    async matchFileBySuffix(abs) {
+      const dir = String(abs || "").split("/").slice(0, -1).join("/") || "/";
+      const base = (this.fileBaseName(abs) || "").toLowerCase();
+      if (!base) return "";
+      try {
+        const res = await fetch(`/api/workspace/files?path=${encodeURIComponent(dir)}`);
+        if (!res.ok) return "";
+        const data = await res.json();
+        const hits = (data.items || [])
+          .filter(it => !it.is_dir && String(it.name || "").toLowerCase() && base.endsWith(String(it.name).toLowerCase()))
+          .sort((a, b) => String(b.name).length - String(a.name).length);
+        return hits.length ? hits[0].path : "";
+      } catch (e) {
+        return "";
+      }
+    },
+
+    // 归一化 /a/./b/../c 这种路径（只做字符串层面，交给后端再校验一次）
+    normalizeFsPath(p) {
+      const raw = String(p || "");
+      const isAbs = raw.startsWith("/");
+      const out = [];
+      raw.split(/[\\/]+/).forEach(seg => {
+        if (!seg || seg === ".") return;
+        if (seg === "..") { out.pop(); return; }
+        out.push(seg);
+      });
+      return (isAbs ? "/" : "") + out.join("/");
+    },
+
+    // 从聊天里打开的文件：让右侧列表先切到它所在的目录，
+    // 这样关掉预览看到的就是「这个文件所在的地方」，而不是原先停着的目录
+    focusWorkspaceDir(absFile) {
+      const root = String((this.currentSession && this.currentSession.workspace_dir) || "").replace(/[/\\]+$/, "");
+      if (!root) return;
+      const dir = String(absFile || "").split("/").slice(0, -1).join("/") || "/";
+      if (!(dir === root || dir.startsWith(root + "/"))) return;
+      if (this.workspaceCurrentDir === dir) return;
+      const stack = [{ name: this.workspaceRootName(), path: root }];
+      let cur = root;
+      dir.slice(root.length).split("/").filter(Boolean).forEach(seg => {
+        cur = `${cur}/${seg}`;
+        stack.push({ name: seg, path: cur });
+      });
+      this.workspacePathStack = stack;
+      this.workspaceCurrentDir = dir;
+      this.loadWorkspaceFiles();
     },
 
     // ---- mermaid ----------------------------------------------------------
@@ -1948,15 +2427,53 @@ createApp({
         if (nextCount > prevCount) {
           // 用户正在往上翻历史时不抢位置（角落有「回到最新」提示）
           this.$nextTick(() => this.scrollToBottom(false));
-          this.measureMsgOverflow();
         }
+        // 消息条数没变、但某条消息的正文变了（单任务从空内容变成整段回答）同样会改变高度。
+        // 只在条数增加时量，长回答就会被限高切掉却没有「展开全文」按钮——正是用户看到的
+        // 「内容挤下去了、又没法往下翻」。
+        this.scheduleMsgOverflowMeasure();
       } catch (e) {
         // 静默容错
       }
     },
 
-    insertMention(name) {
-      this.suggest = null;
+    // 拉「正在生成的文本」。只在有任务在跑时请求，空闲会话零开销。
+    async pollLiveStreams() {
+      const sid = this.currentSessionId;
+      if (!sid) return;
+      if (!this.hasActiveTasks) {
+        // 没有任务在跑了：清掉残留，避免旧文本一直挂在界面上
+        if (Object.keys(this.liveStreams).length) this.liveStreams = {};
+        return;
+      }
+      try {
+        const res = await fetch(`/api/sessions/${sid}/live`);
+        if (!res.ok) return;
+        const data = await res.json();
+        if (sid !== this.currentSessionId) return;
+        const streams = data.streams || {};
+        let grew = false;
+        for (const key of Object.keys(streams)) {
+          const item = streams[key];
+          if (!item || !item.text) continue;
+          const prev = this.liveStreams[key];
+          if (!prev || (item.chars || 0) > (prev.chars || 0)) grew = true;
+          this.liveLast[key] = { text: item.text, phase: item.phase, activity: item.activity, chars: item.chars };
+        }
+        // 只留最近 2 分钟的兜底文本，防止长会话里越攒越多
+        const cutoff = Date.now() - 120000;
+        for (const key of Object.keys(this.liveLast)) {
+          if (!streams[key] && (this.liveLast[key].at || 0) < cutoff) delete this.liveLast[key];
+          else if (streams[key]) this.liveLast[key].at = Date.now();
+        }
+        this.liveStreams = streams;
+        if (grew && this.stickToBottom) this.$nextTick(() => this.scrollToBottom(false));
+      } catch (e) {
+        // 静默容错：拿不到就继续显示上一份
+      }
+    },
+
+    insertMention(name) {      this.suggest = null;
       this.inputContent = (this.inputContent ? this.inputContent + " " : "") + `@${name} `;
       this.$nextTick(() => {
         const textarea = this.$refs.chatInput;
@@ -1977,8 +2494,23 @@ createApp({
     },
 
     // ----------------- 工作目录文件浏览器 -----------------
+    // 把当前会话根目录作为面包屑起点，并加载根目录内容。
+    // 会话切换 / 改配置后调用，确保从根目录重新开始，不会停留在上一个会话的目录里。
+    resetWorkspaceDir() {
+      const root = this.currentSession?.workspace_dir || "";
+      this.workspaceCurrentDir = root;
+      this.workspacePathStack = root ? [{ name: this.workspaceRootName(), path: root }] : [];
+    },
+
+    // 根目录在面包屑里显示的友好名字（取路径最后一段）
+    workspaceRootName() {
+      const root = (this.currentSession?.workspace_dir || "").replace(/[/\\]+$/, "");
+      const segs = root.split(/[/\\]+/).filter(Boolean);
+      return segs.length ? segs[segs.length - 1] : this.t("未指定目录");
+    },
+
     async loadWorkspaceFiles() {
-      const dir = this.currentSession?.workspace_dir;
+      const dir = this.workspaceCurrentDir || this.currentSession?.workspace_dir;
       if (!dir) return;
       try {
         const res = await fetch(`/api/workspace/files?path=${encodeURIComponent(dir)}`);
@@ -1991,6 +2523,10 @@ createApp({
 
     async onWorkspaceItemClick(item) {
       if (item.is_dir) {
+        // 就地进入子目录：把这一级压进面包屑栈，列表就地替换为子目录内容，
+        // 不弹新窗口；之后点面包屑或「↑」即可返回原先预览的目录
+        this.workspaceCurrentDir = item.path;
+        this.workspacePathStack = this.workspacePathStack.concat([{ name: item.name, path: item.path }]);
         try {
           const res = await fetch(`/api/workspace/files?path=${encodeURIComponent(item.path)}`);
           const data = await res.json();
@@ -2002,6 +2538,21 @@ createApp({
         this.selectedWorkspaceFile = item;
         await this.openFilePreview(item);
       }
+    },
+
+    // 点面包屑某一段：截断到该段并重新加载，实现「跳回任意上级目录」
+    async gotoCrumb(index) {
+      if (index < 0 || index >= this.workspacePathStack.length) return;
+      this.workspacePathStack = this.workspacePathStack.slice(0, index + 1);
+      const crumb = this.workspacePathStack[this.workspacePathStack.length - 1];
+      this.workspaceCurrentDir = crumb.path;
+      await this.loadWorkspaceFiles();
+    },
+
+    // 返回上一级目录（栈顶弹出一段）
+    async goUpWorkspace() {
+      if (this.workspacePathStack.length <= 1) return;
+      await this.gotoCrumb(this.workspacePathStack.length - 2);
     },
 
     // 按扩展名决定怎么预览：md 渲染成文档，图片直接显示，其余按等宽文本，
@@ -2019,35 +2570,58 @@ createApp({
       return "text";
     },
 
-    async openFilePreview(item) {
-      if (!item) return;
+    // 打开文件预览。返回 false 表示「文件不在」（调用方决定怎么提示）。
+    async openFilePreview(item, opts = {}) {
+      if (!item) return false;
       const kind = this.filePreviewKind(item);
+      const fromChat = !!opts.fromChat;
+      // 从聊天里点进来的路径可能早就被改名 / 删掉了：先确认文件在，
+      // 不在就交给调用方按后缀再找一次，别把预览面板刷成「读取失败」
+      if (fromChat && kind !== "text" && kind !== "markdown") {
+        const ok = await this.workspaceFileExists(item.path);
+        if (!ok) return false;
+      }
       this.showFilePreview = true;
       this.filePreviewLoading = kind === "text" || kind === "markdown";
+      // 换文件时先把编辑态清干净，避免上一条的草稿被带到新文件上
+      this.previewEditing = false;
+      this.previewDraft = "";
+      this.previewDirty = false;
+      this.previewUpdatedAt = 0;
       this.filePreview = {
         name: item.name, path: item.path, size: item.size || 0, kind,
-        content: "", url: "", error: "",
+        mtime: 0, content: "", url: "", error: "", updatedAt: 0,
       };
       if (kind === "image") {
-        this.filePreview.url = `/api/workspace/raw?path=${encodeURIComponent(item.path)}`;
+        // 带时间戳：AI 重画了同名图片时，浏览器不会拿缓存里的旧图
+        this.filePreview.url = `/api/workspace/raw?path=${encodeURIComponent(item.path)}&t=${Date.now()}`;
         this.filePreviewLoading = false;
-        return;
+        return true;
       }
       if (kind === "binary") {
         this.filePreviewLoading = false;
         this.filePreview.error = this.t("这一类文件不支持在线预览，可以复制路径后在本机打开");
-        return;
+        return true;
       }
       try {
         const res = await fetch(`/api/workspace/file?path=${encodeURIComponent(item.path)}`);
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.error || res.status);
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          if (fromChat) {
+            this.closeFilePreview();
+            return false;
+          }
+          throw new Error(data.error || res.status);
+        }
         // 连点两个文件时，先返回的那个不能盖掉后点的
-        if (!this.filePreview || this.filePreview.path !== item.path) return;
+        if (!this.filePreview || this.filePreview.path !== item.path) return true;
         if (data.too_large) {
           this.filePreview.error = data.error || this.t("文件过大，暂不支持在线预览");
+          this.filePreview.too_large = true;
         } else {
           this.filePreview.content = data.content || "";
+          this.filePreview.mtime = Number(data.mtime) || 0;
+          this.filePreview.size = data.size || this.filePreview.size;
           this.selectedFileContent = this.filePreview.content;
         }
       } catch (e) {
@@ -2057,12 +2631,200 @@ createApp({
       } finally {
         if (this.filePreview && this.filePreview.path === item.path) this.filePreviewLoading = false;
       }
+      return true;
     },
 
     closeFilePreview() {
       this.showFilePreview = false;
       this.filePreview = null;
       this.filePreviewLoading = false;
+      this.previewEditing = false;
+      this.previewDraft = "";
+      this.previewDirty = false;
+      this.previewSaving = false;
+    },
+
+    // ----------------- 预览面板：就地编辑 + 保存 -----------------
+    previewExt() {
+      const name = String((this.filePreview && this.filePreview.name) || "").toLowerCase();
+      return name.includes(".") ? name.slice(name.lastIndexOf(".") + 1) : "";
+    },
+    canEditPreview() {
+      const pv = this.filePreview;
+      if (!pv) return false;
+      if (pv.kind !== "text" && pv.kind !== "markdown") return false;
+      if (pv.error) return false;
+      return EDITABLE_EXTS.has(this.previewExt());
+    },
+    startPreviewEdit() {
+      if (!this.canEditPreview()) return;
+      this.previewDraft = (this.filePreview && this.filePreview.content) || "";
+      this.previewDirty = false;
+      this.previewEditing = true;
+      this.$nextTick(() => {
+        const el = this.$refs.previewEditor;
+        if (el) {
+          el.focus();
+          // 光标放到末尾：多半是「接着补两句」，不是从头改
+          el.selectionStart = el.selectionEnd = el.value.length;
+        }
+      });
+    },
+    onPreviewDraftInput() {
+      const pv = this.filePreview;
+      this.previewDirty = !!(pv && this.previewDraft !== (pv.content || ""));
+    },
+    cancelPreviewEdit() {
+      if (this.previewSaving) return;
+      if (this.previewDirty && !confirm(this.t("放弃未保存的修改？"))) return;
+      this.previewEditing = false;
+      this.previewDraft = "";
+      this.previewDirty = false;
+    },
+    // force=true 用于「文件已被别人改写，仍然覆盖」的二次确认
+    async savePreviewFile(force = false) {
+      const pv = this.filePreview;
+      if (!pv || this.previewSaving) return;
+      this.previewSaving = true;
+      try {
+        const res = await fetch("/api/workspace/file", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            path: pv.path,
+            content: this.previewDraft,
+            base_mtime: pv.mtime || 0,
+            force: !!force,
+          }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (res.status === 409) {
+          // AI 或别的编辑器在这段时间里写过这个文件：让人自己决定要不要盖掉
+          const ok = confirm(
+            this.t("这个文件刚被改写过（可能是 AI 正在写）。仍要用你编辑的版本覆盖吗？")
+          );
+          if (ok) return this.savePreviewFile(true);
+          // 放弃覆盖：把磁盘上的新版读回来，别让人以为自己的草稿才是最新的
+          await this.reloadPreviewContent(true);
+          return;
+        }
+        if (!res.ok) {
+          this.showToast(data.error || this.t("保存失败（HTTP {status}）", { status: res.status }));
+          return;
+        }
+        if (!this.filePreview || this.filePreview.path !== pv.path) return;
+        this.filePreview.content = this.previewDraft;
+        this.filePreview.mtime = Number(data.mtime) || this.filePreview.mtime;
+        this.filePreview.size = data.size || this.filePreview.size;
+        this.selectedFileContent = this.filePreview.content;
+        this.previewEditing = false;
+        this.previewDirty = false;
+        this.showToast(this.t("已保存"));
+        this.loadWorkspaceFiles();
+      } catch (e) {
+        this.showToast(this.t("保存失败：") + (e.message || e));
+      } finally {
+        this.previewSaving = false;
+      }
+    },
+
+    // ----------------- 预览面板：被外部改写时自动刷新 -----------------
+    // 一直是开着的（顶部不再给开关，免得按钮堆一排）：正文可能被 AI 正在写，
+    // 先看 mtime 有没有变，变了才读全文，免得 1.2s 一次把几百 KB 的文件反复读进内存。
+    async pollPreviewFile() {
+      const pv = this.filePreview;
+      if (!pv || pv.error || this.previewEditing) return;
+      if (pv.kind !== "text" && pv.kind !== "markdown" && pv.kind !== "image") return;
+      if (pv.too_large) return;
+      try {
+        const res = await fetch(`/api/workspace/file?meta=1&path=${encodeURIComponent(pv.path)}`);
+        if (!res.ok) return;
+        const meta = await res.json();
+        // 期间可能已经切到别的文件 / 关了面板
+        if (!this.filePreview || this.filePreview.path !== pv.path) return;
+        // 0.5ms 容差：mtime 是浮点秒，不同文件系统精度略有差异
+        if (!(Number(meta.mtime) > (Number(pv.mtime) || 0) + 0.0005)) return;
+        if (pv.kind === "image") {
+          pv.mtime = Number(meta.mtime) || pv.mtime;
+          pv.size = meta.size || pv.size;
+          pv.url = `/api/workspace/raw?path=${encodeURIComponent(pv.path)}&t=${Math.round(meta.mtime * 1000)}`;
+          this.previewUpdatedAt = Date.now();
+          return;
+        }
+        await this.reloadPreviewContent(true);
+        this.previewUpdatedAt = Date.now();
+      } catch (e) {
+        // 静默容错：这一轮拿不到就等下一轮
+      }
+    },
+    // 重新读取正文（保留滚动位置）。silent=true 时不显示「正在读取」占位，
+    // 避免 AI 每写一次面板就闪一下。
+    async reloadPreviewContent(silent = false) {
+      const pv = this.filePreview;
+      if (!pv) return;
+      const body = this.$refs.previewBody;
+      const keepTop = body ? body.scrollTop : 0;
+      if (!silent) this.filePreviewLoading = true;
+      try {
+        const res = await fetch(`/api/workspace/file?path=${encodeURIComponent(pv.path)}`);
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) return;
+        if (!this.filePreview || this.filePreview.path !== pv.path) return;
+        if (data.too_large) {
+          this.filePreview.error = data.error || this.t("文件过大，暂不支持在线预览");
+          return;
+        }
+        this.filePreview.content = data.content || "";
+        this.filePreview.mtime = Number(data.mtime) || this.filePreview.mtime;
+        this.filePreview.size = data.size || this.filePreview.size;
+        this.filePreview.updatedAt = Date.now();
+        this.selectedFileContent = this.filePreview.content;
+        if (silent) {
+          this.$nextTick(() => {
+            if (body && this.$refs.previewBody === body) body.scrollTop = keepTop;
+          });
+        }
+      } catch (e) {
+        // 忽略：文件可能正好被改名 / 删除，下一次轮询会自然停在这里
+      } finally {
+        if (!silent) this.filePreviewLoading = false;
+      }
+    },
+    // 头部那句「几秒前更新」：只在真的刷新过时才显示，避免长期占位
+    previewUpdatedLabel() {
+      if (!this.previewUpdatedAt) return "";
+      const sec = Math.max(0, Math.round((this.nowTick - this.previewUpdatedAt) / 1000));
+      if (sec < 3) return this.t("刚刚已更新");
+      if (sec < 60) return this.t("{n} 秒前已更新", { n: sec });
+      return this.t("{n} 分钟前已更新", { n: Math.floor(sec / 60) });
+    },
+    // 文件是否存在：用读内容接口探一下（后端对不存在直接 404）
+    async workspaceFileExists(p) {
+      if (!p) return false;
+      try {
+        const res = await fetch(`/api/workspace/file?path=${encodeURIComponent(p)}`, { method: "GET" });
+        return res.ok;
+      } catch (e) {
+        return false;
+      }
+    },
+
+    // 文件预览顶部「全屏」：只把右侧预览面板本身请求全屏（不是整页），
+    // 退出全屏或关掉预览即回到面板内视图
+    togglePreviewFullscreen() {
+      const el = this.$refs.previewPanel;
+      if (!el) return;
+      try {
+        if (document.fullscreenElement) {
+          document.exitFullscreen();
+        } else if (el.requestFullscreen) {
+          el.requestFullscreen();
+        } else {
+          this.showToast(this.t("当前浏览器不支持全屏"));
+        }
+      } catch (e) {
+        this.showToast(this.t("当前浏览器不支持全屏"));
+      }
     },
 
     // 预览正文：md 走和聊天同一套 renderMdText（marked + DOMPurify），
@@ -2189,7 +2951,10 @@ createApp({
         system_prompt: "",
         enabled: true,
         timeout: 0,
-        write_access: false
+        // 新建成员默认「读 + 写」都开：只勾读不足以做实际交付，
+        // 两个都不勾则连产物都读不到（只会回一句「我先读取一下」）。
+        write_access: true,
+        read_access: true
       };
       this.showEmpEditModal = true;
     },
@@ -2198,8 +2963,12 @@ createApp({
       this.isEditingEmployee = true;
       this.editingEmpIdx = idx;
       this.editingEmp = JSON.parse(JSON.stringify(emp));
+      // 老配置只有 write_access，没有 read_access：按「有读权限」补齐
+      if (this.editingEmp.read_access === undefined) this.editingEmp.read_access = true;
+      if (this.editingEmp.write_access === undefined) this.editingEmp.write_access = false;
       const match = this.scannedModels.find(m => m.cli_cmd === emp.cli_cmd);
       this.selectedModelId = match ? this.modelKey(match) : "";
+      this.syncEditingEmpCli();
       this.showEmpEditModal = true;
     },
 
@@ -2214,7 +2983,39 @@ createApp({
         if (!this.editingEmp.system_prompt && match.default_prompt) {
           this.editingEmp.system_prompt = match.default_prompt;
         }
+        this.syncEditingEmpCli();
       }
+    },
+
+    // 勾选读/写权限后，把模板里的 --tools 同步成实际会执行的值，
+    // 避免「界面上写 --tools ""、实际又补了工具」这种看不懂的状态。
+    // 服务端保存时还会按权限再规范化一次（core.executor.normalize_cli_tools）。
+    onAccessToggle(field, ev) {
+      this.editingEmp[field] = !!(ev && ev.target ? ev.target.checked : this.editingEmp[field]);
+      this.syncEditingEmpCli();
+    },
+
+    syncEditingEmpCli() {
+      const cmd = this.editingEmp.cli_cmd || "";
+      if (!/\bcodebuddy\b/.test(cmd)) return;
+      const re = /--tools\s+("[^"]*"|'[^']*'|\S+)/;
+      const m = cmd.match(re);
+      if (!m) return;
+      const cur = m[1].replace(/["']/g, "").trim();
+      if (["default", "all"].includes(cur.toLowerCase())) return;
+
+      const READ = ["Read", "Glob", "Grep"];
+      const WRITE = ["Write", "Edit", "Bash"];
+      const read = this.editingEmp.read_access !== false;
+      const write = !!this.editingEmp.write_access;
+      let tools = cur ? cur.split(",").map(s => s.trim()).filter(Boolean) : [];
+      if (!read) tools = tools.filter(t => !READ.includes(t));
+      if (!write) tools = tools.filter(t => !WRITE.includes(t));
+      const lower = new Set(tools.map(t => t.toLowerCase()));
+      [...(read ? READ : []), ...(write ? WRITE : [])].forEach(t => {
+        if (!lower.has(t.toLowerCase())) { tools.push(t); lower.add(t.toLowerCase()); }
+      });
+      this.editingEmp.cli_cmd = cmd.replace(re, `--tools "${tools.join(",")}"`);
     },
 
     async saveEmployeeItem() {

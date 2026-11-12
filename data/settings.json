@@ -11,7 +11,8 @@
       "system_prompt": "",
       "enabled": true,
       "timeout": 0,
-      "write_access": true
+      "write_access": true,
+      "read_access": true
     },
     {
       "id": "codebuddy-ds4",
@@ -23,7 +24,8 @@
       "system_prompt": "擅长深度逻辑推演、推演潜在隐患与方案边界风险，以客观严谨的态度提出建设性意见。",
       "enabled": true,
       "timeout": 0,
-      "write_access": true
+      "write_access": true,
+      "read_access": true
     },
     {
       "id": "codebuddy-hy4",
@@ -35,7 +37,34 @@
       "system_prompt": "注重实际落地执行可行性、周期效率与实操适配度，提供稳健务实的路径建议。",
       "enabled": true,
       "timeout": 0,
-      "write_access": true
+      "write_access": true,
+      "read_access": true
+    },
+    {
+      "id": "emp_mwdd6d4v_wbdk",
+      "name": "hy4-std",
+      "avatar": "🤖",
+      "avatar_color": "#3b82f6",
+      "type": "cli",
+      "cli_cmd": "codebuddy --model hy4std --tools \"Read,Glob,Grep\" -p \"{prompt}\"",
+      "system_prompt": "",
+      "enabled": true,
+      "timeout": 0,
+      "write_access": true,
+      "read_access": true
+    },
+    {
+      "id": "emp_mwdd7j5x_mj36",
+      "name": "hy3",
+      "avatar": "🤖",
+      "avatar_color": "#3b82f6",
+      "type": "cli",
+      "cli_cmd": "codebuddy --model hy3 --tools \"Read,Glob,Grep\" -p \"{prompt}\"",
+      "system_prompt": "",
+      "enabled": true,
+      "timeout": 0,
+      "write_access": true,
+      "read_access": true
     }
   ]
 }

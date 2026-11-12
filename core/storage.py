@@ -57,7 +57,8 @@ DEFAULT_SETTINGS = {
             "system_prompt": "",
             "enabled": True,
             "timeout": 0,
-            "write_access": False
+            "write_access": False,
+            "read_access": True
         },
         {
             "id": "codebuddy-ds4",
@@ -65,11 +66,12 @@ DEFAULT_SETTINGS = {
             "avatar": "🧠",
             "avatar_color": "#9333ea",
             "type": "cli",
-            "cli_cmd": 'codebuddy --model deepseek-v4-pro --tools "" -p "{prompt}"',
+            "cli_cmd": 'codebuddy --model deepseek-v4-pro --tools "Read,Glob,Grep" -p "{prompt}"',
             "system_prompt": "擅长深度逻辑推演、推演潜在隐患与方案边界风险，以客观严谨的态度提出建设性意见。",
             "enabled": True,
             "timeout": 0,
-            "write_access": False
+            "write_access": False,
+            "read_access": True
         },
         {
             "id": "codebuddy-hy4",
@@ -77,11 +79,12 @@ DEFAULT_SETTINGS = {
             "avatar": "⚡",
             "avatar_color": "#059669",
             "type": "cli",
-            "cli_cmd": 'codebuddy --model hy4std --tools "" -p "{prompt}"',
+            "cli_cmd": 'codebuddy --model hy4std --tools "Read,Glob,Grep" -p "{prompt}"',
             "system_prompt": "注重实际落地执行可行性、周期效率与实操适配度，提供稳健务实的路径建议。",
             "enabled": True,
             "timeout": 0,
-            "write_access": False
+            "write_access": False,
+            "read_access": True
         }
     ]
 }
@@ -119,6 +122,14 @@ def load_settings() -> Dict[str, Any]:
         if not isinstance(clean["employees"], list):
             clean["employees"] = copy.deepcopy(DEFAULT_SETTINGS["employees"])
             changed = True
+
+        # 老配置没有 read_access（读写权限曾合成一个 write_access 开关）：
+        # 补成 True 才能让「只读成员也必须能 Read/Glob/Grep」这条生效。
+        for emp in clean["employees"]:
+            if isinstance(emp, dict) and "read_access" not in emp:
+                emp["read_access"] = True
+                changed = True
+
         if changed:
             save_settings(clean)
         return clean

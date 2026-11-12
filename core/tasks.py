@@ -11,6 +11,7 @@
 """
 
 import json
+import inspect
 import os
 import re
 import threading
@@ -21,7 +22,13 @@ from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple
 
 import core.storage as storage
-from core.executor import Executor
+import core.streaming as streaming
+from core.executor import (
+    Executor,
+    sanitize_model_output,
+    looks_like_incomplete,
+    capability_block,
+)
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PROMPTS_DIR = os.path.join(BASE_DIR, "prompts")
@@ -55,10 +62,28 @@ MEMBER_BUSY_SUMMARY = "等待该成员空闲超时，本次未执行；可稍后
 FINAL_TASK_STATES = (STATUS_DELIVERED, STATUS_CANCELLED, STATUS_FAILED, STATUS_TIMEOUT)
 RETRYABLE_STATES = (STATUS_FAILED, STATUS_CANCELLED, STATUS_TIMEOUT, STATUS_NO_OPINION)
 
+# 审核回答「没给结论」时的语义层重试提示：只说该直接给结论，不重复整段任务说明。
+REVIEW_RETRY_HINT = (
+    "\n\n【上一次回答没有给出审核结论】你可能只描述了「准备去读什么」，"
+    "或只输出了工具调用标记。请立刻直接给出结论：首行写 [通过] 或 [意见]，"
+    "第二行写核对范围，需要时按规程列条目；不要描述你打算做什么，也不要反问。"
+)
+
+
+def _accepts_on_chunk(runner: Any) -> bool:
+    """执行器是否接受 on_chunk（流式回调）。拿不到签名时按不支持处理。"""
+    try:
+        sig = inspect.signature(runner)
+    except (TypeError, ValueError):
+        return False
+    params = sig.parameters.values()
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params):
+        return True
+    return "on_chunk" in sig.parameters
+
 
 def task_id() -> str:
     return "t_" + uuid.uuid4().hex[:8]
-
 
 def msg_id() -> str:
     return "m_" + uuid.uuid4().hex[:10]
@@ -281,6 +306,24 @@ def parse_single(content: str, settings: Dict[str, Any]) -> Optional[str]:
     return str(hits[0][0]["id"]) if hits else None
 
 
+def last_ai_member(messages: List[Dict[str, Any]], settings: Dict[str, Any]) -> Optional[str]:
+    """最近一个跟用户说过话、并且现在还能用的 AI 成员。
+
+    用于「消息里没 @ 任何人」时的默认对象：聊天窗里默认接着刚才那位说，
+    比回一句「请 @ 成员」更符合直觉。只认本场会话里别人真正回过话的成员，
+    已停用 / 缺 CLI 配置的一律跳过（否则消息发出去直接建个必然失败的任务）。
+    """
+    for msg in reversed(messages or []):
+        if not isinstance(msg, dict):
+            continue
+        sender = str(msg.get("sender") or "")
+        if not sender or sender in ("user", "system"):
+            continue
+        if usable_member(settings, sender):
+            return sender
+    return None
+
+
 # ---------------------------------------------------------------------------
 # 运行规程与 prompt
 # ---------------------------------------------------------------------------
@@ -429,14 +472,34 @@ def build_prompt(
     if artifacts:
         parts.append("【主创产物清单】\n" + json.dumps(artifacts, ensure_ascii=False, indent=2))
     if opinions:
-        lines = [f"- {o.get('name') or o.get('member_id')}: {o.get('summary') or ''}" for o in opinions]
+        lines = []
+        for o in opinions:
+            mark = ""
+            if o.get("review_verdict") == "pass":
+                # 判定通过的成员没有改动要求：明说出来，免得主创硬找点东西改
+                mark = "（[通过]，无需改动）"
+            elif o.get("review_verdict") == "issues":
+                mark = "（[意见]）"
+            lines.append(f"- {o.get('name') or o.get('member_id')}{mark}: {o.get('summary') or ''}")
         parts.append("【审核意见】\n" + "\n".join(lines))
-    parts.append(
-        "【输出要求】正文用正常文字回答（这段会直接展示给用户，不要写成 JSON）；"
-        "如果产出了文件，在正文末尾附一个 JSON 代码块登记产物清单："
-        '{"artifacts": [{"path": "...", "summary": "...", "bytes": 0}]}，'
-        "交付环节可在其中加 changes 字段说明改动。软件会把这段登记从正文里摘掉。"
-    )
+    if stage == STAGE_REVIEW:
+        # 审核是只读环节、不会产出文件。若沿用通用那句「如果产出了文件才登记」，
+        # 模型会以为不必写登记块，[通过] 与条数就落不到卡片上。
+        parts.append(
+            "【输出要求】正文用正常文字写审核意见（这段会直接展示给用户，不要写成 JSON）："
+            "首行写 `[通过]` 或 `[意见]`，第二行写核对范围；有意见时按「隐患与漏洞」→「新意与巧思」分节列条目。"
+            "末尾务必附一个 JSON 代码块登记（软件会摘掉，不展示）："
+            '{"artifacts": [{"path": "...", "summary": "..."}], '
+            '"review": {"verdict": "pass|issues", "issues": 0, "ideas": 0}}。'
+            "verdict 与首行标记一致，issues / ideas 填实际条数；即使没有产出文件也要写这一段。"
+        )
+    else:
+        parts.append(
+            "【输出要求】正文用正常文字回答（这段会直接展示给用户，不要写成 JSON）；"
+            "如果产出了文件，在正文末尾附一个 JSON 代码块登记产物清单："
+            '{"artifacts": [{"path": "...", "summary": "...", "bytes": 0}]}，'
+            "交付环节可在其中加 changes 字段说明改动。软件会把这段登记从正文里摘掉。"
+        )
     return "\n\n".join(p for p in parts if p)
 
 
@@ -509,6 +572,23 @@ def _clean_artifacts(raw_artifacts: Any) -> List[Dict[str, Any]]:
     return clean
 
 
+def _clean_review(raw: Any) -> Dict[str, Any]:
+    """审核登记块：只认 verdict=pass/issues，其余字段一律不采信，避免模型自造判定。"""
+    if not isinstance(raw, dict):
+        return {}
+    verdict = str(raw.get("verdict") or "").strip().lower()
+    if verdict not in ("pass", "issues"):
+        return {}
+
+    def count(key: str) -> int:
+        try:
+            return max(0, int(raw.get(key) or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    return {"verdict": verdict, "issues": count("issues"), "ideas": count("ideas")}
+
+
 def parse_output(text: str) -> Dict[str, Any]:
     """解析结构化输出：正文照原样展示，只把结尾的产物登记块摘出来。
 
@@ -524,7 +604,9 @@ def parse_output(text: str) -> Dict[str, Any]:
         candidate = _loads_json_object(match.group(1))
         if not candidate:
             continue
-        if not ({"artifacts", "changes", "summary", "opinion_handling"} & set(candidate)):
+        # review 也是登记块：审核成员只给 verdict 而不列 artifacts 时，同样要摘掉，
+        # 否则这段 JSON 会原样出现在聊天卡片里
+        if not ({"artifacts", "changes", "summary", "opinion_handling", "review"} & set(candidate)):
             continue
         data = candidate
         body = (raw[:match.start()] + raw[match.end():]).strip()
@@ -542,11 +624,40 @@ def parse_output(text: str) -> Dict[str, Any]:
     if not summary:
         summary = raw.strip()
 
+    review = _clean_review((data or {}).get("review"))
+    if not review and body.strip():
+        # 模型漏写登记块时，仍按正文首行的 [通过] / [意见] 兜底判定。
+        # 条数不可信，统一记 0，卡片只用 verdict。
+        first_line = body.strip().splitlines()[0].strip()
+        if first_line.startswith("[通过]"):
+            review = {"verdict": "pass", "issues": 0, "ideas": 0}
+        elif first_line.startswith("[意见]"):
+            review = {"verdict": "issues", "issues": 0, "ideas": 0}
+
     return {
         "summary": summary,
         "artifacts": _clean_artifacts((data or {}).get("artifacts")),
         "changes": str((data or {}).get("changes") or (data or {}).get("opinion_handling") or "").strip(),
+        "review": review,
     }
+
+
+def _review_needs_retry(res: Any) -> bool:
+    """审核回答是否需要语义重试：回了内容，却没给出任何结论（开场白 / 只剩工具标记）。
+
+    真空输出不算——那交给「无意见」，重试也大概率还是空。只有「说了话但没结论」
+    才值得带强指令再问一次，避免把「我先读取…」当成审核意见入库。
+    """
+    if str(getattr(res, "status", "") or "") != "success":
+        return False
+    raw = str(getattr(res, "output", "") or "")
+    cleaned = sanitize_model_output(raw)
+    if not cleaned.strip():
+        return False
+    parsed = parse_output(raw)
+    if parsed.get("review"):
+        return False  # 已给出 [通过]/[意见] 或登记块，属于有效结论
+    return looks_like_incomplete(cleaned)
 
 
 def scan_artifacts(workspace_dir: str, artifacts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -645,6 +756,21 @@ class TaskManager:
         self._active_keys: Dict[str, Dict[str, Any]] = {}
         # 正在重跑的环节：挡住连点两次「重试」造成的重复执行
         self._retries: set = set()
+        # 执行器是否支持流式回调（on_chunk）。测试里的假执行器通常不带，自动退回非流式，
+        # 免得为了一个进度提示去改一整套测试夹具
+        self._streams = _accepts_on_chunk(self.runner)
+
+    def _stream_sink(self, sid: str, tid: str, stage: str, member_id: str, key: str):
+        """把执行器的增量回调转成「这场会话、这位成员正在写什么」。"""
+        def sink(text: str, info: Optional[Dict[str, Any]] = None) -> None:
+            data = info or {}
+            streaming.publish(
+                sid, key, tid, stage, member_id,
+                text or "",
+                str(data.get("phase") or ""),
+                str(data.get("activity") or ""),
+            )
+        return sink
 
     # ---------------- 会话读写小工具 ----------------
     def _get(self, sid: str) -> Optional[Dict[str, Any]]:
@@ -716,9 +842,19 @@ class TaskManager:
                 reviewer_ids = []
                 goal = content
                 task_type = TYPE_SINGLE
+                if not owner_id:
+                    # 没 @ 任何人：默认接着「最近一位回过话的成员」说（微信式对话习惯）。
+                    # 只取本场会话里现存、可用的成员；一个都没有才退回「仅作上下文」。
+                    owner_id = last_ai_member(messages[:-1], settings) or ""
+                    if owner_id:
+                        emp_default = self._employee(settings, owner_id) or {}
+                        user_msg["auto_to"] = {
+                            "id": owner_id,
+                            "name": emp_default.get("name") or owner_id,
+                        }
 
             if not owner_id:
-                # 没有点名成员：只作为上下文保留，不创建任务
+                # 没有点名、也没有可接话的成员：只作为上下文保留，不创建任务
                 self._save(session)
                 return {"info": "context_only"}
 
@@ -1054,6 +1190,8 @@ class TaskManager:
                 "raw_response": result.get("raw", ""),
                 "artifacts": task["artifacts"],
                 "elapsed_time": result.get("elapsed", 0),
+                "started_at": result.get("started_at"),
+                "finished_at": result.get("finished_at"),
             })
             self._update_card(session, task)
             self._save(session)
@@ -1174,20 +1312,48 @@ class TaskManager:
                     item["status"] = STATUS_TIMEOUT
                 elif result.get("status") == STATUS_FAILED:
                     item["status"] = STATUS_FAILED
-                elif not (result.get("summary") or "").strip():
-                    item["status"] = STATUS_NO_OPINION
                 else:
-                    item["status"] = STATUS_DONE
+                    summary_now = result.get("summary") or ""
+                    review_now = result.get("review") or {}
+                    if not summary_now.strip():
+                        # 完全没输出：无意见
+                        item["status"] = STATUS_NO_OPINION
+                    elif not review_now.get("verdict") and looks_like_incomplete(summary_now):
+                        # 只回了「我先读取…」这类开场白、没给结论（语义重试后仍如此）：
+                        # 不能冒充「完成」，记无意见，免得把开场白当审核意见喂给主创
+                        item["status"] = STATUS_NO_OPINION
+                    else:
+                        item["status"] = STATUS_DONE
+                review = result.get("review") or {}
+                summary_text = result.get("summary", "")
+                # 无意见时把正文换成明确说明：气泡显示「未给出结论」，而不是把开场白当结论。
+                # 原始输出仍保留在 raw_output，可在「交互详情」里查看。
+                if item["status"] == STATUS_NO_OPINION:
+                    if not (summary_text or "").strip():
+                        summary_text = "（本轮未给出意见）"
+                    elif looks_like_incomplete(summary_text):
+                        summary_text = (
+                            "（本轮未给出有效结论：模型只返回了开场白，"
+                            "没有按要求给出 [通过] / [意见]。原始输出可在「交互详情」查看）"
+                        )
                 item.update({
-                    "summary": result.get("summary", ""),
+                    "summary": summary_text,
                     "raw_output": result.get("raw", ""),
                     "sent_prompt": result.get("prompt", ""),
                     "msg_id": result.get("record_msg_id", ""),
                     "elapsed": result.get("elapsed", 0),
                     "started_at": result.get("started_at"),
                     "finished_at": result.get("finished_at"),
+                    "review_verdict": review.get("verdict", ""),
+                    "review_counts": {
+                        "issues": int(review.get("issues") or 0),
+                        "ideas": int(review.get("ideas") or 0),
+                    },
                 })
-                self._add_flow(task, f"{item.get('name')} 审核{self._state_label(item['status'])}")
+                if review.get("verdict") == "pass":
+                    self._add_flow(task, f"{item.get('name')} 审核通过")
+                else:
+                    self._add_flow(task, f"{item.get('name')} 审核{self._state_label(item['status'])}")
                 break
             self._update_card(session, task)
             self._save(session)
@@ -1361,6 +1527,10 @@ class TaskManager:
                     include_after=is_retry,
                 ),
             )
+            if read_only:
+                # 只读环节（审核）把「到底能不能读文件」如实写进 prompt：
+                # 工具被禁用的成员否则会回一句「我先读取…」就结束本轮，等于没审核。
+                prompt = prompt + capability_block(emp)
             record = {
                 "id": msg_id(),
                 "sender": emp_id,
@@ -1389,6 +1559,10 @@ class TaskManager:
                             "summary": "", "raw_output": "",
                             "sent_prompt": prompt, "msg_id": record["id"],
                             "elapsed": 0,
+                            # started_at 必须现在写：卡片上「进行中」这一段要显示开始时刻
+                            # 并实时计时，等跑完才写就整段时间都是空的
+                            "started_at": int(time.time()), "finished_at": None,
+                            "review_verdict": "", "review_counts": {},
                         })
             elif stage == STAGE_EXEC:
                 # 重跑执行时先清空上一轮的简报与产物：本轮失败也不该拿旧简报当结果展示；
@@ -1396,22 +1570,34 @@ class TaskManager:
                 task["part_a"].update({
                     "status": MEMBER_IN_PROGRESS, "brief": "", "artifacts": [],
                     "sent_prompt": prompt, "raw_output": "", "msg_id": record["id"],
-                    "elapsed": 0,
+                    "elapsed": 0, "started_at": int(time.time()), "finished_at": None,
                 })
                 task["artifacts"] = []
+                # 单任务：把本轮 Prompt 同步到聊天可见的结果消息，
+                # 执行进行中（点 ℹ️）就能看到「发送给 AI 的 Prompt」，不用等跑完；
+                # 同时记下 started_at，让结果消息顶部实时计时、显示「正在思考中」
+                if task.get("result_msg_id"):
+                    self._update_message(session, task["result_msg_id"], {
+                        "sent_prompt": prompt,
+                        "started_at": int(time.time()),
+                        "status": STATUS_RUNNING,
+                    })
                 # 主创重跑意味着上一轮的审核意见全部作废：不清掉的话，卡片上会挂着
                 # 上一轮的「已完成」和旧意见，看起来像这一轮审核已经通过了
                 for item in task.get("part_b") or []:
                     item.update({
                         "status": MEMBER_WAITING, "summary": "", "raw_output": "",
                         "sent_prompt": "", "msg_id": "", "elapsed": 0,
+                        "review_verdict": "", "review_counts": {},
                     })
             elif stage == STAGE_DELIVER:
                 task["part_a"]["final_status"] = MEMBER_IN_PROGRESS
-                # 交付的 Prompt 同样先落下来，交付进行中也能查
+                # 交付的 Prompt 同样先落下来，交付进行中也能查；开始时刻现在写，
+                # 卡片上「交付中」这一段才能显示开始时间并实时计时
                 task["part_a"].update({
                     "final": {}, "final_sent_prompt": prompt, "final_raw_output": "",
                     "final_elapsed": 0,
+                    "final_started_at": int(time.time()), "final_finished_at": None,
                 })
             task.setdefault("attempts", {})[attempt_key] = task["attempts"].get(attempt_key, 0) + 1
             self._update_card(session, task)
@@ -1424,15 +1610,43 @@ class TaskManager:
         if read_only:
             runner_emp["write_access"] = False  # 审核环节一律只读
 
+        # 流式：执行器每吐一段就写进暂存区，界面按 100ms 级轮询取尾部渲染，
+        # 等待期间能看到「正在写什么」，而不是只有一个「正在思考中」。
+        # 暂存用的 key 是 `{tid}:{stage}:{member_id}`（会话另记），与前端拼的完全一致。
+        live_key = streaming.stream_key(tid, stage, emp_id or "")
+        sink = self._stream_sink(sid, tid, stage, emp_id or "", live_key) if self._streams else None
+        run_kwargs: Dict[str, Any] = {"session_id": key, "workspace_dir": workspace_dir}
+        if sink:
+            run_kwargs["on_chunk"] = sink
+
         started = time.time()
         cancelled_flag = False
         try:
-            res = self.runner(
-                runner_emp,
-                prompt,
-                session_id=key,
-                workspace_dir=workspace_dir,
-            )
+            res = self.runner(runner_emp, prompt, **run_kwargs)
+            # 语义层重试（仅审核环节）：模型只回了「我先读取…」这类开场白、没给任何结论时，
+            # 带强指令再问一次。审核是只读的，重跑不会重复写盘；复用同一个执行单元与记录，
+            # 不会多出一条 task_record，也不额外占队列。仍然失败则交给「无意见」兜底。
+            if stage == STAGE_REVIEW and key not in CANCELLED_KEYS and _review_needs_retry(res):
+                print(f"[TaskManager] {emp.get('name') or emp_id} 审核疑似未给出结论，重试一次")
+                # 上一轮那句开场白先清掉：重试期间界面上不该还挂着旧文本
+                if sink:
+                    streaming.clear(live_key)
+                try:
+                    res_retry = self.runner(runner_emp, prompt + REVIEW_RETRY_HINT, **run_kwargs)
+                except Exception:
+                    res_retry = None
+
+                if res_retry is not None and key not in CANCELLED_KEYS:
+                    res_retry.elapsed = round(
+                        (getattr(res_retry, "elapsed", 0) or 0)
+                        + (getattr(res, "elapsed", 0) or 0),
+                        2,
+                    )
+                    res_retry.raw_output = (
+                        f"{getattr(res, 'raw_output', '')}\n--- retry ---\n"
+                        f"{getattr(res_retry, 'raw_output', '')}"
+                    )
+                    res = res_retry
         except Exception as exc:
             res = type("FallbackResult", (), {
                 "status": "error", "output": str(exc), "raw_output": str(exc),
@@ -1445,6 +1659,10 @@ class TaskManager:
                 # 同一个 key 下一轮执行会被无条件判成已取消（真的调了模型却不认结果）
                 cancelled_flag = key in CANCELLED_KEYS
                 CANCELLED_KEYS.discard(key)
+            # 这一轮已结束：暂存的半成品立刻撤掉，结果马上会以正式记录落库。
+            # 不清理的话，界面会一直显示上一轮的「正在写」文本
+            if sink:
+                streaming.clear(live_key)
 
         status = str(getattr(res, "status", "") or "")
         raw = str(getattr(res, "raw_output", "") or "") or str(getattr(res, "output", "") or "")
@@ -1481,6 +1699,7 @@ class TaskManager:
             "summary": parsed["summary"],
             "artifacts": parsed["artifacts"],
             "changes": parsed["changes"],
+            "review": parsed["review"],
             "raw": raw,
             "prompt": prompt,
             "record_msg_id": record["id"],
@@ -1657,6 +1876,9 @@ class TaskManager:
                 # 重跑执行=这一轮从头推进；重跑交付=重新生成终版
                 task["status"] = STATUS_RUNNING
                 task["finished_at"] = None
+                # 头部计时从这一轮重新算：不清掉的话「重新生成」会接着上一轮的
+                # started_at 一直计下去（看起来像跑了半小时）
+                task["started_at"] = int(time.time())
                 if stage == STAGE_EXEC and task.get("type") == TYPE_SINGLE and task.get("result_msg_id"):
                     # 单任务重跑期间消息转「执行中」，避免还挂着失效的「重试」按钮
                     self._update_message(session, task["result_msg_id"], {"status": STATUS_RUNNING})
@@ -1676,6 +1898,11 @@ class TaskManager:
                 for item in task.get("part_b") or []:
                     item["status"] = MEMBER_WAITING
                     item["summary"] = ""
+                    item["raw_output"] = ""
+                    item["sent_prompt"] = ""
+                    item["msg_id"] = ""
+                    item["review_verdict"] = ""
+                    item["review_counts"] = {}
                     item["elapsed"] = 0
                     item["started_at"] = None
                     item["finished_at"] = None
@@ -1691,6 +1918,9 @@ class TaskManager:
                 task["status"] = STATUS_RUNNING
                 task["finished_at"] = None
                 task["step"] = 2
+                # 单条重审同样算一轮：头部「开始 / 计时」从点下去的那一刻算，
+                # 否则会沿用整条任务最早的 started_at
+                task["started_at"] = int(time.time())
                 # 一次「重新审核」算一轮。多位审核并发重跑时只补一次交付：
                 # 谁最后跑完，看 generation 比 auto_deliver_generation 大就补一次。
                 task["review_generation"] = int(task.get("review_generation") or 0) + 1
@@ -1699,6 +1929,13 @@ class TaskManager:
                         item["status"] = MEMBER_WAITING
                         item["summary"] = ""
                         item["raw_output"] = ""
+                        # 旧输入快照里还是上一版规程，重审期间不能继续挂在这一段上：
+                        # 新 Prompt 会在 _execute_unit 里落库；若成员占用失败而没跑起来，
+                        # 也该显示「暂无输入」，而不是让人误以为新规程没生效。
+                        item["sent_prompt"] = ""
+                        item["msg_id"] = ""
+                        item["review_verdict"] = ""
+                        item["review_counts"] = {}
                         item["elapsed"] = 0
                         item["started_at"] = None
                         item["finished_at"] = None

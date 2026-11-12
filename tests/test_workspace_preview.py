@@ -76,6 +76,71 @@ class TestWorkspacePreviewApi(unittest.TestCase):
         )
         self.assertEqual(r.status_code, 404)
 
+    # ---------------- 实时刷新用的版本指纹 ----------------
+    def test_meta_only_returns_mtime_without_content(self):
+        r = self.client.get("/api/workspace/file", query_string={"path": self.md_path, "meta": "1"})
+        self.assertEqual(r.status_code, 200)
+        data = r.get_json()
+        self.assertGreater(data.get("mtime") or 0, 0)
+        self.assertEqual(data.get("size"), os.path.getsize(self.md_path))
+        # 只回版本信息：预览面板 1.2s 轮一次，不能每次都把正文读出来
+        self.assertNotIn("content", data)
+
+    # ---------------- 就地编辑保存 ----------------
+    def _write(self, name, text):
+        path = os.path.join(self.tmpdir, name)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+        return path
+
+    def test_save_writes_content_and_returns_new_mtime(self):
+        path = self._write("edit-me.md", "旧内容\n")
+        before = os.path.getmtime(path)
+        r = self.client.post("/api/workspace/file", json={
+            "path": path, "content": "新内容\n第二行\n", "base_mtime": before,
+        })
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        data = r.get_json()
+        self.assertTrue(data.get("ok"))
+        self.assertGreaterEqual(data.get("mtime"), before)
+        with open(path, "r", encoding="utf-8") as f:
+            self.assertEqual(f.read(), "新内容\n第二行\n")
+        # 保存后不再残留临时文件
+        self.assertFalse([n for n in os.listdir(self.tmpdir) if ".aim-save-" in n])
+
+    def test_save_detects_conflict_when_file_changed_meanwhile(self):
+        path = self._write("conflict.md", "AI 写的版本\n")
+        stale = os.path.getmtime(path) - 30      # 前端手里是旧版本
+        r = self.client.post("/api/workspace/file", json={
+            "path": path, "content": "我的覆盖\n", "base_mtime": stale,
+        })
+        self.assertEqual(r.status_code, 409)
+        data = r.get_json()
+        self.assertEqual(data.get("code"), "conflict")
+        with open(path, "r", encoding="utf-8") as f:
+            self.assertEqual(f.read(), "AI 写的版本\n")   # 没有被悄悄盖掉
+
+    def test_save_force_overwrites_after_confirmation(self):
+        path = self._write("force.md", "旧\n")
+        r = self.client.post("/api/workspace/file", json={
+            "path": path, "content": "确认覆盖\n", "base_mtime": 1, "force": True,
+        })
+        self.assertEqual(r.status_code, 200)
+        with open(path, "r", encoding="utf-8") as f:
+            self.assertEqual(f.read(), "确认覆盖\n")
+
+    def test_save_rejects_binary_file(self):
+        r = self.client.post("/api/workspace/file", json={
+            "path": self.png_path, "content": "假装是文本",
+        })
+        self.assertEqual(r.status_code, 415)
+
+    def test_save_rejects_path_outside_workspace(self):
+        r = self.client.post("/api/workspace/file", json={
+            "path": "/etc/hosts", "content": "x",
+        })
+        self.assertEqual(r.status_code, 404)
+
 
 if __name__ == "__main__":
     unittest.main()

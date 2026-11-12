@@ -98,9 +98,15 @@ class FakeRunner:
         self.fail_for = []
         self.empty_for = []
         self.timeout_for = []
+        # 按 key 片段返回自定义输出，用于验证「正文 + 登记块」这类新协议
+        self.outputs = {}
+        # 按 key 片段返回「每次调用依次不同」的输出，用于验证语义层重试（先开场白、后正常）
+        self.sequence_outputs = {}
         # 每位成员同时在跑的调用数（不变量：任意成员永远不超过 1）
         self.per_member = {}
         self.max_per_member = {}
+        # 进审核就挡住：用来在「审核进行中」这一刻检查卡片状态（进门后才放行）
+        self.review_gate = None
 
     def __call__(self, employee, prompt, session_id, workspace_dir):
         with self.lock:
@@ -128,6 +134,8 @@ class FakeRunner:
                     self.exec_barrier.wait(timeout=3)
                 except threading.BrokenBarrierError:
                     pass
+            if ":review:" in session_id and self.review_gate is not None:
+                self.review_gate.wait(timeout=5)
             gate = self.gates.get(session_id)
             if gate is not None:
                 gate.wait(timeout=3)
@@ -139,6 +147,13 @@ class FakeRunner:
                 return SimpleNamespace(status="error", output="调用失败", raw_output="调用失败", elapsed=0)
             if any(flag in session_id for flag in self.empty_for):
                 return SimpleNamespace(status="success", output="", raw_output="", elapsed=0)
+            for flag, seq in self.sequence_outputs.items():
+                if flag in session_id and seq:
+                    text = seq.pop(0)
+                    return SimpleNamespace(status="success", output=text, raw_output=text, elapsed=0)
+            for flag, text in self.outputs.items():
+                if flag in session_id:
+                    return SimpleNamespace(status="success", output=text, raw_output=text, elapsed=0)
             payload = {
                 "summary": "已完成 " + session_id,
                 "artifacts": [{"path": "out.md", "summary": "产物", "bytes": 12}],
@@ -359,6 +374,34 @@ class TestTaskCreation(TaskCase):
         self.assertIn("raw_response", result_msg)
         self.manager.wait_idle()
 
+    def test_single_result_msg_shows_prompt_while_running(self):
+        # 单任务（如给 agy 发消息）：结果消息在执行进行中就要带上 sent_prompt 与 started_at，
+        # 这样点 ℹ️「交互详情审查」能立即看到「发送给 AI 的 Prompt」，结果消息顶部也能实时计时，
+        # 不用等整轮跑完。
+        result = self._submit("@agy 做一件事")
+        tid = result["task_id"]
+        # 预先按 execution_key 把 worker 卡在「执行中」：runner 一进来就会被 gate 挡住，
+        # 但此刻 _execute 已经把 Prompt 与 started_at 写进了结果消息
+        hold = threading.Event()
+        self.runner.gates[f"s1:{tid}:exec:emp_agy"] = hold
+        # 等 worker 进入执行调用并被门挡住
+        deadline = time.time() + 4
+        while time.time() < deadline and not self.runner.calls:
+            time.sleep(0.02)
+        session = self.store.get_session("s1")
+        result_msg = [m for m in session["messages"] if m.get("kind") == "task_result"][0]
+        self.assertEqual(result_msg["status"], T.STATUS_RUNNING)
+        self.assertTrue(result_msg["sent_prompt"], "执行中结果消息应已带 Prompt")
+        self.assertTrue(result_msg["started_at"], "执行中结果消息应已带 started_at 供实时计时")
+        # 放行并等完成：完成后补上 finished_at
+        hold.set()
+        self._wait(tid)
+        session = self.store.get_session("s1")
+        result_msg = [m for m in session["messages"] if m.get("kind") == "task_result"][0]
+        self.assertEqual(result_msg["status"], T.STATUS_DELIVERED)
+        self.assertTrue(result_msg["finished_at"], "完成后结果消息应带 finished_at")
+        self.manager.wait_idle()
+
     def test_collab_with_spread_mentions_creates_card_with_reviewers(self):
         # 用户原话：主创点在前，审核的人写在句子后半段
         self.manager.auto_start = False
@@ -375,6 +418,8 @@ class TestTaskCreation(TaskCase):
         self.assertEqual(cards[0]["task_id"], result["task_id"])
 
     def test_no_mention_is_context_only(self):
+        # 本场会话还没有任何 AI 回过话，没有「默认接话对象」——仍只作上下文保留。
+        # 有历史时默认接最近一位，见 TestDefaultRouteToLastAi。
         result = self._submit("大家先看看这段背景")
         self.assertEqual(result.get("info"), "context_only")
         session = self.store.get_session("s1")
@@ -691,7 +736,7 @@ class TestCancelRetry(TaskCase):
                 len([c for c in self.runner.calls if ":deliver:" in c["key"]]),
                 before_deliver + 1,
             )
-        task = self._task(result["task_id"])
+        task = self._wait(result["task_id"], timeout=5) or self._task(result["task_id"])
         self.assertEqual(task["status"], T.STATUS_DELIVERED)
         self.assertEqual(
             next(i["status"] for i in task["part_b"] if i["member_id"] == "emp_ds4"),
@@ -1401,6 +1446,339 @@ class TestBusinessInvariants(TaskCase):
         self.assertEqual(execs, before + 1)
         self.assertEqual(len(current["tasks"]), 1)
         self.assertEqual(len([m for m in current["messages"] if m.get("kind") == "task_result"]), 1)
+
+
+class TestReviewStandard(TaskCase):
+    """审核规程四条标准 + [通过] 判定从模型输出一路传到卡片与主创。"""
+
+    PASS_OUTPUT = (
+        "[通过] 结构与用户原话逐条对应，边界情形都写了兜底，无需改动。\n"
+        "核对范围：out.md\n"
+        "```json\n"
+        '{"artifacts":[{"path":"out.md","summary":"终版"}],'
+        '"review":{"verdict":"pass","issues":0,"ideas":0}}\n'
+        "```"
+    )
+    ISSUES_OUTPUT = (
+        "[意见] 1 处隐患、1 条巧思。\n"
+        "核对范围：out.md\n"
+        "## 隐患与漏洞\n"
+        "- out.md:第 3 节 失败路径没给兜底 → 依赖缺失时走不下去 → 补一条降级步骤\n"
+        "## 新意与巧思\n"
+        "- out.md:第 5 节 用查表替代逐级判断，省一半步骤；代价是要先维护一张表（可选）\n"
+        "```json\n"
+        '{"artifacts":[{"path":"out.md","summary":"终版"}],'
+        '"review":{"verdict":"issues","issues":1,"ideas":1}}\n'
+        "```"
+    )
+
+    def test_protocol_contains_four_standards_and_no_stale_bans(self):
+        text = T._read_protocol("roles/reviewer.md")
+        for kw in ("审视隐患与漏洞", "逻辑自洽性", "边界条件", "实操可用性",
+                   "新意与巧思", "篇幅不设上限", "[通过]",
+                   "严禁为了提意见而硬挤琐碎细节", "隐患与漏洞"):
+            self.assertIn(kw, text)
+        # 这两条会把「尚未落盘的巧思」一起禁掉，不能回来
+        self.assertNotIn("不要要求用户没提过的新功能", text)
+        self.assertNotIn("不要对未落盘的设想发表意见", text)
+        self.assertNotIn("不对未落盘的设想发表意见",
+                         T._read_protocol("protocol/task-flow.md"))
+
+    def test_parse_output_strips_registry_and_reads_verdict(self):
+        parsed = T.parse_output(self.PASS_OUTPUT)
+        self.assertTrue(parsed["summary"].startswith("[通过]"))
+        self.assertNotIn("```json", parsed["summary"])
+        self.assertEqual(parsed["review"]["verdict"], "pass")
+        self.assertEqual(len(parsed["artifacts"]), 1)
+        self.assertEqual(
+            T.parse_output(self.ISSUES_OUTPUT)["review"],
+            {"verdict": "issues", "issues": 1, "ideas": 1},
+        )
+
+    def test_parse_output_infers_verdict_from_first_line(self):
+        # 模型漏写登记块时也要能判定「通过」
+        self.assertEqual(T.parse_output("[通过] 已经够好。")["review"]["verdict"], "pass")
+        self.assertEqual(T.parse_output("[意见] 有一处硬伤。")["review"]["verdict"], "issues")
+        self.assertEqual(T.parse_output("普通执行结果")["review"], {})
+
+    def test_verdict_not_trusted_when_invalid(self):
+        bad = '{"review":{"verdict":"maybe","issues":9}}'
+        self.assertEqual(T.parse_output("```json\n" + bad + "\n```")["review"], {})
+
+    def test_build_prompt_marks_pass_for_owner(self):
+        prompt = T.build_prompt(
+            T.STAGE_DELIVER, "写方案", T.TYPE_COLLAB,
+            opinions=[{"name": "DS4", "summary": "[通过] 够好", "review_verdict": "pass"}],
+        )
+        self.assertIn("[通过]，无需改动", prompt)
+        # 老会话没有 verdict：不加标记，也不能报错
+        old = T.build_prompt(
+            T.STAGE_DELIVER, "写方案", T.TYPE_COLLAB,
+            opinions=[{"name": "HY4", "summary": "一条意见"}],
+        )
+        self.assertIn("- HY4: 一条意见", old)
+
+    def test_pass_review_reaches_card_and_owner(self):
+        self.runner.outputs[":review:"] = self.PASS_OUTPUT
+        result = self._submit("/collab @agy @DS4 @HY4 写方案")
+        self._wait(result["task_id"])
+        self.manager.wait_idle()
+        task = self._task(result["task_id"])
+        for item in task["part_b"]:
+            self.assertEqual(item["status"], T.STATUS_DONE)
+            self.assertEqual(item["review_verdict"], "pass")
+            self.assertTrue(item["summary"].startswith("[通过]"))
+            self.assertNotIn("```json", item["summary"])
+        self.assertTrue(any("审核通过" in f["text"] for f in task["flow"]))
+        card = T.build_card(task)
+        self.assertTrue(all(i["review_verdict"] == "pass" for i in card["part_b"]))
+        with self.runner.lock:
+            deliver_prompts = [c["prompt"] for c in self.runner.calls
+                               if ":deliver:" in c["key"]]
+        self.assertTrue(deliver_prompts)
+        self.assertTrue(all("[通过]，无需改动" in p for p in deliver_prompts))
+
+    def test_issues_review_has_no_pass_label(self):
+        self.runner.outputs[":review:"] = self.ISSUES_OUTPUT
+        result = self._submit("/collab @agy @DS4 @HY4 写方案")
+        self._wait(result["task_id"])
+        self.manager.wait_idle()
+        task = self._task(result["task_id"])
+        for item in task["part_b"]:
+            self.assertEqual(item["review_verdict"], "issues")
+            self.assertEqual(item["review_counts"], {"issues": 1, "ideas": 1})
+        self.assertFalse(any("审核通过" in f["text"] for f in task["flow"]))
+
+    LEGACY_REVIEW_PROMPT = (
+        "# 角色规程 · 协助审核成员\n要求：\n"
+        "- 没有意见时正文明确写「无意见」，软件会在卡片里如实标记。\n"
+        "- 阅读输入里列出的真实产物。\n"
+    )
+
+    def test_current_review_prompt_has_four_standards_and_review_registry(self):
+        """输入快照是每次现拼的：新规程四条标准 + 审核专用登记要求都在里面。"""
+        prompt = T.build_prompt(T.STAGE_REVIEW, "写方案", T.TYPE_COLLAB)
+        for kw in ("审视隐患与漏洞", "新意与巧思", "精简实用", "达标即过",
+                   "[通过]", "[意见]", '"review"', "即使没有产出文件也要写这一段"):
+            self.assertIn(kw, prompt)
+        # 流程概述与旧角色规程的措辞都不能再混进输入
+        for kw in ("独立给出审核意见或优化建议", "没有意见时正文明确写「无意见」",
+                   "不对未落盘的设想发表意见", "不要对未落盘的设想发表意见"):
+            self.assertNotIn(kw, prompt)
+        # 执行 / 交付段仍用原来的输出要求，没被审核专用文案带偏
+        for stage in (T.STAGE_EXEC, T.STAGE_DELIVER):
+            other = T.build_prompt(stage, "写方案", T.TYPE_COLLAB)
+            self.assertIn("如果产出了文件", other)
+            self.assertNotIn("即使没有产出文件也要写这一段", other)
+
+    def test_retry_review_rebuilds_prompt_with_current_protocol(self):
+        """存量会话里挂着旧规程快照时，点「重新审核」不会复用它，而是重新拼一份。"""
+        result = self._submit("/collab @agy @DS4 @HY4 写方案")
+        self._wait(result["task_id"])
+        self.manager.wait_idle()
+        tid = result["task_id"]
+        with self.store.session_lock("s1"):
+            session = self.store.get_session("s1")
+            task = session["tasks"][tid]
+            member = task["part_b"][0]["member_id"]
+            task["part_b"][0]["sent_prompt"] = self.LEGACY_REVIEW_PROMPT
+            task["part_b"][0]["review_verdict"] = "pass"
+            task["part_b"][0]["review_counts"] = {"issues": 0, "ideas": 0}
+            self.store.save_session(session)
+
+        retry = self.manager.retry("s1", tid, T.STAGE_REVIEW, member)
+        self.assertTrue(retry.get("ok"), retry)
+        self._wait_retries()
+        self.manager.wait_idle()
+
+        item = next(i for i in self._task(tid)["part_b"]
+                    if i["member_id"] == member)
+        fresh = item["sent_prompt"]
+        self.assertIn("审视隐患与漏洞", fresh)
+        self.assertIn("达标即过", fresh)
+        self.assertNotIn("没有意见时正文明确写「无意见」", fresh)
+        # 旧判定也随这一轮重审清掉重算，不会把上一轮的 pass 带过来
+        self.assertNotEqual(item.get("review_verdict"), "pass")
+        # 真正发给 CLI 的那份输入同样是新规程
+        with self.runner.lock:
+            calls = [c["prompt"] for c in self.runner.calls if ":review:" in c["key"]]
+        self.assertGreaterEqual(len(calls), 3)
+        self.assertTrue(all("审视隐患与漏洞" in p for p in calls))
+
+
+class TestReviewSemanticRetry(TaskCase):
+    """模型只回「我先读一下…」这类开场白时：语义层重试 + 判无意见 + 气泡文案正确。
+
+    回归自 17d6e8a 的旧修复：任务系统重构时把 run_with_retry 丢了，
+    导致 hy4-std 这种「说了要做却没给结论」的回复被当成「完成」。
+    """
+
+    def test_detector_recognizes_intent_only_replies(self):
+        from core.executor import looks_like_incomplete as L
+        # 真实回归样本：hy4-std 的英文开场白（S 号：6373f3ce / t_60f4c7b0）
+        self.assertTrue(L("I'll read the actual artifact and surrounding context before judging."))
+        self.assertTrue(L("我先读取一下产物和上下文再判断。"))
+        self.assertTrue(L("Let me read the files first."))
+        # 正常的短结论不算残缺
+        self.assertFalse(L("[通过] 内容扎实，无硬伤。"))
+        self.assertFalse(L("[意见] 有 2 处隐患。\n核对范围：A01.md"))
+
+    def test_preamble_only_review_is_retried_then_no_opinion(self):
+        preamble = "I'll read the actual artifact and surrounding context before judging."
+        self.runner.outputs = {":review:emp_ds4": preamble}
+        result = self._submit("/collab @agy @DS4 @HY4 写方案")
+        task = self._wait(result["task_id"])
+        item = next(i for i in task["part_b"] if i["member_id"] == "emp_ds4")
+        # 不能冒充「完成」，记「无意见」
+        self.assertEqual(item["status"], T.STATUS_NO_OPINION)
+        self.assertEqual(item["review_verdict"], "")
+        # 气泡正文换成明确说明，不把开场白当结论
+        self.assertIn("未给出有效结论", item["summary"])
+        self.assertNotIn("I'll read the actual artifact", item["summary"])
+        # 原始开场白仍留在 raw_output 里可查
+        self.assertIn("I'll read the actual artifact", item["raw_output"])
+        # 确实做了语义层重试
+        with self.runner.lock:
+            calls = [c for c in self.runner.calls if ":review:emp_ds4" in c["key"]]
+        self.assertGreaterEqual(len(calls), 2)
+        # 无效结论不会作为审核意见喂给主创
+        deliver_prompt = next(c["prompt"] for c in self.runner.calls if ":deliver:" in c["key"])
+        self.assertNotIn("I'll read the actual artifact", deliver_prompt)
+        self.manager.wait_idle()
+
+    def test_preamble_then_valid_review_uses_retried_answer(self):
+        # 第一次开场白、第二次给出正常结论：重试后采用后者，不吞掉真实审核
+        self.runner.sequence_outputs = {
+            ":review:emp_ds4": [
+                "I'll read the actual artifact and surrounding context before judging.",
+                "[意见] 有一处隐患。\n核对范围：A01.md\n```json\n"
+                '{"review":{"verdict":"issues","issues":1,"ideas":0}}\n```',
+            ],
+        }
+        result = self._submit("/collab @agy @DS4 @HY4 写方案")
+        task = self._wait(result["task_id"])
+        item = next(i for i in task["part_b"] if i["member_id"] == "emp_ds4")
+        self.assertEqual(item["status"], T.STATUS_DONE)
+        self.assertEqual(item["review_verdict"], "issues")
+        self.assertIn("有一处隐患", item["summary"])
+        self.manager.wait_idle()
+
+    def test_substantive_review_without_marker_is_not_retried(self):
+        # 内容充实、只是忘了首行标记：不算开场白，不重试、不误判无意见
+        long_review = (
+            "核对范围：A01.md。这份文档整体可用，但第三节与第七节在屏幕使用上口径冲突，"
+            "建议在第三节补一句前提限定，并同步第七节的示例，避免家长照做时左右为难。"
+        ) * 3
+        self.runner.outputs = {":review:emp_ds4": long_review}
+        result = self._submit("/collab @agy @DS4 @HY4 写方案")
+        task = self._wait(result["task_id"])
+        item = next(i for i in task["part_b"] if i["member_id"] == "emp_ds4")
+        self.assertEqual(item["status"], T.STATUS_DONE)
+        with self.runner.lock:
+            calls = [c for c in self.runner.calls if ":review:emp_ds4" in c["key"]]
+        self.assertEqual(len(calls), 1)  # 没有语义重试
+        self.manager.wait_idle()
+
+
+class TestRunningCardClock(TaskCase):
+    """卡片「进行中」必须同时有开始时刻和实时计时。
+
+    历史表现：只有等环节跑完才写 started_at，跑了多久、几点开始全靠猜；
+    单条重审还会沿用整条任务最早的 started_at，看起来像跑了半小时。
+    """
+
+    def test_review_item_has_started_at_while_running(self):
+        self.runner.review_gate = threading.Event()
+        result = self._submit("/collab @agy @DS4 写一份方案")
+        tid = result["task_id"]
+        # 等审核调用真的进来（被门挡住，此刻状态已经是「进行中」）
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            if any(":review:" in c["key"] for c in self.runner.calls):
+                break
+            time.sleep(0.02)
+        item = [i for i in self._task(tid)["part_b"] if i["member_id"] == "emp_ds4"][0]
+        self.assertEqual(item["status"], T.MEMBER_IN_PROGRESS)
+        self.assertTrue(item["started_at"], "审核进行中就要有开始时刻，卡片才能计时")
+        self.assertIsNone(item["finished_at"])
+        self.runner.review_gate.set()
+        self.manager.wait_idle()
+
+    def test_retry_review_resets_card_clock(self):
+        result = self._submit("/collab @agy @DS4 写一份方案")
+        tid = result["task_id"]
+        self._wait(tid)
+
+        # 把卡片计时改成「很久以前开始」，模拟已交付很久之后再点重新审核
+        task = self._task(tid)
+        task["started_at"] = 1000
+        task["finished_at"] = 0
+
+        out = self.manager.retry("s1", tid, T.STAGE_REVIEW, "emp_ds4")
+        self.assertTrue(out.get("ok"))
+        task = self._task(tid)
+        self.assertGreater(task["started_at"], 1000, "重审应从点下去的那一刻重新计时")
+        self.manager.wait_idle()
+        self._wait_retries()
+
+
+class TestDefaultRouteToLastAi(TaskCase):
+    """没 @ 任何人的消息，默认接着「最近一位回过话的成员」说。
+
+    起因：聊天窗里连着追问（「再补一句」「按刚才的改」）很常见，每句都要求
+    重新打一遍 @ 谁，实际用起来很别扭。默认对象只取本场会话里现存且可用的成员，
+    一个都没有时仍然只把消息当上下文保留（不凭空建任务）。
+    """
+
+    def _seed(self, senders, settings=None):
+        session = self.store.get_session("s1")
+        for i, sender in enumerate(senders):
+            session["messages"].append({
+                "id": f"m_seed_{i}", "sender": sender, "sender_name": sender,
+                "content": f"第 {i} 条历史", "in_chat": True, "created_at": 100 + i,
+            })
+        self.store.save_session(session)
+        if settings is not None:
+            self.settings = settings
+            self.store.settings = settings
+
+    def test_no_mention_goes_to_last_ai(self):
+        self.manager.auto_start = False
+        # 最后一条是 HY4 说的；更早是 agy
+        self._seed(["emp_agy", "user", "emp_hy4"])
+        result = self.manager.submit_message("s1", "再补一句结论", self.settings)
+        self.assertIn("task_id", result, result)
+        task = self._task(result["task_id"])
+        self.assertEqual(task["owner_id"], "emp_hy4")
+        user_msg = [m for m in self.store.get_session("s1")["messages"] if m["sender"] == "user"][-1]
+        # 前端据此在气泡里标「默认发给 XXX」，避免「我没点名它怎么回了」
+        self.assertEqual(user_msg["auto_to"]["id"], "emp_hy4")
+        self.assertEqual(user_msg["auto_to"]["name"], "HY4")
+        self.manager.wait_idle()
+
+    def test_mention_still_wins_over_history(self):
+        self.manager.auto_start = False
+        self._seed(["emp_hy4"])
+        result = self.manager.submit_message("s1", "@DS4 你看一下这个", self.settings)
+        self.assertEqual(self._task(result["task_id"])["owner_id"], "emp_ds4")
+        self.manager.wait_idle()
+
+    def test_skips_disabled_member(self):
+        self.manager.auto_start = False
+        settings = copy.deepcopy(self.settings)
+        for emp in settings["employees"]:
+            if emp["id"] == "emp_hy4":
+                emp["enabled"] = False
+        self._seed(["emp_ds4", "emp_hy4"], settings=settings)
+        result = self.manager.submit_message("s1", "继续说", settings)
+        self.assertEqual(self._task(result["task_id"])["owner_id"], "emp_ds4")
+        self.manager.wait_idle()
+
+    def test_no_history_stays_context_only(self):
+        self.manager.auto_start = False
+        result = self.manager.submit_message("s1", "大家好", self.settings)
+        self.assertEqual(result.get("info"), "context_only")
+        self.assertNotIn("task_id", result)
 
 
 if __name__ == "__main__":

@@ -13,8 +13,9 @@ from core.storage import (
     list_sessions, get_session, create_session, save_session, delete_session,
     is_valid_session_id, session_lock, SessionDeletedError
 )
-from core.executor import Executor, validate_cli_template
+from core.executor import Executor, validate_cli_template, normalize_cli_tools
 from core.tasks import task_manager, parse_collab, STAGE_EXEC, STAGE_REVIEW, STAGE_DELIVER
+import core.streaming as streaming
 from core.scanner import scan_local_models
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -193,6 +194,14 @@ def _sanitize_agent(raw, label: str, default_id: str) -> "tuple":
     # 0 = 不限制（默认）：模型可以跑到自己结束，需要中断时在对应消息或卡片上点取消
     timeout = max(0, min(86400, timeout))
 
+    # 读/写权限分开存。老配置没有 read_access 字段 => 视为有读权限，
+    # 避免升级后所有成员突然读不到工作目录（表现为只回一句「我先读取一下」）。
+    read_access = bool(raw.get("read_access", True))
+    write_access = bool(raw.get("write_access", False))
+    # 模板里残留的 --tools "" 会让人连产物都读不到：按权限就地修好再落库，
+    # 这样界面上看到的模板 = 实际执行用的模板。
+    cli_cmd = normalize_cli_tools(cli_cmd, read_access, write_access)
+
     return {
         "id": agent_id,
         "name": str(raw.get("name") or "").strip() or label,
@@ -205,7 +214,8 @@ def _sanitize_agent(raw, label: str, default_id: str) -> "tuple":
         "timeout": timeout,
         # 写权限由服务端按 CLI 类型注入对应开关（见 core.executor.apply_access_mode）：
         # 模板里手写 --dangerously-skip-permissions 也能生效，但 UI 开关是唯一可审计的入口。
-        "write_access": bool(raw.get("write_access", False)),
+        "write_access": write_access,
+        "read_access": read_access,
     }, None
 
 
@@ -308,6 +318,7 @@ def api_delete_session(session_id):
     # 任务系统的执行键是 `{session_id}:{task_id}:{stage}:{member_id}`，
     # 只按 session_id 精确匹配会漏杀正在执行的 CLI 子进程
     Executor.kill_session_processes(session_id)
+    streaming.clear_session(session_id)
     success = delete_session(session_id)
     return jsonify({"success": success})
 
@@ -414,18 +425,47 @@ def api_workspace_files():
     except Exception as e:
         return jsonify({"error": str(e), "items": []})
 
+# 允许在预览面板里直接编辑的文件类型：只放行纯文本，二进制（docx/图片/压缩包）
+# 一旦被当文本写回去会直接损坏，所以用白名单而不是黑名单。
+EDITABLE_EXTS = {
+    ".md", ".markdown", ".mdx", ".txt", ".text", ".log",
+    ".json", ".jsonl", ".yml", ".yaml", ".toml", ".ini", ".conf", ".cfg",
+    ".csv", ".tsv", ".html", ".htm", ".css", ".scss", ".less",
+    ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".vue", ".svelte",
+    ".py", ".sh", ".bash", ".zsh", ".sql", ".xml", ".java", ".go", ".rs", ".rb", ".php",
+}
+# 在线编辑的体量上限：预览是 500KB，写回留一点余量但不无限放大
+EDITABLE_MAX_BYTES = 2 * 1024 * 1024
+
+
+def _file_meta(fpath: str) -> dict:
+    """文件的「版本指纹」：mtime 精确到纳秒级（float），前端据此判断要不要重新读。"""
+    st = os.stat(fpath)
+    return {
+        "path": fpath,
+        "name": os.path.basename(fpath),
+        "size": st.st_size,
+        "mtime": st.st_mtime,
+    }
+
+
 @app.route("/api/workspace/file", methods=["GET"])
 def api_workspace_file_content():
     fpath = request.args.get("path", "").strip()
     if not fpath or not is_path_safe(fpath) or not os.path.exists(fpath) or not os.path.isfile(fpath):
         return jsonify({"error": "文件不存在或无权访问"}), 404
 
-    size = os.path.getsize(fpath)
-    name = os.path.basename(fpath)
+    meta = _file_meta(fpath)
+    # meta=1：只回版本指纹，不读正文。预览面板的「有没有被改写」轮询走这条路，
+    # 一本几百 KB 的文档也不至于每秒读一遍盘。
+    if request.args.get("meta") in ("1", "true"):
+        return jsonify(meta)
+
+    size = meta["size"]
     if size > 500 * 1024:
         # 明确告诉前端「为什么没有内容」，别让它把提示语当成文件正文渲染
         return jsonify({
-            "content": "", "path": fpath, "name": name, "size": size,
+            **meta, "content": "",
             "too_large": True,
             "error": "文件过大（>500KB），暂不支持在线预览",
         })
@@ -433,9 +473,68 @@ def api_workspace_file_content():
     try:
         with open(fpath, "r", encoding="utf-8", errors="replace") as f:
             content = f.read()
-        return jsonify({"content": content, "path": fpath, "name": name, "size": size})
+        return jsonify({**meta, "content": content})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/workspace/file", methods=["POST"])
+def api_workspace_file_save():
+    """把编辑后的正文写回磁盘（预览面板的「编辑 → 保存」）。
+
+    - 只允许纯文本白名单后缀，二进制文件一律拒绝（写回去就是损坏）
+    - 写入走「同目录临时文件 + os.replace」，中途失败不会留下半个文件
+    - 带 base_mtime 时做一次冲突检测：期间被 AI 或别的编辑器改过就返回 409，
+      由前端确认「仍要覆盖」后再带 force=1 重发，避免悄悄盖掉刚写好的内容
+    """
+    data = request.get_json(silent=True) or {}
+    fpath = str(data.get("path") or "").strip()
+    content = data.get("content")
+    if not fpath or not is_path_safe(fpath) or not os.path.exists(fpath) or not os.path.isfile(fpath):
+        return jsonify({"error": "文件不存在或无权写入"}), 404
+    if not isinstance(content, str):
+        return jsonify({"error": "内容必须是文本"}), 400
+
+    ext = os.path.splitext(fpath)[1].lower()
+    if ext not in EDITABLE_EXTS:
+        return jsonify({"error": "这类文件不支持在线编辑（只支持纯文本）"}), 415
+    if "\x00" in content:
+        return jsonify({"error": "内容里含有不可写入的二进制字符"}), 400
+    encoded = content.encode("utf-8")
+    if len(encoded) > EDITABLE_MAX_BYTES:
+        return jsonify({"error": "内容过大（上限 2MB），请在本机编辑器里修改"}), 413
+
+    meta = _file_meta(fpath)
+    base_mtime = data.get("base_mtime")
+    force = bool(data.get("force"))
+    if isinstance(base_mtime, (int, float)) and not force:
+        # 1ms 容差：纳秒级 mtime 在不同文件系统上可能有极小抖动
+        if abs(meta["mtime"] - float(base_mtime)) > 0.001:
+            return jsonify({
+                "error": "文件在你编辑期间被改写了（可能是 AI 刚写入）",
+                "code": "conflict",
+                "mtime": meta["mtime"],
+                "size": meta["size"],
+            }), 409
+
+    tmp_path = f"{fpath}.aim-save-{int(time.time() * 1000)}.tmp"
+    try:
+        mode = os.stat(fpath).st_mode & 0o777
+        with open(tmp_path, "w", encoding="utf-8", newline="") as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp_path, mode)
+        os.replace(tmp_path, fpath)
+    except Exception as e:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
+        return jsonify({"error": f"保存失败：{e}"}), 500
+
+    return jsonify({"ok": True, **_file_meta(fpath)})
 
 
 # 预览弹窗里能直接看图：只放行图片类型，避免这个接口变成任意文件下载器
@@ -458,6 +557,21 @@ def api_workspace_file_raw():
         # 用 <img> 加载时脚本不会执行；这里再显式声明，避免被当成 HTML 打开
         mime = "image/svg+xml"
     return send_file(fpath, mimetype=mime, max_age=0)
+
+@app.route("/api/sessions/<session_id>/live", methods=["GET"])
+def api_session_live(session_id):
+    """正在生成的文本（进程内暂存，不落库）。
+
+    为什么要单独一个轻量接口：会话轮询是 1.5s 一次、且整份 messages 会被替换重渲染，
+    拿它来做「逐字增长」既慢又贵。这里只回当前几条在跑的文本，前端 300~700ms 拉一次，
+    回答结束后这些 key 会消失，正式结果照常从 /api/sessions/<id> 取。
+    """
+    if not is_valid_session_id(session_id):
+        return jsonify({"error": "非法 session_id"}), 400
+    if not get_session(session_id):
+        return jsonify({"error": "会话不存在"}), 404
+    return jsonify({"streams": streaming.for_session(session_id)})
+
 
 # ----------------- Meeting Controls API -----------------
 @app.route("/api/sessions/<session_id>/message", methods=["POST"])
