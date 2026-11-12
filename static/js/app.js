@@ -23,6 +23,12 @@ createApp({
         employees: []
       },
       inputContent: "",
+      // 输入候选列表：打 / 弹命令、打 @ 弹成员。
+      // { kind: 'command'|'member', query, items, active, start, end }，start/end 是被替换的文本范围
+      suggest: null,
+      // /collab 的服务端校验结果：{ content, ok, error }；content 用来丢弃过期响应
+      collabCheck: null,
+      collabCheckTimer: null,
       // 引用回复：{ id, sender, sender_name, content }，发送时把 id 交给后端定向
       replyTarget: null,
       // 长消息展开状态（按消息 id 记，轮询刷新不会把用户展开的又收回去）
@@ -32,6 +38,10 @@ createApp({
       workspaceItems: [],
       selectedWorkspaceFile: null,
       selectedFileContent: "",
+      // 文件预览弹窗：右侧面板只列目录，点文件在这里看，md 走渲染、图片走 img、其余按等宽文本
+      showFilePreview: false,
+      filePreview: null,          // { name, path, size, kind, content, error }
+      filePreviewLoading: false,
 
       showMemberDropdown: false,
 
@@ -93,9 +103,18 @@ createApp({
       cardModalMsg: null,
       nowTick: Date.now(),   // 卡片外壳的「实时耗时」由每秒心跳驱动
       tickTimer: null,
+      // 聊天卡片里某段简报是否展开全文（key → true）。不存进后端：
+      // 这是纯阅读状态，刷新页面回到「三行摘要」是符合预期的。
+      briefOpen: {},
+      cardClosed: {},
+      // 已删除（或正在删除）的消息 id：本地先屏蔽，别等轮询把旧数据带回来闪一下
+      deletedMsgIds: {},
       // 消息审查详情弹窗
       showInspectModal: false,
       inspectTab: "prompt",
+      // 原始回复默认按 markdown 渲染；模型偶发输出半截表格/代码块时，
+      // 渲染结果会难看懂，所以留一个「原文」开关让人切回纯文本对照。
+      inspectRaw: false,
       inspectingMsg: null,
       // Prompt 分段折叠状态（key → 是否展开）。只记用户手动点过的段，
       // 没点过的走 promptSections 里的 defaultOpen，所以每次打开弹窗都是默认视图。
@@ -166,6 +185,64 @@ createApp({
         .filter(s => s.title || s.body);
     },
 
+    // 查看某环节输入输出、但这一环节没有 Prompt 时该说什么
+    inspectEmptyHint() {
+      const st = (this.inspectingMsg && this.inspectingMsg.stage_status) || "";
+      if (["waiting", "queued"].includes(st)) {
+        return "该环节还没开始，执行后才能看到发送给模型的 Prompt。";
+      }
+      if (["running", "in_progress"].includes(st)) {
+        return "该环节正在执行，Prompt 已随这次执行留存，稍后刷新即可查看。";
+      }
+      return "该条记录生成于 Prompt 持久化功能上线前，未留存独立 Prompt。";
+    },
+
+    // 输入输出弹窗顶部的解释条：把 CLI 的英文报错翻成人话。
+    // 起因：端口冲突修复上线后，用户点开一条旧记录看到满屏 EADDRINUSE，
+    // 会以为「修了还在报」。原文一个字不改（可复制、可排查），只在上面加一句说明。
+    inspectNote() {
+      const text = String(
+        (this.inspectingMsg &&
+          (this.inspectingMsg.raw_response || this.inspectingMsg.content)) ||
+          ""
+      );
+      if (!text) return "";
+      if (/EADDRINUSE|address already in use/i.test(text)) {
+        return this.t(
+          "这是命令行的端口冲突：CLI 启动时要监听的本机端口被别的程序占了，进程随即退出，所以这一环节没有产出。当前版本会在干净环境里启动 CLI，撞端口还会自动重试；若这条是较早的记录，点该环节的「重试」跑一次即可确认。"
+        );
+      }
+      if (/Authentication required|not logged in|please log ?in/i.test(text)) {
+        return this.t(
+          "这是 CLI 自己的登录态失效，和软件无关：在终端里重新登录该 CLI，再点该环节的「重试」即可。"
+        );
+      }
+      return "";
+    },
+
+    // 弹窗默认视图的正文：登记块已摘掉；整段都是 JSON 时退回到 summary 字段
+    inspectBody() {
+      const split = this.splitRegistry(
+        (this.inspectingMsg && (this.inspectingMsg.raw_response || this.inspectingMsg.content)) || ""
+      );
+      if (split.body) return split.body;
+      if (!split.registry) return "";
+      try {
+        const obj = JSON.parse(split.registry);
+        const summary = String(obj.summary || "").trim();
+        const changes = String(obj.changes || obj.opinion_handling || "").trim();
+        if (summary && changes) return `${summary}\n\n**处理说明**\n\n${changes}`;
+        return summary || changes || "";
+      } catch (e) {
+        return "";
+      }
+    },
+    inspectRegistry() {
+      return this.splitRegistry(
+        (this.inspectingMsg && (this.inspectingMsg.raw_response || this.inspectingMsg.content)) || ""
+      ).registry;
+    },
+
     // 本会话已选成员列表（未勾选的不在此列表中）
     activeSessionEmployees() {
       if (!this.currentSession || !Array.isArray(this.currentSession.employee_ids)) return [];
@@ -186,12 +263,28 @@ createApp({
     availableEmployees() {
       return (this.settings.employees || []).filter(e => e.enabled);
     },
+    // 输入框打 / 时弹出的命令清单。这里只列真正实现了的指令，
+    // 不做「以后可能会有」的占位项——点了没反应比没有更糟。
+    commandCandidates() {
+      return [
+        {
+          id: "cmd/collab",
+          kind: "command",
+          label: "/collab",
+          desc: this.t("发起协助任务：@主创 @协助成员 任务内容"),
+          insert: "/collab ",
+          opensMembers: true,   // 选完立刻接着让人选主创
+        },
+      ];
+    },
     inputPlaceholder() {
       return this.t("输入任务：@ 一位成员，或 /collab @主创 @协助成员 任务内容… (Enter 发送)");
     },
     // 协助任务各环节的执行记录不进聊天流（但能在卡片弹窗里查完整输入 / 原始输出）
     visibleMessages() {
-      return (this.currentSession?.messages || []).filter(m => m && m.in_chat !== false);
+      return (this.currentSession?.messages || []).filter(
+        m => m && m.in_chat !== false && !(m.id && this.deletedMsgIds[m.id])
+      );
     },
     hasActiveTasks() {
       const tasks = this.currentSession?.tasks || {};
@@ -206,45 +299,17 @@ createApp({
         t.status === "running" || t.status === "queued" || inflight(t)
       ));
     },
-    // 输入时的 /collab 严格校验：主创 + 至少一位协助成员 + 任务内容 + 成员可用
+    // 输入时的 /collab 校验：交给服务端 /api/collab/validate，前后端用同一套解析。
+    // 本地再写一套「谁被 @ 了」的判断必然会和 Python 那边越走越偏（现在已支持
+    // @//agy/ 这种路径写法、大小写、提及散落在句子里），所以这里只负责显示结果。
     collabHint() {
       const text = (this.inputContent || "").trim();
       if (!/^\/collab(\s|$)/i.test(text)) return null;
-      const rest = text.replace(/^\/collab\s*/i, "").trim();
-      const pool = (this.settings.employees || []).map(e => {
-        const name = String(e.name || "");
-        const short = (name.match(/[（(][^（）()]+[）)]/g) || []).map(s => s.slice(1, -1));
-        const aliases = [name, String(e.id || ""), ...short].filter(Boolean)
-          .sort((a, b) => b.length - a.length);
-        return { emp: e, aliases };
-      });
-      const picked = [];
-      let cursor = 0;
-      while (true) {
-        const rawTail = rest.slice(cursor);
-        const tail = rawTail.trimStart();
-        if (!tail.startsWith("@")) break;
-        const hit = pool.find(m => m.aliases.some(n => tail.startsWith("@" + n)));
-        if (!hit) break;
-        const alias = hit.aliases.find(n => tail.startsWith("@" + n));
-        picked.push(hit.emp);
-        cursor += (rawTail.length - rawTail.trimStart().length) + alias.length + 1;
-      }
-      const goal = rest.slice(cursor).trim();
-      if (picked.length === 0) return { ok: false, text: this.t("缺少主创：请用 /collab @主创 @协助成员 任务内容") };
-      if (picked.length < 2) return { ok: false, text: this.t("缺少协助成员：主创之后至少再指定一位协助成员") };
-      if (!goal) return { ok: false, text: this.t("请写上任务内容") };
-      // 停用或缺 CLI 的成员在这里就提示：否则格式看着正确，发出去才在审核环节变成「成员不可用」
-      const usable = e => e && e.enabled !== false && String(e.cli_cmd || "").trim() !== "";
-      const label = e => String(e.name || e.id || "");
-      if (!usable(picked[0])) {
-        return { ok: false, text: this.t("主创 {name} 已停用或缺少 CLI 配置：请先在设置里启用", { name: label(picked[0]) }) };
-      }
-      const unusable = picked.slice(1).filter(e => !usable(e));
-      if (unusable.length) {
-        return { ok: false, text: this.t("协助成员 {name} 已停用或缺少 CLI 配置：请先在设置里启用", { name: unusable.map(label).join("、") }) };
-      }
-      return { ok: true, text: this.t("格式正确：将发起一轮协助任务") };
+      const res = this.collabCheck;
+      // 还没校验完（或期间又改了字）就先不显示，避免闪一下错的提示
+      if (!res || res.content !== text) return null;
+      if (res.ok) return { ok: true, text: this.t("格式正确：将发起一轮协助任务") };
+      return { ok: false, text: this.t(res.error || "格式不正确") };
     },
     // 卡片弹窗里的「历次执行记录」：取消 / 重试产生的旧记录也保留，可按记录查看完整输入与原始输出
     cardRecords() {
@@ -258,7 +323,26 @@ createApp({
           seen[k] = (seen[k] || 0) + 1;
           return { ...m, _label: this.recordLabel(m, seen[k]) };
         });
-    }
+    },
+
+    // 实时流水：早期记录里写的是 emp_xxx 这种内部 id，显示时换成成员名
+    cardFlow() {
+      return (this.cardModalMsg?.card?.flow || []).slice(-8).map(f => ({
+        ...f,
+        text: this._localizeMemberIds(f.text),
+      }));
+    },
+
+    // 卡片顶部的三步进度：执行 → 审核 → 交付
+    cardSteps() {
+      return this.cardStepsOf(this.cardModalMsg && this.cardModalMsg.card);
+    },
+
+    // 审核环节的整体进度，例如「1/2 已完成」
+    reviewProgress() {
+      return this.reviewProgressOf(this.cardModalMsg && this.cardModalMsg.card);
+    },
+
   },
   mounted() {
     this.restoreLayout();
@@ -272,29 +356,366 @@ createApp({
     window.addEventListener("mousemove", this.onDragMove);
     window.addEventListener("mouseup", this.onDragEnd);
     window.addEventListener("resize", this.onWindowResize);
+    window.addEventListener("keydown", this.onGlobalKeydown);
+    // markdown 里的 mermaid 图要在 v-html 落地后再换成 SVG。
+    // 聊天流、预览弹窗、任务详情都会插入新节点，统一用观察器兜住，不用每处都插一次调用。
+    this.mermaidObserver = new MutationObserver(this.scheduleMermaid);
+    this.mermaidObserver.observe(document.body, { childList: true, subtree: true });
+    this.scheduleMermaid();
   },
   beforeUnmount() {
     if (this.pollInterval) clearInterval(this.pollInterval);
     if (this.tickTimer) clearInterval(this.tickTimer);
+    if (this.mermaidObserver) this.mermaidObserver.disconnect();
+    if (this._mermaidTimer) clearTimeout(this._mermaidTimer);
     document.removeEventListener("click", this.handleGlobalClick);
     window.removeEventListener("mousemove", this.onDragMove);
     window.removeEventListener("mouseup", this.onDragEnd);
     window.removeEventListener("resize", this.onWindowResize);
+    window.removeEventListener("keydown", this.onGlobalKeydown);
   },
   methods: {
+    // Esc 关掉最上面那层弹窗（文件预览 → 输入输出 → 任务详情），输入框里按 Esc 不受影响
+    onGlobalKeydown(e) {
+      if (e.key !== "Escape") return;
+      if (this.showFilePreview) { this.closeFilePreview(); return; }
+      if (this.showInspectModal) { this.showInspectModal = false; return; }
+      if (this.showCardModal) { this.showCardModal = false; }
+    },
+    // 折叠卡片也要显示审核进度，所以按任意 card 计算
+    reviewProgressOf(card) {
+      const reviewers = (card && card.part_b) || [];
+      if (!reviewers.length) return "";
+      const finished = reviewers.filter(r =>
+        ["done", "failed", "cancelled", "timeout", "no_opinion"].includes(r.status)
+      ).length;
+      return this.t("{done}/{total} 已完成", { done: finished, total: reviewers.length });
+    },
+    // 流水文案里残留的内部成员 id 换成成员名（折叠卡片只显示最后一行，也要换）
+    _localizeMemberIds(raw) {
+      let text = String(raw || "");
+      const nameOf = {};
+      (this.settings.employees || []).forEach(e => { nameOf[e.id] = e.name || e.id; });
+      // 长 id 先替换，避免 emp_agy 被 emp_agy_2 这种更长的 id 抢先切掉一半
+      Object.keys(nameOf).sort((a, b) => b.length - a.length).forEach(id => {
+        if (text.includes(id)) text = text.split(id).join(nameOf[id]);
+      });
+      return text;
+    },
+
+    latestFlowText(card) {
+      const flow = (card && card.flow) || [];
+      const last = flow[flow.length - 1];
+      return last ? this._localizeMemberIds(last.text) : this.t("（暂无）");
+    },
+
+    // 聊天卡片的主体：主创执行 / 每位协助审核 / 主创交付，各一段简报。
+    // 产物清单、实时流水、完整 Prompt 与原始输出都留在「完整任务详情」里，
+    // 聊天流里只回答问题「这一轮谁做了什么、结论是什么」。
+    cardBriefRows(card) {
+      if (!card) return [];
+      const a = card.part_a || {};
+      const ownerName = card.owner_name || (card.owner && card.owner.name) || "";
+      const rows = [{
+        key: "exec",
+        icon: "🎯",
+        name: ownerName,
+        role: this.t("主创"),
+        stage: this.t("执行"),
+        status: a.status || "waiting",
+        elapsed: Number(a.elapsed) || 0,
+        started_at: a.started_at || null,
+        finished_at: a.finished_at || null,
+        brief: a.brief || "",
+        inspect: {
+          sent_prompt: a.sent_prompt || "",
+          raw_response: a.raw_output || "",
+          content: a.brief || "",
+          stage_status: a.status || "",
+          elapsed: Number(a.elapsed) || 0,
+          started_at: a.started_at || null,
+          finished_at: a.finished_at || null,
+        },
+      }];
+      (card.part_b || []).forEach(item => {
+        const st = item.status || "waiting";
+        rows.push({
+          key: "review:" + (item.member_id || ""),
+          icon: "🤝",
+          name: item.name || item.member_id || "",
+          memberId: item.member_id || "",
+          role: this.t("协助审核"),
+          stage: this.t("审核"),
+          status: st,
+          elapsed: Number(item.elapsed) || 0,
+          started_at: item.started_at || null,
+          finished_at: item.finished_at || null,
+          brief: item.summary || "",
+          inspect: {
+            sent_prompt: item.sent_prompt || "",
+            raw_response: item.raw_output || "",
+            content: item.summary || "",
+            stage_status: st,
+            elapsed: Number(item.elapsed) || 0,
+            started_at: item.started_at || null,
+            finished_at: item.finished_at || null,
+          },
+        });
+      });
+      const final = a.final || {};
+      rows.push({
+        key: "deliver",
+        icon: "📦",
+        name: ownerName,
+        role: this.t("主创"),
+        stage: this.t("交付"),
+        status: a.final_status || "waiting",
+        elapsed: Number(a.final_elapsed) || 0,
+        started_at: a.final_started_at || null,
+        finished_at: a.final_finished_at || null,
+        brief: final.summary || "",
+        inspect: {
+          sent_prompt: a.final_sent_prompt || "",
+          raw_response: a.final_raw_output || "",
+          content: final.summary || "",
+          stage_status: a.final_status || "",
+          elapsed: Number(a.final_elapsed) || 0,
+          started_at: a.final_started_at || null,
+          finished_at: a.final_finished_at || null,
+        },
+      });
+      return rows;
+    },
+
+    // 角色 + 环节：「协助审核」本身就是环节名，再拼一次会变成「协助审核 · 审核」
+    briefRoleText(row) {
+      const role = (row && row.role) || "";
+      const stage = (row && row.stage) || "";
+      if (!stage || (role && role.includes(stage))) return role || stage;
+      return `${role} · ${stage}`;
+    },
+
+    // 简报正文：没出结果时给出「为什么没有」，比空白或「暂无」有用
+    briefText(row) {
+      const raw = String((row && row.brief) || "").trim();
+      const st = (row && row.status) || "";
+      // 取消与报错时，后端写进 summary 的是给日志看的内部提示（【任务已被用户取消】、
+      // 【CLI 执行报错: Error: listen EADDRINUSE …】）。原样铺在卡片上既占地方又吓人，
+      // 卡片上说清结论，报错原文留给「输入输出」弹窗。
+      if (st === "cancelled") return this.t("已取消，未给出意见");
+      if (["failed", "timeout"].includes(st) && (!raw || /^【/.test(raw))) {
+        return st === "failed"
+          ? this.t("执行失败，点击查看报错详情")
+          : this.t("已超时，点击查看已产出的内容");
+      }
+      if (raw) return raw;
+      if (["running", "in_progress"].includes(st)) return this.t("正在执行，简报生成后会显示在这里…");
+      if (["waiting", "queued"].includes(st)) return this.t("排队等待中…");
+      if (st === "failed") return this.t("执行失败，点击查看报错详情");
+      if (st === "timeout") return this.t("已超时，点击查看已产出的内容");
+      if (st === "no_opinion") return this.t("未提出意见");
+      return this.t("（暂无）");
+    },
+
+    briefKey(card, row) {
+      return `${(card && card.task_id) || ""}:${(row && row.key) || ""}`;
+    },
+    // 整张卡片的收起：点头部横栏切换。和「每段各自的展开」是两层，
+    // 卡片收起来时三段内容一起藏掉，头部与底部流水还留着（详情入口在那里）
+    isCardClosed(msg) {
+      const key = (msg && msg.card && msg.card.task_id) || (msg && msg.id) || "";
+      return !!this.cardClosed[key];
+    },
+    toggleCardClosed(msg) {
+      const key = (msg && msg.card && msg.card.task_id) || (msg && msg.id) || "";
+      if (!key) return;
+      if (this.cardClosed[key]) delete this.cardClosed[key];
+      else this.cardClosed[key] = true;
+      this.cardClosed = { ...this.cardClosed };
+    },
+    isBriefOpen(card, row) {
+      return !!this.briefOpen[this.briefKey(card, row)];
+    },
+    toggleBrief(card, row) {
+      const k = this.briefKey(card, row);
+      if (this.briefOpen[k]) delete this.briefOpen[k];
+      else this.briefOpen[k] = true;
+      // Vue 3 的 reactive 对 delete 有响应，但要触发视图更新还是换个引用更稳
+      this.briefOpen = { ...this.briefOpen };
+    },
+    // 超过 3 行才给「展开全文」：短简报下面挂个没用的按钮更碍眼
+    briefLong(row) {
+      const text = this.briefText(row);
+      return text.length > 96 || text.split("\n").length > 3;
+    },
+    briefElapsed(row) {
+      const sec = Number((row && row.elapsed) || 0);
+      if (!sec) return "";
+      return sec >= 60 ? `${Math.floor(sec / 60)}m${Math.round(sec % 60)}s` : `${Math.round(sec)}s`;
+    },
+    // 卡片每段标题后的时间：几点开始 + 跑了多久。
+    // 老任务没有 started_at（这个字段是后加的），退回只显示耗时，不显示 "Invalid Date"
+    briefWhen(row) {
+      const ts = Number((row && row.started_at) || 0);
+      const sec = Number((row && row.elapsed) || 0);
+      if (!ts) return sec ? this.briefElapsed(row) : "";
+      const clock = this.formatFlowTime(ts);
+      return sec ? `${clock} · ${this.briefElapsed(row)}` : clock;
+    },
+    briefWhenTitle(row) {
+      const s = Number((row && row.started_at) || 0);
+      const f = Number((row && row.finished_at) || 0);
+      if (!s) return "";
+      return f
+        ? this.t("开始 {a} · 返回 {b}", { a: this.formatFlowTime(s), b: this.formatFlowTime(f) })
+        : this.t("开始 {a}", { a: this.formatFlowTime(s) });
+    },
+    // 「输入输出」弹窗顶部那一行：开始 / 返回 / 用时
+    inspectTimeText() {
+      const m = this.inspectingMsg || {};
+      const s = Number(m.started_at || 0);
+      // 老记录 / 普通消息没有独立的 finished_at：消息落库时刻就是结果返回时刻，
+      // 拿 created_at 兜底，至少能回答「这条是什么时候出来的」
+      let f = Number(m.finished_at || 0);
+      if (!f && !s) f = Number(m.created_at || 0);
+      const sec = Number(m.elapsed || m.elapsed_time || 0);
+      if (!s && !f && !sec) return "";
+      const parts = [];
+      if (s) parts.push(this.t("开始 {a}", { a: this.formatFlowTime(s) }));
+      if (f) parts.push(this.t("返回 {b}", { b: this.formatFlowTime(f) }));
+      else if (["running", "in_progress"].includes(m.stage_status || "")) parts.push(this.t("执行中"));
+      if (sec) parts.push(this.t("用时 {d}", { d: this.briefElapsed({ elapsed: sec }) }));
+      return parts.join("  ·  ");
+    },
+    briefBusy(row) {
+      return ["running", "in_progress"].includes((row && row.status) || "");
+    },
+
+    // 「输入输出」弹窗的入参：从卡片直接取那一段（补齐起止时刻，
+    // 详情弹窗里点进来的和聊天卡片里点进来的是同一份数据、同一个弹窗）
+    inspectForCard(card, key, memberId) {
+      const rows = this.cardBriefRows(card || {});
+      const target = memberId ? `review:${memberId}` : key;
+      const row = rows.find(r => r.key === target);
+      if (!row) return {};
+      return Object.assign({}, row.inspect, { sender_name: row.name, stage_label: row.role });
+    },
+
+    // 每段简报自己的重跑入口：执行段重跑主创、审核段重跑这一位、交付段重出终稿。
+    // 运行中的那一段不再给「重跑」，换成「取消」，同一个环节不能并发两份执行。
+    briefAction(card, row) {
+      if (!card || !row) return null;
+      const key = row.key || "";
+      const stage = key === "deliver"
+        ? "deliver"
+        : (key.indexOf("review:") === 0 ? "review" : "exec");
+      const memberId = stage === "review" ? (row.memberId || key.slice(7)) : "";
+      const st = (row.status || "").toLowerCase();
+      if (this.briefBusy(row)) {
+        return { kind: "cancel", stage, memberId, label: this.t("取消") };
+      }
+      const bad = ["failed", "timeout", "cancelled", "no_opinion"];
+      if (stage === "exec") {
+        if (st === "done" || st === "delivered") {
+          return { kind: "retry", stage, memberId, label: this.t("重新执行") };
+        }
+        if (bad.includes(st)) return { kind: "retry", stage, memberId, label: this.t("重试执行") };
+        return null;
+      }
+      if (stage === "review") {
+        if (st === "done") return { kind: "retry", stage, memberId, label: this.t("重新审核") };
+        if (bad.includes(st)) return { kind: "retry", stage, memberId, label: this.t("重试审核") };
+        return null;
+      }
+      // 交付段：执行没成功之前不能重跑交付，否则会出一个没有产物也没有意见的「已交付」
+      const a = card.part_a || {};
+      if ((a.status || "") !== "done") return null;
+      if (st === "done" || st === "delivered") {
+        return { kind: "retry", stage, memberId, label: this.t("重新生成交付") };
+      }
+      if (bad.includes(st)) return { kind: "retry", stage, memberId, label: this.t("重试交付") };
+      const settled = (card.part_b || []).every(r =>
+        ["done", "failed", "timeout", "cancelled", "no_opinion"].includes((r.status || ""))
+      );
+      if ((st === "waiting" || !st) && settled) {
+        return { kind: "retry", stage, memberId, label: this.t("生成交付") };
+      }
+      return null;
+    },
+    briefAct(msg, row) {
+      const act = this.briefAction(msg.card, row);
+      if (!act) return;
+      if (act.kind === "cancel") {
+        return this.cancelTask(msg, act.stage, act.memberId);
+      }
+      return this.retryTask(msg, act.stage, act.memberId);
+    },
+
+    // 三步进度的计算（弹窗与聊天流里的折叠卡片共用）
+    cardStepsOf(card) {
+      if (!card) return [];
+      const a = card.part_a || {};
+      const reviewStatus = this._reviewAggregate(card.part_b || []);
+      const busy = s => ["running", "in_progress"].includes(s);
+      return [
+        { key: "exec", label: this.t("执行"), status: a.status || "waiting", active: busy(a.status) },
+        { key: "review", label: this.t("审核"), status: reviewStatus, active: busy(reviewStatus) },
+        { key: "deliver", label: this.t("交付"), status: a.final_status || "waiting", active: busy(a.final_status) },
+      ];
+    },
+
+    // 多位协助成员的状态合成一个环节状态（进度条上只用这一个圆点）
+    _reviewAggregate(reviewers) {
+      if (!reviewers || !reviewers.length) return "waiting";
+      const states = reviewers.map(r => r.status || "waiting");
+      if (states.some(s => ["running", "in_progress"].includes(s))) return "in_progress";
+      const ended = states.filter(s => ["done", "failed", "cancelled", "timeout", "no_opinion"].includes(s));
+      if (ended.length !== states.length) return "waiting";
+      if (states.some(s => ["failed", "timeout"].includes(s))) return "failed";
+      if (states.every(s => s === "cancelled")) return "cancelled";
+      return "done";
+    },
+
+    stepDotClass(status) {
+      if (status === "done") return "bg-emerald-50 text-emerald-700 border-emerald-300";
+      if (["failed", "timeout"].includes(status)) return "bg-red-50 text-red-600 border-red-300";
+      if (status === "cancelled") return "bg-gray-100 text-gray-500 border-gray-300";
+      if (["running", "in_progress"].includes(status)) return "bg-blue-50 text-blue-700 border-blue-400";
+      return "bg-white text-gray-400 border-gray-300";
+    },
+
+    stepGlyph(step, idx) {
+      if (step.status === "done") return "✓";
+      if (["failed", "timeout"].includes(step.status)) return "!";
+      if (step.status === "cancelled") return "–";
+      const i = typeof idx === "number" ? idx : this.cardSteps.findIndex(s => s.key === step.key);
+      return String(i + 1);
+    },
+
     // ----------------- 任务卡片与消息上的取消 / 重试 -----------------
     openCardModal(msg) {
       this.cardModalMsg = msg;
       this.showCardModal = true;
     },
     openInspectMsg(payload) {
+      // 起止时刻 / 耗时必须一起透传：弹窗顶部的「开始 · 返回 · 用时」读的是
+      // inspectingMsg 上的这些字段，卡片每段与历次执行记录都带了，漏一个就整行不显示。
+      const p = payload || {};
       this.openInspectModal({
         id: "task-record",
         sender: "task",
-        sender_name: this.t("任务记录"),
-        content: payload.content || "",
-        sent_prompt: payload.sent_prompt || "",
-        raw_response: payload.raw_response || ""
+        sender_name: p.sender_name || this.t("任务记录"),
+        content: p.content || "",
+        sent_prompt: p.sent_prompt || "",
+        raw_response: p.raw_response || "",
+        // 没有 Prompt 时要区分「这一环节还没开始/正在跑」和「老记录没留存」，
+        // 一律说成「持久化上线前生成」会让人以为功能坏了
+        stage_status: p.stage_status || "",
+        stage_label: p.stage_label || "",
+        started_at: p.started_at || null,
+        finished_at: p.finished_at || null,
+        created_at: p.created_at || null,
+        elapsed: Number(p.elapsed || p.elapsed_time || 0)
       });
     },
     _taskId(msg) {
@@ -385,6 +806,23 @@ createApp({
     formatFlowTime(ts) {
       if (!ts) return "--:--:--";
       return new Date(ts * 1000).toLocaleTimeString();
+    },
+    // 卡片上的「创建时间」要带日期：隔天的任务只看 12:30 分不清是哪一天。
+    // 新任务的 created_at 由 build_card 透传；老会话退回卡片消息落库的时刻。
+    cardCreatedAt(msg) {
+      const card = (msg && msg.card) || {};
+      const ts = Number(card.created_at || (msg && msg.created_at) || 0);
+      if (!ts) return "";
+      const d = new Date(ts * 1000);
+      if (isNaN(d.getTime())) return "";
+      const pad = n => String(n).padStart(2, "0");
+      return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${d.toLocaleTimeString()}`;
+    },
+    // 交付段标签的悬停说明：把自动补交付的时间一并带上，方便复盘
+    autoDeliverTitle(card) {
+      const at = Number((card && card.deliver_source_at) || 0);
+      const base = this.t("全部审核出结论后自动补一次交付，这一版终稿是按最新审核意见重新生成的");
+      return at ? `${base} · ${this.t("重新生成于 {a}", { a: this.formatFlowTime(at) })}` : base;
     },
 
     // ------------------- 多语言 -------------------
@@ -635,6 +1073,7 @@ createApp({
       this.selectedWorkspaceFile = null;
       this.selectedFileContent = "";
       this.showMemberDropdown = false;
+      this.suggest = null;
       // 引用与展开状态都属于具体会话的某条消息，切会话就清掉
       this.replyTarget = null;
       this.expandedMsgs = {};
@@ -823,8 +1262,175 @@ createApp({
       }, 120);
     },
 
+    // ----------------- 输入候选：打 / 出命令，打 @ 出成员 -----------------
+    // /collab 的格式校验（主创 + 协助成员 + 任务内容 + 成员可用）由服务端给答案：
+    // 输入停下来 250ms 再问，边打字边请求没意义，也避免每键一个响应互相覆盖。
+    scheduleCollabCheck() {
+      if (this.collabCheckTimer) {
+        clearTimeout(this.collabCheckTimer);
+        this.collabCheckTimer = null;
+      }
+      const text = (this.inputContent || "").trim();
+      if (!/^\/collab(\s|$)/i.test(text)) {
+        this.collabCheck = null;
+        return;
+      }
+      this.collabCheckTimer = setTimeout(async () => {
+        this.collabCheckTimer = null;
+        try {
+          const res = await fetch("/api/collab/validate", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ content: text }),
+          });
+          const data = await res.json().catch(() => ({}));
+          // 期间用户又改了字：这份结果已经过期，直接丢掉
+          if (String(this.inputContent || "").trim() !== text) return;
+          this.collabCheck = { content: text, ok: !!data.ok, error: data.error || "" };
+        } catch (err) {
+          // 校验请求失败不该打断输入，交给发送时的服务端校验兜底
+        }
+      }, 250);
+    },
+
+    // 触发条件只看「光标前是否是一个刚敲的 token」，不看输入历史：
+    // 这样在句子中间补一个 @ 也能弹，而段落里打路径（如 a/b）不会乱弹命令。
+    onInputSuggest(e) {
+      this.scheduleCollabCheck();
+      const el = (e && e.target) || this.$refs.chatInput;
+      const text = String(this.inputContent || "");
+      const caret = el && Number.isFinite(el.selectionStart) ? el.selectionStart : text.length;
+      const before = text.slice(0, caret);
+
+      // 程序刚替用户打开候选（例如选完 /collab）时，人会直接接着打名字，不会再打一个 @。
+      // 这段追加的文本当查询词处理，别因为「前面没有 @ 前缀」就把菜单关掉。
+      if (this.suggest && this.suggest.implicit) {
+        const from = this.suggest.start;
+        const q = caret >= from ? text.slice(from, caret) : "";
+        if (caret >= from && !/[\s@/]/.test(q)) {
+          this.suggest = { ...this.suggest, query: q, items: this.memberSuggestItems(q), active: 0, end: caret };
+          return;
+        }
+        this.suggest = null;
+      }
+
+      // 左边界用「非单词字符」而不是「空白」：中文不打空格，`请@agy` 也要能弹；
+      // 同时把 a@b、src/app.js 这类邮箱/路径挡在外面。
+      const hit = /(^|[^\w.\-@/])([@/][^\s@/]*)$/.exec(before);
+      if (!hit) {
+        this.suggest = null;
+        return;
+      }
+      const start = hit.index + hit[1].length;
+      const token = before.slice(start);
+      const sigil = token.slice(0, 1);
+      const query = token.slice(1);
+
+      if (sigil === "/") {
+        // 命令只在行首生效：后端只认 ^/collab，别的地方打 / 多半是路径
+        if (start !== 0) {
+          this.suggest = null;
+          return;
+        }
+        const q = query.toLowerCase();
+        const items = this.commandCandidates.filter(c => c.label.toLowerCase().startsWith("/" + q));
+        this.suggest = { kind: "command", query, items, active: 0, start, end: caret };
+        return;
+      }
+
+      const items = this.memberSuggestItems(query);
+      if (!items.length) {
+        this.suggest = null;
+        return;
+      }
+      this.suggest = { kind: "member", query, items, active: 0, start, end: caret };
+    },
+
+    // @ 候选：按名字 / id / 括号短名（DS4、HY4）做不区分大小写的包含匹配
+    memberSuggestItems(query = "") {
+      const q = String(query || "").trim().toLowerCase();
+      const matched = this.activeSessionEmployees.filter(emp => {
+        if (!q) return true;
+        const name = String(emp.name || "");
+        const short = (name.match(/[（(]([^（）()]+)[）)]/g) || []).map(s => s.slice(1, -1));
+        return [name, emp.id, ...short]
+          .some(v => String(v || "").toLowerCase().includes(q));
+      });
+      return matched.map(emp => ({
+        id: emp.id,
+        kind: "member",
+        label: emp.name || emp.id,
+        avatar: emp.avatar || "🤖",
+        desc: emp.write_access ? this.t("可读写") : this.t("只读"),
+        // 缺 CLI 的成员点了也发不出去，这里直接置灰，别让人选完才发现
+        disabled: !String(emp.cli_cmd || "").trim(),
+        hint: this.t("缺少 CLI 配置"),
+        insert: "@" + (emp.name || emp.id) + " ",
+      }));
+    },
+
+    closeSuggest() {
+      this.suggest = null;
+    },
+    // 候选是用 mousedown.prevent 点中的：不先让 textarea 失焦，选完光标还在输入框
+    // 所以这里的 blur 处置只服务于「点别处关掉菜单」
+    onSuggestBlur() {
+      setTimeout(() => { this.suggest = null; }, 120);
+    },
+    moveSuggest(step) {
+      const s = this.suggest;
+      if (!s || !s.items.length) return;
+      const n = s.items.length;
+      let i = s.active;
+      for (let k = 0; k < n; k++) {
+        i = (i + step + n) % n;
+        if (!s.items[i].disabled) break;
+      }
+      s.active = i;
+    },
+    pickSuggest(idx) {
+      const s = this.suggest;
+      if (!s) return;
+      const item = s.items[idx];
+      if (!item || item.disabled) return;
+      const text = String(this.inputContent || "");
+      const caret = s.start + item.insert.length;
+      this.inputContent = text.slice(0, s.start) + item.insert + text.slice(s.end);
+      this.suggest = null;
+      this.scheduleCollabCheck();
+      this.$nextTick(() => {
+        const el = this.$refs.chatInput;
+        if (!el) return;
+        el.focus();
+        el.selectionStart = el.selectionEnd = caret;
+        // 选完 /collab 紧接着弹成员列表：先选主创，再选协助成员
+        if (item.opensMembers) {
+          const items = this.memberSuggestItems("");
+          if (items.length) {
+            this.suggest = {
+              kind: "member", query: "", items, active: 0,
+              start: caret, end: caret, implicit: true,
+            };
+          }
+        }
+      });
+    },
+
     // ----------------- 消息输入与 Backspace 整删 @ 标签 -----------------
     onInputKeydown(e) {
+      // 候选列表打开时先接管方向键与回车：此时回车是「确认候选」，不是发送
+      if (this.suggest) {
+        if (e.key === "ArrowDown") { e.preventDefault(); this.moveSuggest(1); return; }
+        if (e.key === "ArrowUp") { e.preventDefault(); this.moveSuggest(-1); return; }
+        if (e.key === "Escape") { e.preventDefault(); this.suggest = null; return; }
+        if (e.key === "Enter" || e.key === "Tab") {
+          if (e.isComposing || this.isComposing || e.keyCode === 229) return;
+          e.preventDefault();
+          this.pickSuggest(this.suggest.active);
+          return;
+        }
+      }
+
       // Esc 撤掉引用回复条（不打断已打的字）
       if (e.key === "Escape" && this.replyTarget) {
         e.preventDefault();
@@ -896,6 +1502,7 @@ createApp({
         }
         this.inputContent = "";
         this.replyTarget = null;
+        this.suggest = null;
         this.currentSession = data;
         this.pinToBottom();
         this.measureMsgOverflow();
@@ -972,6 +1579,12 @@ createApp({
       const cached = this._mdCache.get(src);
       if (cached !== undefined) return cached;
       let out;
+      // gfm + breaks：模型输出习惯用单个换行分行（不是空行分段）。
+      // 不开 breaks 的话这些换行会被合并成一个空格，简报和审核意见会挤成一坨。
+      if (window.marked && !this.__mdOptionsReady) {
+        try { window.marked.setOptions({ gfm: true, breaks: true }); } catch (e) { /* 老版本没有 setOptions */ }
+        this.__mdOptionsReady = true;
+      }
       if (!window.marked || !window.DOMPurify) {
         out = `<pre style="white-space:pre-wrap">${this.escapeHtml(src)}</pre>`;
       } else {
@@ -984,6 +1597,148 @@ createApp({
       if (this._mdCache.size > 150) this._mdCache.clear();
       this._mdCache.set(src, out);
       return out;
+    },
+
+    // ---- mermaid ----------------------------------------------------------
+    // marked 把 ```mermaid 渲染成 <pre><code class="language-mermaid">，不处理就是一坨代码。
+    // 库有 2.4MB，所以只在页面上真的出现图时才加载，别拖慢首屏。
+    scheduleMermaid() {
+      if (this._mermaidTimer) clearTimeout(this._mermaidTimer);
+      this._mermaidTimer = setTimeout(() => { this.hydrateMermaid(); }, 150);
+    },
+
+    ensureMermaid() {
+      if (window.mermaid) return Promise.resolve(window.mermaid);
+      if (this._mermaidLoading) return this._mermaidLoading;
+      this._mermaidLoading = new Promise((resolve, reject) => {
+        const script = document.createElement("script");
+        script.src = "/static/vendor/mermaid.min.js?v=11.4.1";
+        script.async = true;
+        script.onload = () => {
+          try {
+            window.mermaid.initialize({
+              startOnLoad: false,
+              theme: "neutral",
+              securityLevel: "strict",
+              fontFamily: "inherit",
+              flowchart: { htmlLabels: false, useMaxWidth: true },
+            });
+          } catch (e) { /* 初始化异常留到 render 时暴露 */ }
+          resolve(window.mermaid);
+        };
+        script.onerror = () => {
+          this._mermaidLoading = null;
+          reject(new Error("mermaid 加载失败"));
+        };
+        document.head.appendChild(script);
+      });
+      return this._mermaidLoading;
+    },
+
+    // 把页面里所有还没处理的 mermaid 代码块换成 SVG。
+    // 失败时保留原代码并给一句说明——宁可看代码，也别给一块空白。
+    async hydrateMermaid() {
+      if (!document.querySelector("pre > code.language-mermaid")) return;
+      let lib = null;
+      try { lib = await this.ensureMermaid(); } catch (e) { lib = null; }
+
+      const blocks = [...document.querySelectorAll("pre > code.language-mermaid")];
+      for (let i = 0; i < blocks.length; i++) {
+        const code = blocks[i];
+        const pre = code.parentElement;
+        if (!pre || pre.dataset.mermaidDone) continue;
+        pre.dataset.mermaidDone = "1";
+        if (!lib) {
+          pre.insertAdjacentHTML(
+            "afterend",
+            `<div class="mermaid-error">${this.t("流程图组件没能加载，先按代码展示。")}</div>`
+          );
+          continue;
+        }
+        const src = (code.textContent || "").trim();
+        if (!src) continue;
+        const id = "mmd-" + Date.now().toString(36) + "-" + i;
+        try {
+          const out = await lib.render(id, src);
+          const box = document.createElement("div");
+          box.className = "mermaid-box";
+          box.innerHTML = out.svg;
+          pre.replaceWith(box);
+        } catch (e) {
+          // mermaid 出错时会在 body 里留一个临时节点，顺手清掉
+          const junk = document.getElementById("d" + id) || document.getElementById(id);
+          if (junk) junk.remove();
+          pre.insertAdjacentHTML(
+            "afterend",
+            `<div class="mermaid-error">${this.t("流程图语法没能解析，已保留代码。")}</div>`
+          );
+        }
+      }
+    },
+
+    // 删一条消息：服务端物理删除，build_context 下次就取不到它了。
+    // 本地先按 id 屏蔽，避免轮询刚好返回旧数据时消息「闪回来」。
+    async deleteMessage(msg) {
+      if (!msg || !msg.id || !this.currentSessionId) return;
+      if (!confirm(this.t("确定删除这条消息吗？删除后它不会再进入后续对话的上下文。"))) return;
+
+      const sid = this.currentSessionId;
+      const mid = msg.id;
+      this.deletedMsgIds = Object.assign({}, this.deletedMsgIds, { [mid]: 1 });
+
+      try {
+        const res = await fetch(`/api/sessions/${sid}/messages/${mid}`, { method: "DELETE" });
+        if (!res.ok) {
+          const data = await res.json().catch(() => ({}));
+          const next = Object.assign({}, this.deletedMsgIds);
+          delete next[mid];
+          this.deletedMsgIds = next;
+          this.showToast(data.error || this.t("删除失败，请重试"));
+          return;
+        }
+        const s = this.currentSession;
+        if (s && Array.isArray(s.messages)) {
+          s.messages = s.messages.filter(m => m.id !== mid);
+        }
+        this.showToast(this.t("已删除，后续对话不再带上这条"));
+      } catch (e) {
+        const next = Object.assign({}, this.deletedMsgIds);
+        delete next[mid];
+        this.deletedMsgIds = next;
+        this.showToast(this.t("删除失败，请重试"));
+      }
+    },
+
+    // 「模型原始回复」里存的是 CLI 的完整 stdout，正文后面常常还挂着一块
+    // ```json { "summary": …, "artifacts": […] }``` 的产物登记。整段直接渲染会把登记
+    // 铺成一个大代码块、正文被挤到下面，看起来就是「还是 md 源码」。
+    // 这里按后端的同一套规则把登记块摘出来：正文照常渲染，登记单独折叠。
+    // 注意：带参数，只能放 methods（放 computed 里 Vue 会当无参 getter 缓存）。
+    splitRegistry(text) {
+      const raw = String(text || "");
+      if (!raw.trim()) return { body: "", registry: "" };
+      const keys = ["artifacts", "changes", "summary", "opinion_handling"];
+      const re = /```(?:json)?\s*(\{[\s\S]*?\})\s*```/gi;
+      let m;
+      while ((m = re.exec(raw)) !== null) {
+        let obj = null;
+        try { obj = JSON.parse(m[1]); } catch (e) { obj = null; }
+        if (!obj || typeof obj !== "object") continue;
+        if (!keys.some(k => k in obj)) continue;
+        const body = (raw.slice(0, m.index) + raw.slice(m.index + m[0].length)).trim();
+        return { body, registry: JSON.stringify(obj, null, 2) };
+      }
+      // 整段就是一份 JSON（老写法，或模型只回了一份结构）
+      const whole = raw.trim();
+      if (whole.startsWith("{") && whole.endsWith("}")) {
+        try {
+          const obj = JSON.parse(whole);
+          if (obj && typeof obj === "object") {
+            return { body: "", registry: JSON.stringify(obj, null, 2) };
+          }
+        } catch (e) { /* 不是 JSON，按正文处理 */ }
+      }
+      return { body: whole, registry: "" };
     },
 
     // 点引用块：原话还在列表里就滚过去并高亮；已经不在（被重试覆盖/清空）就弹快照预览
@@ -1201,6 +1956,7 @@ createApp({
     },
 
     insertMention(name) {
+      this.suggest = null;
       this.inputContent = (this.inputContent ? this.inputContent + " " : "") + `@${name} `;
       this.$nextTick(() => {
         const textarea = this.$refs.chatInput;
@@ -1243,14 +1999,106 @@ createApp({
           console.error("展开目录失败:", e);
         }
       } else {
-        try {
-          const res = await fetch(`/api/workspace/file?path=${encodeURIComponent(item.path)}`);
-          const data = await res.json();
-          this.selectedWorkspaceFile = item;
-          this.selectedFileContent = data.content || this.t("(空文件)");
-        } catch (e) {
-          alert(this.t("读取文件失败:") + " " + e);
+        this.selectedWorkspaceFile = item;
+        await this.openFilePreview(item);
+      }
+    },
+
+    // 按扩展名决定怎么预览：md 渲染成文档，图片直接显示，其余按等宽文本，
+    // 压缩包 / Office 这类二进制给一句话说明而不是把乱码铺出来
+    filePreviewKind(item) {
+      const name = String((item && item.name) || "").toLowerCase();
+      const ext = name.includes(".") ? name.slice(name.lastIndexOf(".")) : "";
+      if ([".md", ".markdown", ".mdx"].includes(ext)) return "markdown";
+      if ([".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg", ".ico"].includes(ext)) return "image";
+      if ([
+        ".pdf", ".zip", ".gz", ".tar", ".tgz", ".7z", ".rar",
+        ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+        ".mp3", ".mp4", ".mov", ".wav", ".dmg", ".pkg", ".exe",
+      ].includes(ext)) return "binary";
+      return "text";
+    },
+
+    async openFilePreview(item) {
+      if (!item) return;
+      const kind = this.filePreviewKind(item);
+      this.showFilePreview = true;
+      this.filePreviewLoading = kind === "text" || kind === "markdown";
+      this.filePreview = {
+        name: item.name, path: item.path, size: item.size || 0, kind,
+        content: "", url: "", error: "",
+      };
+      if (kind === "image") {
+        this.filePreview.url = `/api/workspace/raw?path=${encodeURIComponent(item.path)}`;
+        this.filePreviewLoading = false;
+        return;
+      }
+      if (kind === "binary") {
+        this.filePreviewLoading = false;
+        this.filePreview.error = this.t("这一类文件不支持在线预览，可以复制路径后在本机打开");
+        return;
+      }
+      try {
+        const res = await fetch(`/api/workspace/file?path=${encodeURIComponent(item.path)}`);
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || res.status);
+        // 连点两个文件时，先返回的那个不能盖掉后点的
+        if (!this.filePreview || this.filePreview.path !== item.path) return;
+        if (data.too_large) {
+          this.filePreview.error = data.error || this.t("文件过大，暂不支持在线预览");
+        } else {
+          this.filePreview.content = data.content || "";
+          this.selectedFileContent = this.filePreview.content;
         }
+      } catch (e) {
+        if (this.filePreview && this.filePreview.path === item.path) {
+          this.filePreview.error = this.t("读取文件失败") + "：" + (e.message || e);
+        }
+      } finally {
+        if (this.filePreview && this.filePreview.path === item.path) this.filePreviewLoading = false;
+      }
+    },
+
+    closeFilePreview() {
+      this.showFilePreview = false;
+      this.filePreview = null;
+      this.filePreviewLoading = false;
+    },
+
+    // 预览正文：md 走和聊天同一套 renderMdText（marked + DOMPurify），
+    // 纯文本先转义再塞进 <pre>，文件里的 HTML 不会被当标签执行
+    filePreviewHtml() {
+      const pv = this.filePreview;
+      if (!pv || !pv.content) return "";
+      if (pv.kind === "markdown") {
+        return `<div class="markdown-body">${this.renderMdText(pv.content)}</div>`;
+      }
+      return `<pre class="text-xs font-mono whitespace-pre-wrap break-words">${this.escapeHtml(pv.content)}</pre>`;
+    },
+
+    // md 预览里的链接：不在当前页跳走（会把整个工作台刷掉），外链开新标签，
+    // 相对路径多半指向文件旁边的资源，应用里没有对应路由，给一句提示就好
+    onPreviewClick(e) {
+      const a = e.target && e.target.closest ? e.target.closest("a") : null;
+      if (!a) return;
+      const href = a.getAttribute("href") || "";
+      e.preventDefault();
+      if (/^https?:\/\//i.test(href)) {
+        window.open(href, "_blank", "noopener,noreferrer");
+      } else if (href && !href.startsWith("#")) {
+        this.showToast(this.t("相对链接请在本机打开"));
+      }
+    },
+
+    async copyFilePath() {
+      const path = (this.filePreview && this.filePreview.path) || "";
+      if (!path) return;
+      try {
+        await navigator.clipboard.writeText(path);
+        this.showToast(this.t("路径已复制"));
+      } catch (e) {
+        // 非安全上下文（http + 非 localhost）拿不到剪贴板权限，退化成把路径显示出来
+        this.showToast(path);
       }
     },
 
@@ -1266,6 +2114,7 @@ createApp({
     openInspectModal(msg) {
       this.inspectingMsg = msg;
       this.inspectTab = "prompt";
+      this.inspectRaw = false;   // 每次打开都先给渲染后的版本
       this.promptOpen = {};   // 每次打开都回到默认视图（大块材料折叠）
       this.showInspectModal = true;
     },

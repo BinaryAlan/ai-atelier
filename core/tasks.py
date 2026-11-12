@@ -17,6 +17,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple
 
 import core.storage as storage
@@ -113,27 +114,103 @@ def member_aliases(emp: Dict[str, Any]) -> List[str]:
     return [a for a in [name, str(emp.get("id") or "")] + short if a]
 
 
-def _match_mention(text: str, settings: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], int]:
-    """匹配文本开头的一个 @成员（名字或 id），支持含空格的名字，返回 (成员, 消费长度)。"""
-    if not text.startswith("@"):
-        return None, 0
-    tokens = []
+def _mention_aliases(emp: Dict[str, Any]) -> List[str]:
+    """可被 @ 的名字：别名 + 去掉括号的短名（如 DeepSeek-V4），长名优先。"""
+    out = list(member_aliases(emp))
+    head = re.split(r"[（(]", str(emp.get("name") or ""), maxsplit=1)[0].strip()
+    if head and head not in out:
+        out.append(head)
+    out.sort(key=len, reverse=True)
+    return out
+
+
+@lru_cache(maxsize=512)
+def _alias_pattern(alias: str) -> "re.Pattern":
+    """把别名编译成宽松模式：字母数字必须按序出现，其余字符（空格、连字符、下划线、
+    括号、斜杠）可有可无。
+
+    这样 `@agy`、`@//agy/`（编辑器里那种文件引用写法）、`@DeepSeek-V4 (DS4)`、
+    `@deepseek-v4/(DS4)` 都能对上同一个成员。
+    """
+    chunks = []
+    for ch in alias:
+        if ch.isalnum():
+            chunks.append(re.escape(ch))
+        else:
+            chunks.append(r"[\s\-_.()（）/\\]*")
+    return re.compile("".join(chunks), re.IGNORECASE)
+
+
+def _match_mention_at(
+    text: str, pos: int, settings: Dict[str, Any]
+) -> Tuple[Optional[Dict[str, Any]], int]:
+    """pos 指向 '@'，返回 (成员, 结束下标)；对不上就返回 (None, pos)。"""
+    n = len(text)
+    if pos >= n or text[pos] != "@":
+        return None, pos
+    start = pos + 1
+    while start < n and text[start] in "/\\":
+        start += 1
+    best: Optional[Tuple[Dict[str, Any], int]] = None
     for emp in _member_candidates(settings):
-        for alias in member_aliases(emp):
-            tokens.append((alias, emp))
-    # 长别名优先，避免 "agy" 抢先匹配 "agy-pro"
-    tokens.sort(key=lambda item: len(item[0]), reverse=True)
-    for alias, emp in tokens:
-        if text.startswith("@" + alias):
-            return emp, len(alias) + 1
-    return None, 0
+        for alias in _mention_aliases(emp):
+            if not alias:
+                continue
+            m = _alias_pattern(alias).match(text, start)
+            if not m:
+                continue
+            end = m.end()
+            # 后面紧跟英文字母/数字说明这是更长的一个词：@agy-pro 不是 @agy
+            if end < n and text[end].isascii() and text[end].isalnum():
+                continue
+            # 顺手吃掉 `@//agy/` 这种写法尾巴上的斜杠，别把它留在任务内容里
+            while end < n and text[end] in "/\\":
+                end += 1
+            if best is None or end > best[1]:
+                best = (emp, end)
+    if best is None:
+        return None, pos
+    return best
+
+
+def _mention_start_ok(text: str, pos: int) -> bool:
+    """'@' 前面不能是邮箱/路径里的字符，避免把 a@b、../x@y 当成提及。"""
+    if pos == 0:
+        return True
+    prev = text[pos - 1]
+    return not (prev.isascii() and (prev.isalnum() or prev in "._-@\\/"))
+
+
+def scan_mentions(
+    text: str, settings: Dict[str, Any]
+) -> List[Tuple[Dict[str, Any], int, int]]:
+    """按出现顺序找出文本里所有能对上成员的 @ 提及，返回 [(成员, 起, 止)]。
+
+    不要求提及挨在一起：用户常写成「@agy 你来做，@DS4 @HY4 负责审核」。
+    """
+    hits: List[Tuple[Dict[str, Any], int, int]] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        if text[i] == "@" and _mention_start_ok(text, i):
+            emp, end = _match_mention_at(text, i, settings)
+            if emp is not None:
+                hits.append((emp, i, end))
+                i = end
+                continue
+        i += 1
+    return hits
 
 
 def parse_collab(content: str, settings: Dict[str, Any]) -> Dict[str, Any]:
-    """严格解析 /collab @主创 @协助成员... 任务内容。
+    """解析 /collab：整条消息里第一个能对上的 @ 是主创，其余是协助成员。
+
+    早期实现要求所有 @ 紧跟在指令后面，用户写成
+    `/collab @agy 你来做，@DS4 @HY4 负责审核` 就会被判成「缺少协助成员」，
+    而 `@//agy/` 这种文件引用写法连主创都认不出来。现在按出现顺序扫描整条消息，
+    任务内容 = 去掉提及后的文字。缺主创、缺协助成员、缺任务内容仍然一律拦截。
 
     返回 {"ok": bool, "error": str, "owner_id", "reviewer_ids", "goal"}。
-    缺少主创或缺少协助成员时一律拦截，不创建任务。
     """
     result: Dict[str, Any] = {
         "ok": False, "error": "", "owner_id": "", "reviewer_ids": [], "goal": ""
@@ -143,28 +220,31 @@ def parse_collab(content: str, settings: Dict[str, Any]) -> Dict[str, Any]:
         result["error"] = "缺少主创和协助成员：格式 /collab @主创 @协助成员 任务内容"
         return result
 
-    owner_id = ""
-    reviewer_ids: List[str] = []
-    pos = 0
-    while True:
-        tail = rest[pos:].lstrip()
-        if not tail.startswith("@"):
-            break
-        consumed_ws = len(rest[pos:]) - len(rest[pos:].lstrip())
-        emp, used = _match_mention(tail, settings)
-        if not emp:
-            break
-        if not owner_id:
-            owner_id = str(emp["id"])
-        elif str(emp["id"]) not in reviewer_ids and str(emp["id"]) != owner_id:
-            reviewer_ids.append(str(emp["id"]))
-        pos += consumed_ws + used
-
-    goal = rest[pos:].strip()
-
-    if not owner_id:
+    hits = scan_mentions(rest, settings)
+    if not hits:
         result["error"] = "缺少主创：请用 /collab @主创 @协助成员 任务内容"
         return result
+
+    owner_id = str(hits[0][0]["id"])
+    reviewer_ids: List[str] = []
+    for emp, _start, _end in hits[1:]:
+        eid = str(emp["id"])
+        if eid != owner_id and eid not in reviewer_ids:
+            reviewer_ids.append(eid)
+
+    # 任务内容 = 去掉所有提及后的文字（连带去掉提及两边的标点碎片）
+    pieces: List[str] = []
+    last = 0
+    for _emp, start, end in hits:
+        pieces.append(rest[last:start])
+        last = end
+    pieces.append(rest[last:])
+    goal = re.sub(r"\s+", " ", "".join(pieces)).strip()
+    # 摘掉提及后常在标点前留一个空格（"参考 ，负责审核"），顺手收掉
+    goal = re.sub(r"\s+([，。、；：！？）】」])", r"\1", goal)
+    goal = re.sub(r"([，。、；：！？])\s+", r"\1", goal)
+    goal = goal.strip(" ，,、;；:：")
+
     if not reviewer_ids:
         result["error"] = "缺少协助成员：主创之后至少再指定一位协助成员"
         return result
@@ -192,16 +272,13 @@ def parse_collab(content: str, settings: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def parse_single(content: str, settings: Dict[str, Any]) -> Optional[str]:
-    """普通消息里找一位被 @ 的成员，返回成员 id；没有点名返回 None。"""
-    aliases: List[Tuple[str, Dict[str, Any]]] = []
-    for emp in _member_candidates(settings):
-        for alias in member_aliases(emp):
-            aliases.append((alias, emp))
-    aliases.sort(key=lambda pair: len(pair[0]), reverse=True)
-    for alias, emp in aliases:
-        if ("@" + alias) in content:
-            return str(emp["id"])
-    return None
+    """普通消息里找被 @ 的成员，返回成员 id；没有点名返回 None。
+
+    按出现顺序取第一个：一条消息里 @ 了多人时，用户点名的第一位才是指令对象
+    （早期实现按「别名最长」挑，会跳过第一个 @ 去执行后面的成员）。
+    """
+    hits = scan_mentions(content or "", settings)
+    return str(hits[0][0]["id"]) if hits else None
 
 
 # ---------------------------------------------------------------------------
@@ -355,44 +432,121 @@ def build_prompt(
         lines = [f"- {o.get('name') or o.get('member_id')}: {o.get('summary') or ''}" for o in opinions]
         parts.append("【审核意见】\n" + "\n".join(lines))
     parts.append(
-        "【输出要求】请优先输出一个 JSON 对象，字段为 "
-        '{"summary": "简短说明", "artifacts": [{"path": "...", "summary": "...", "bytes": 0}]}；'
-        "无法给出 JSON 时输出纯文本，软件会按纯文本展示。"
+        "【输出要求】正文用正常文字回答（这段会直接展示给用户，不要写成 JSON）；"
+        "如果产出了文件，在正文末尾附一个 JSON 代码块登记产物清单："
+        '{"artifacts": [{"path": "...", "summary": "...", "bytes": 0}]}，'
+        "交付环节可在其中加 changes 字段说明改动。软件会把这段登记从正文里摘掉。"
     )
     return "\n\n".join(p for p in parts if p)
 
 
-def parse_output(text: str) -> Dict[str, Any]:
-    """解析结构化输出；解析不到时按纯文本展示，不影响交付。"""
-    raw = text or ""
-    candidates = [raw.strip()]
-    for block in re.findall(r"```(?:json)?\s*(.*?)```", raw, flags=re.S | re.I):
-        candidates.insert(0, block.strip())
-    for candidate in candidates:
-        if not candidate.startswith("{"):
-            continue
+_SUMMARY_FIELDS = (
+    "summary", "result", "output", "content", "text", "answer",
+    "opinion", "comment", "说明", "结论",
+)
+
+
+def _loads_json_object(text: str) -> Optional[Dict[str, Any]]:
+    """从一段文本里取出一个 JSON 对象，容忍前后有说明文字或 markdown 围栏。"""
+    s = (text or "").strip()
+    if not s:
+        return None
+    try:
+        data = json.loads(s)
+        if isinstance(data, dict):
+            return data
+    except (ValueError, TypeError):
+        pass
+    start = s.find("{")
+    while start != -1:
         try:
-            data = json.loads(candidate)
+            data = json.loads(s[start:])
             if isinstance(data, dict):
-                artifacts = data.get("artifacts")
-                if not isinstance(artifacts, list):
-                    artifacts = []
-                clean = []
-                for item in artifacts:
-                    if isinstance(item, dict) and item.get("path"):
-                        clean.append({
-                            "path": str(item["path"]),
-                            "summary": str(item.get("summary") or ""),
-                            "bytes": int(item.get("bytes") or 0),
-                        })
-                return {
-                    "summary": str(data.get("summary") or "").strip() or raw.strip(),
-                    "artifacts": clean,
-                    "changes": str(data.get("changes") or data.get("opinion_handling") or "").strip(),
-                }
+                return data
         except (ValueError, TypeError):
+            pass
+        # 整体解析失败（后面还跟着别的字），退一步只截到最后一个右括号
+        end = s.rfind("}")
+        if end > start:
+            try:
+                data = json.loads(s[start:end + 1])
+                if isinstance(data, dict):
+                    return data
+            except (ValueError, TypeError):
+                pass
+        start = s.find("{", start + 1)
+    return None
+
+
+def _readable_summary(data: Dict[str, Any]) -> str:
+    """JSON 里没有 summary 字段时，也拼出人能读的一段，而不是把花括号丢给用户。"""
+    for key in _SUMMARY_FIELDS:
+        value = data.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    lines = []
+    for key, value in data.items():
+        if key in ("artifacts", "changes", "opinion_handling"):
             continue
-    return {"summary": raw.strip(), "artifacts": [], "changes": ""}
+        if isinstance(value, str) and value.strip():
+            lines.append(f"{key}：{value.strip()}")
+        elif isinstance(value, (int, float)) and not isinstance(value, bool):
+            lines.append(f"{key}：{value}")
+    return "\n".join(lines[:12])
+
+
+def _clean_artifacts(raw_artifacts: Any) -> List[Dict[str, Any]]:
+    if not isinstance(raw_artifacts, list):
+        return []
+    clean = []
+    for item in raw_artifacts:
+        if isinstance(item, dict) and item.get("path"):
+            clean.append({
+                "path": str(item["path"]),
+                "summary": str(item.get("summary") or ""),
+                "bytes": int(item.get("bytes") or 0),
+            })
+    return clean
+
+
+def parse_output(text: str) -> Dict[str, Any]:
+    """解析结构化输出：正文照原样展示，只把结尾的产物登记块摘出来。
+
+    协议要求「正文用自然语言写，产物清单用 JSON 代码块登记」，所以这里先剥登记块、
+    再认整段就是 JSON 的老写法。任何情况下都不把 `{...}` 原样当正文递给聊天窗口。
+    """
+    raw = text or ""
+    body = raw.strip()
+    data: Optional[Dict[str, Any]] = None
+
+    # 1) 正文 + 结尾登记块：把登记块从正文里摘掉，正文就是要展示的内容
+    for match in re.finditer(r"```(?:json)?\s*(\{.*?\})\s*```", raw, flags=re.S | re.I):
+        candidate = _loads_json_object(match.group(1))
+        if not candidate:
+            continue
+        if not ({"artifacts", "changes", "summary", "opinion_handling"} & set(candidate)):
+            continue
+        data = candidate
+        body = (raw[:match.start()] + raw[match.end():]).strip()
+        break
+
+    # 2) 整段就是一个 JSON（老写法，或模型只回了一份结构）
+    if data is None:
+        whole = _loads_json_object(raw)
+        if whole is not None:
+            data = whole
+            body = ""
+
+    # 正文才是给人看的内容：有正文就用正文，只有整段都是 JSON 时才从字段里取
+    summary = body if body else (_readable_summary(data) if data else "")
+    if not summary:
+        summary = raw.strip()
+
+    return {
+        "summary": summary,
+        "artifacts": _clean_artifacts((data or {}).get("artifacts")),
+        "changes": str((data or {}).get("changes") or (data or {}).get("opinion_handling") or "").strip(),
+    }
 
 
 def scan_artifacts(workspace_dir: str, artifacts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -433,6 +587,15 @@ def build_card(task: Dict[str, Any]) -> Dict[str, Any]:
         "reviewer_names": task.get("reviewer_names") or [],
         "started_at": task.get("started_at"),
         "finished_at": task.get("finished_at"),
+        # 任务创建时刻：卡片头部直接显示，老会话没有这个字段时前端退回落库消息的时间
+        "created_at": task.get("created_at"),
+        # 这一版终稿是怎么来的："" = 正常流程 / 用户手点，"review_auto" = 所有审核
+        # 出结论后系统自动补的那一次。交付段会挂一个「审核补全后重新生成」标签。
+        "deliver_source": task.get("deliver_source", ""),
+        "deliver_source_at": task.get("deliver_source_at"),
+        # 审核意见重出之后终稿就过期了：自动补交付期间短暂为真，重出成功后清掉；
+        # 审核没齐时留着，卡片上提示「建议重新生成交付」
+        "deliver_stale": bool(task.get("deliver_stale")),
         "flow": list(task.get("flow") or []),
         "artifacts": list(task.get("artifacts") or []),
         "part_a": {
@@ -440,12 +603,19 @@ def build_card(task: Dict[str, Any]) -> Dict[str, Any]:
             "artifacts": list(part_a.get("artifacts") or []),
             "final": dict(part_a.get("final") or {}),
             "status": part_a.get("status", MEMBER_WAITING),
+            "elapsed": part_a.get("elapsed", 0),
+            "started_at": part_a.get("started_at"),
+            "finished_at": part_a.get("finished_at"),
             "msg_id": part_a.get("msg_id"),
             "sent_prompt": part_a.get("sent_prompt", ""),
             "raw_output": part_a.get("raw_output", ""),
             "final_status": part_a.get("final_status", MEMBER_WAITING),
+            "final_elapsed": part_a.get("final_elapsed", 0),
+            "final_started_at": part_a.get("final_started_at"),
+            "final_finished_at": part_a.get("final_finished_at"),
             "final_sent_prompt": part_a.get("final_sent_prompt", ""),
             "final_raw_output": part_a.get("final_raw_output", ""),
+            "final_source": part_a.get("final_source", ""),
         },
         "part_b": [dict(item) for item in part_b],
     }
@@ -582,6 +752,11 @@ class TaskManager:
                 "part_a": {
                     "brief": "", "artifacts": [], "final": {},
                     "status": MEMBER_WAITING, "final_status": MEMBER_WAITING,
+                    "elapsed": 0, "final_elapsed": 0,
+                    # 每个环节自己的起止时刻：任务级别的 started_at/finished_at
+                    # 分不到三段上，卡片和「输入输出」要显示「几点开始、几点返回」
+                    "started_at": None, "finished_at": None,
+                    "final_started_at": None, "final_finished_at": None,
                     "msg_id": "", "sent_prompt": "", "raw_output": "",
                     "final_sent_prompt": "", "final_raw_output": "",
                 },
@@ -595,6 +770,7 @@ class TaskManager:
                     task["part_b"].append({
                         "member_id": rid, "name": rname, "status": MEMBER_WAITING,
                         "summary": "", "raw_output": "", "sent_prompt": "", "msg_id": "",
+                        "elapsed": 0, "started_at": None, "finished_at": None,
                     })
                 card_msg = {
                     "id": msg_id(),
@@ -705,7 +881,8 @@ class TaskManager:
                     if started:
                         task["status"] = STATUS_RUNNING
                         task["started_at"] = int(time.time())
-                        self._add_flow(task, f"{member_id} 开始执行")
+                        # 流水给人看，用成员名而不是 emp_xxx 这种内部 id
+                        self._add_flow(task, f"{task.get('owner_name') or member_id} 开始执行")
                         if task.get("result_msg_id"):
                             self._update_message(session, task["result_msg_id"], {"status": STATUS_RUNNING})
                         self._update_card(session, task)
@@ -737,6 +914,13 @@ class TaskManager:
     # 也不并发起两个进程写同一工作目录）。
     MEMBER_WAIT_SECONDS = 1800
 
+    def _member_display(self, member_id: str) -> str:
+        """报错与流水里优先用成员名：`emp_agy` 这类内部 id 对人没意义。"""
+        try:
+            return _member_label(self.store.load_settings(), member_id)
+        except Exception:
+            return member_id
+
     def _acquire_member(self, sid: str, member_id: str, timeout: Optional[float] = None) -> bool:
         """占用某位成员（等待它空闲）。同一线程可重入，靠计数释放。"""
         key = (sid, member_id)
@@ -751,7 +935,7 @@ class TaskManager:
                 if remain <= 0:
                     # 绝不为了「不死锁」就并发起进程：同一成员两个 CLI 同时写同一工作目录
                     # 会互相覆盖产物。放弃本次执行，由调用方把环节标成失败并允许重试。
-                    print(f"[TaskManager] 等 {member_id} 空闲超时，本次不执行")
+                    print(f"[TaskManager] 等 {self._member_display(member_id)} 空闲超时，本次不执行")
                     return False
                 self._cond.wait(timeout=min(0.2, remain))
             self._busy[key] = True
@@ -859,6 +1043,9 @@ class TaskManager:
             # 单任务的 part_a 也要收尾，否则交付后仍停在 in_progress，
             # 服务重启时会被恢复逻辑误判成「被中断的环节」
             task["part_a"]["status"] = status
+            task["part_a"]["elapsed"] = result.get("elapsed", 0)
+            task["part_a"]["started_at"] = result.get("started_at")
+            task["part_a"]["finished_at"] = result.get("finished_at")
             self._add_flow(task, f"单任务{self._state_label(status)}")
             self._update_message(session, task.get("result_msg_id"), {
                 "content": result.get("summary", ""),
@@ -887,9 +1074,15 @@ class TaskManager:
             if result.get("cancelled"):
                 task["status"] = STATUS_CANCELLED
                 part_a["status"] = STATUS_CANCELLED
+                part_a["elapsed"] = result.get("elapsed", 0)
+                part_a["started_at"] = result.get("started_at")
+                part_a["finished_at"] = result.get("finished_at")
                 self._add_flow(task, "主创执行已取消")
             elif result.get("status") in (STATUS_FAILED, STATUS_TIMEOUT):
                 part_a["status"] = result["status"]
+                part_a["elapsed"] = result.get("elapsed", 0)
+                part_a["started_at"] = result.get("started_at")
+                part_a["finished_at"] = result.get("finished_at")
                 task["status"] = result["status"]
                 self._add_flow(task, "主创执行" + self._state_label(result["status"]))
             else:
@@ -901,6 +1094,11 @@ class TaskManager:
                     "msg_id": result.get("record_msg_id", ""),
                     "sent_prompt": result.get("prompt", ""),
                     "raw_output": result.get("raw", ""),
+                    # 卡片上要显示「这一段跑了多久」，只有环节自己有耗时，
+                    # 任务级别的 started_at/finished_at 分不到三段
+                    "elapsed": result.get("elapsed", 0),
+                    "started_at": result.get("started_at"),
+                    "finished_at": result.get("finished_at"),
                 })
                 task["step"] = 2
                 self._add_flow(task, "主创执行完成，开始并行审核")
@@ -986,13 +1184,23 @@ class TaskManager:
                     "sent_prompt": result.get("prompt", ""),
                     "msg_id": result.get("record_msg_id", ""),
                     "elapsed": result.get("elapsed", 0),
+                    "started_at": result.get("started_at"),
+                    "finished_at": result.get("finished_at"),
                 })
                 self._add_flow(task, f"{item.get('name')} 审核{self._state_label(item['status'])}")
                 break
             self._update_card(session, task)
             self._save(session)
 
-    def _run_deliver(self, sid: str, tid: str, settings: Dict[str, Any], workspace_dir: str) -> None:
+    def _run_deliver(
+        self, sid: str, tid: str, settings: Dict[str, Any], workspace_dir: str,
+        source: str = "",
+    ) -> None:
+        """重出终稿。
+
+        source="review_auto" 表示这次是「所有审核都出了结论之后系统自动补的一次」，
+        卡片交付段会标出「审核补全后重新生成」，和用户手点「重新生成交付」区分开。
+        """
         result = self._execute(sid, tid, STAGE_DELIVER, None, settings, workspace_dir)
         with self.store.session_lock(sid):
             session = self._get(sid)
@@ -1007,9 +1215,21 @@ class TaskManager:
             if result.get("cancelled"):
                 task["status"] = STATUS_CANCELLED
                 part_a["final_status"] = STATUS_CANCELLED
+                part_a["final_elapsed"] = result.get("elapsed", 0)
+                part_a["final_started_at"] = result.get("started_at")
+                part_a["final_finished_at"] = result.get("finished_at")
+                part_a["final_source"] = ""
+                task["deliver_source"] = ""
+                task["deliver_source_at"] = None
             elif result.get("status") in (STATUS_FAILED, STATUS_TIMEOUT):
                 task["status"] = result["status"]
                 part_a["final_status"] = result["status"]
+                part_a["final_elapsed"] = result.get("elapsed", 0)
+                part_a["final_started_at"] = result.get("started_at")
+                part_a["final_finished_at"] = result.get("finished_at")
+                part_a["final_source"] = ""
+                task["deliver_source"] = ""
+                task["deliver_source_at"] = None
             else:
                 task["artifacts"] = scan_artifacts(
                     workspace_dir, result.get("artifacts") or task.get("artifacts") or []
@@ -1025,8 +1245,27 @@ class TaskManager:
                 part_a["final_status"] = STATUS_DONE
                 part_a["final_sent_prompt"] = result.get("prompt", "")
                 part_a["final_raw_output"] = result.get("raw", "")
+                part_a["final_elapsed"] = result.get("elapsed", 0)
+                part_a["final_started_at"] = result.get("started_at")
+                part_a["final_finished_at"] = result.get("finished_at")
                 task["status"] = STATUS_DELIVERED
                 task["step"] = 3
+                # 终稿已经按最新审核意见重出了，过期标记随之解除
+                task.pop("deliver_stale", None)
+                # 只有真的重出成功才挂来源标签：自动补交付失败/被取消时，
+                # 旧终稿已被清空，不该还标着「审核补全后重新生成」
+                if source:
+                    task["deliver_source"] = source
+                    task["deliver_source_at"] = int(time.time())
+                    part_a["final_source"] = source
+                else:
+                    task["deliver_source"] = ""
+                    task["deliver_source_at"] = None
+                    part_a["final_source"] = ""
+            # 自动补交付的占用无论成败都要解开，否则这一轮之后再重审就不会补了
+            task.pop("auto_deliver_inflight", None)
+            if source == "review_auto":
+                self._add_flow(task, "审核结论已齐，系统自动补一次交付（终稿重新生成）")
             task["finished_at"] = int(time.time())
             self._add_flow(task, "主创交付" + self._state_label(task["status"]))
             self._update_card(session, task)
@@ -1142,17 +1381,22 @@ class TaskManager:
                 for item in task.get("part_b") or []:
                     if item.get("member_id") == member_id:
                         item["status"] = MEMBER_IN_PROGRESS
-                        # 上一轮的意见与输入输出先清掉：这一轮还没出结果，
-                        # 留着旧内容会让人把上一轮的意见当成本轮的
+                        # 上一轮的意见与原始输出先清掉：这一轮还没出结果，
+                        # 留着旧内容会让人把上一轮的意见当成本轮的。
+                        # 但本轮的 Prompt 已经拼好、进程马上要起，先落下来：
+                        # 否则环节进行中查到的 Prompt 是空的，UI 只能显示「未留存」。
                         item.update({
-                            "summary": "", "raw_output": "", "sent_prompt": "",
-                            "msg_id": "", "elapsed": 0,
+                            "summary": "", "raw_output": "",
+                            "sent_prompt": prompt, "msg_id": record["id"],
+                            "elapsed": 0,
                         })
             elif stage == STAGE_EXEC:
-                # 重跑执行时先清空上一轮的简报与产物：本轮失败也不该拿旧简报当结果展示
+                # 重跑执行时先清空上一轮的简报与产物：本轮失败也不该拿旧简报当结果展示；
+                # Prompt 同理换成本轮的（清成空会让「执行中」这段时间看起来没留存）
                 task["part_a"].update({
                     "status": MEMBER_IN_PROGRESS, "brief": "", "artifacts": [],
-                    "sent_prompt": "", "raw_output": "", "msg_id": "",
+                    "sent_prompt": prompt, "raw_output": "", "msg_id": record["id"],
+                    "elapsed": 0,
                 })
                 task["artifacts"] = []
                 # 主创重跑意味着上一轮的审核意见全部作废：不清掉的话，卡片上会挂着
@@ -1164,8 +1408,10 @@ class TaskManager:
                     })
             elif stage == STAGE_DELIVER:
                 task["part_a"]["final_status"] = MEMBER_IN_PROGRESS
+                # 交付的 Prompt 同样先落下来，交付进行中也能查
                 task["part_a"].update({
-                    "final": {}, "final_sent_prompt": "", "final_raw_output": "",
+                    "final": {}, "final_sent_prompt": prompt, "final_raw_output": "",
+                    "final_elapsed": 0,
                 })
             task.setdefault("attempts", {})[attempt_key] = task["attempts"].get(attempt_key, 0) + 1
             self._update_card(session, task)
@@ -1204,6 +1450,7 @@ class TaskManager:
         raw = str(getattr(res, "raw_output", "") or "") or str(getattr(res, "output", "") or "")
         parsed = parse_output(str(getattr(res, "output", "") or ""))
         elapsed = round(time.time() - started, 2)
+        started_ts, finished_ts = int(started), int(time.time())
 
         if status in ("interrupted",) or cancelled_flag:
             mapped = "cancelled"
@@ -1223,6 +1470,8 @@ class TaskManager:
                     "raw_response": raw,
                     "status": mapped,
                     "elapsed_time": elapsed,
+                    "started_at": started_ts,
+                    "finished_at": finished_ts,
                 })
                 self._save(session)
 
@@ -1236,6 +1485,9 @@ class TaskManager:
             "prompt": prompt,
             "record_msg_id": record["id"],
             "elapsed": elapsed,
+            # 起止时刻随结果一起回传：三段各自落库，卡片才能显示「几点开始、几点返回」
+            "started_at": started_ts,
+            "finished_at": finished_ts,
         }
 
     @staticmethod
@@ -1254,6 +1506,13 @@ class TaskManager:
             STATUS_CANCELLED: "已取消", STATUS_TIMEOUT: "超时", STATUS_NO_OPINION: "无意见",
             STATUS_RUNNING: "进行中", STATUS_QUEUED: "排队中",
         }.get(status, status)
+
+    @staticmethod
+    def _stage_label(stage: str) -> str:
+        """流水文案用的环节名：别让用户看到 exec / review / deliver 这种内部值。"""
+        return {
+            STAGE_EXEC: "执行", STAGE_REVIEW: "审核", STAGE_DELIVER: "交付",
+        }.get(stage, stage)
 
     # ---------------- 取消 / 重试 ----------------
     # 可取消的环节状态：还没开始（waiting）、正在跑（in_progress / running）
@@ -1304,11 +1563,15 @@ class TaskManager:
             elif stage == STAGE_DELIVER:
                 task["part_a"]["final_status"] = STATUS_CANCELLED
             elif stage == STAGE_REVIEW:
+                cancelled_name = ""
                 for item in task.get("part_b") or []:
                     if item.get("member_id") == member_id:
                         item["status"] = STATUS_CANCELLED
+                        cancelled_name = str(item.get("name") or "")
                 # 只取消这位成员的审核；主创仍按已有意见交付（文档 4.3）
-                self._add_flow(task, f"已取消 {member_id} 的审核，主创继续交付")
+                self._add_flow(
+                    task, f"已取消 {cancelled_name or member_id} 的审核，主创继续交付"
+                )
                 self._update_card(session, task)
                 self._save(session)
                 try:
@@ -1357,10 +1620,15 @@ class TaskManager:
             task = (session.get("tasks") or {}).get(tid)
             if not task:
                 return {"error": "任务不存在"}
+            redo = False
+            needs_deliver = False
             if stage == STAGE_EXEC:
                 current = task["part_a"].get("status")
-                # 执行：只在失败 / 超时 / 已取消后提供重试
-                allowed = current in RETRYABLE_STATES or task.get("status") in RETRYABLE_STATES
+                # 执行环节有两种入口：失败 / 超时 / 已取消是「重试」，已成功是「重新生成」。
+                # 单任务重跑执行就是把这条回答重写一遍；协助任务重跑执行等于整轮重来
+                # （产物重做、审核重审、交付重出），卡片上三个环节各有自己的入口。
+                redo = current in (STATUS_DONE, STATUS_DELIVERED)
+                allowed = redo or current in RETRYABLE_STATES or task.get("status") in RETRYABLE_STATES
             elif stage == STAGE_DELIVER:
                 part_a = task.get("part_a") or {}
                 current = part_a.get("final_status")
@@ -1376,7 +1644,11 @@ class TaskManager:
                     (item.get("status") for item in task.get("part_b") or []
                      if item.get("member_id") == member_id), None
                 )
-                allowed = current in RETRYABLE_STATES
+                # 审核已成功也可以重跑：合同上的意见要能重出，不能只有失败时才放行
+                redo = current == STATUS_DONE
+                allowed = redo or current in RETRYABLE_STATES
+                # 终稿是否过期，等这次审核真的跑出结论再判（见 _retry_worker）：
+                # 点击的瞬间还不知道会成功还是失败，先标过期会误伤没变的终稿
             if not allowed:
                 return {"error": "当前环节不需要重试"}
             emp_id = member_id or task.get("owner_id") or ""
@@ -1391,13 +1663,46 @@ class TaskManager:
             if stage == STAGE_EXEC:
                 # 重跑主创执行：之前的审核与交付作废，从审核环节重新推进
                 task["part_a"]["status"] = MEMBER_WAITING
+                # 上一轮的简报与耗时一并清掉，否则刚点下去卡片上还挂着旧结论
+                task["part_a"]["brief"] = ""
+                task["part_a"]["elapsed"] = 0
+                task["part_a"]["started_at"] = None
+                task["part_a"]["finished_at"] = None
                 task["part_a"]["final"] = {}
                 task["part_a"]["final_status"] = MEMBER_WAITING
+                task["part_a"]["final_elapsed"] = 0
+                task["part_a"]["final_started_at"] = None
+                task["part_a"]["final_finished_at"] = None
                 for item in task.get("part_b") or []:
                     item["status"] = MEMBER_WAITING
                     item["summary"] = ""
+                    item["elapsed"] = 0
+                    item["started_at"] = None
+                    item["finished_at"] = None
+                task.pop("deliver_stale", None)
+                # 整轮重来：上一版终稿的来源标签作废，这次交付是正常流程里的
+                for key in ("deliver_source", "deliver_source_at"):
+                    task.pop(key, None)
+                task["part_a"]["final_source"] = ""
                 task["step"] = 1
-            self._add_flow(task, f"重试 {stage}")
+            elif stage == STAGE_REVIEW:
+                # 重跑这一位审核：卡片回到「审核中」，旧意见先清掉，
+                # 否则还会显示上一轮的结论，看起来像没生效
+                task["status"] = STATUS_RUNNING
+                task["finished_at"] = None
+                task["step"] = 2
+                # 一次「重新审核」算一轮。多位审核并发重跑时只补一次交付：
+                # 谁最后跑完，看 generation 比 auto_deliver_generation 大就补一次。
+                task["review_generation"] = int(task.get("review_generation") or 0) + 1
+                for item in task.get("part_b") or []:
+                    if item.get("member_id") == member_id:
+                        item["status"] = MEMBER_WAITING
+                        item["summary"] = ""
+                        item["raw_output"] = ""
+                        item["elapsed"] = 0
+                        item["started_at"] = None
+                        item["finished_at"] = None
+            self._add_flow(task, f"{'重新生成' if redo else '重试'}{self._stage_label(stage)}")
             self._update_card(session, task)
             self._save(session)
 
@@ -1447,13 +1752,87 @@ class TaskManager:
         elif stage == STAGE_REVIEW:
             # _run_review_one 内部的 _execute 会占用该成员；这里再占用一次会等自己
             self._run_review_one(sid, tid, member_id, settings, workspace_dir)
+            # 所有审核都出了结论 → 自动补一次交付（用户认可这个行为），并把这版终稿
+            # 标成「审核补全后重新生成」，和用户手点的交付区分开。
+            # 用 review_generation 去重：两位审核并发重跑时只补一次，不会因为先后
+            # 返回就重出两份终稿；用户之后又点一次「重新审核」则是新一轮，再补一次。
+            auto = False
             with self.store.session_lock(sid):
                 session = self._get(sid)
-                if session and tid in (session.get("tasks") or {}):
-                    self._update_card(session, session["tasks"][tid])
+                task = ((session or {}).get("tasks") or {}).get(tid) or {}
+                if task:
+                    part_a = task.get("part_a") or {}
+                    reviewers = task.get("part_b") or []
+                    finished_states = (
+                        STATUS_DONE, STATUS_FAILED, STATUS_TIMEOUT,
+                        STATUS_CANCELLED, STATUS_NO_OPINION,
+                    )
+                    conclusion_states = (STATUS_DONE, STATUS_NO_OPINION)
+                    exec_ok = part_a.get("status") == STATUS_DONE
+                    final_ok = part_a.get("final_status") == STATUS_DONE
+                    all_settled = bool(reviewers) and all(
+                        (i.get("status") or "") in finished_states for i in reviewers
+                    )
+                    all_concluded = bool(reviewers) and all(
+                        (i.get("status") or "") in conclusion_states for i in reviewers
+                    )
+                    generation = int(task.get("review_generation") or 0)
+                    auto_done = int(task.get("auto_deliver_generation") or 0)
+                    # 还有新审核结论没被任何一次交付消费掉
+                    pending_reviews = exec_ok and generation > auto_done
+                    needs_auto = (
+                        pending_reviews and all_concluded
+                        and task.get("status") != STATUS_CANCELLED
+                    )
+                    already_running = bool(task.get("auto_deliver_inflight"))
+                    if needs_auto and not already_running:
+                        # 在锁内先认领，另一个并发的重审线程看到 generation 已被消费就不会再补
+                        task["auto_deliver_generation"] = generation
+                        task["auto_deliver_inflight"] = True
+                        task["deliver_stale"] = True
+                        task["status"] = STATUS_RUNNING
+                        task["finished_at"] = None
+                        task["step"] = 3
+                        self._add_flow(task, "全部审核已出结论，自动补一次交付")
+                        auto = True
+                    elif not already_running and all_settled:
+                        # 审核没齐（有失败/超时/被取消）或这一轮已经补过：只收尾。
+                        # 终稿过期时留提示，是否重出由用户点「重新生成交付」决定。
+                        member_ok = next(
+                            (i.get("status") for i in reviewers
+                             if i.get("member_id") == member_id), ""
+                        )
+                        # 只有「新结论还没被自动交付消费」时才算过期；
+                        # 补完交付后另一个并发重审线程回来收尾，不该又标一次过期
+                        if final_ok and member_ok in conclusion_states and pending_reviews:
+                            task["deliver_stale"] = True
+                        was_running = task.get("status") == STATUS_RUNNING
+                        task["status"] = STATUS_DELIVERED if final_ok else STATUS_DONE
+                        task["finished_at"] = int(time.time())
+                        if final_ok and task.get("deliver_stale") and was_running:
+                            self._add_flow(task, "审核意见已更新，终稿待重新生成")
+                    self._update_card(session, task)
                     self._save(session)
+            if auto:
+                try:
+                    self._run_deliver(
+                        sid, tid, settings, workspace_dir, source="review_auto"
+                    )
+                finally:
+                    self._clear_auto_deliver_inflight(sid, tid)
         elif stage == STAGE_DELIVER:
-            self._run_deliver(sid, tid, settings, workspace_dir)
+            # 用户手点「重新生成交付」：来源标签换成 manual，不再挂自动补全的标记
+            self._run_deliver(sid, tid, settings, workspace_dir, source="manual")
+
+    def _clear_auto_deliver_inflight(self, sid: str, tid: str) -> None:
+        """自动补交付异常退出时兜底解锁，避免这一轮之后再也不补交付。"""
+        with self.store.session_lock(sid):
+            session = self._get(sid)
+            task = ((session or {}).get("tasks") or {}).get(tid)
+            if task and task.get("auto_deliver_inflight"):
+                task.pop("auto_deliver_inflight", None)
+                self._update_card(session, task)
+                self._save(session)
 
     # ---------------- 服务重启恢复 ----------------
     def recover_on_startup(self) -> int:
@@ -1476,6 +1855,9 @@ class TaskManager:
                 for task in (session.get("tasks") or {}).values():
                     if not isinstance(task, dict):
                         continue
+                    if task.pop("auto_deliver_inflight", None):
+                        # 服务重启时那次自动补交付的进程已经没了，解锁留着的占用
+                        changed = True
                     if task.get("status") in FINAL_TASK_STATES:
                         # 已经结束的任务不再动：早期实现会把已交付单任务的 part_a 从
                         # in_progress 改成 cancelled，还追加一条「进行中的环节已取消」的假流水

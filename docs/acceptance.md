@@ -61,14 +61,23 @@ node /tmp/verify_cleanup.mjs   # 旧文案 / 旧字段 / 设置三部分 / 确�
 | A27 | 10 | 设置只有成员管理 / 界面语言 / 服务三部分，没有模式选择 | CDP：`settingsTabs = [general, members, service]`、三项中文标签正确、`hasMeetingTab=false`；`settings` 只有 `ui_language` / `employees` 两个键 | 通过 |
 | A28 | 2 / 6.1 | 长内容默认折叠；每条消息可查看完整输入与原始输出 | 原折叠/查看器逻辑保留；CDP 弹窗查看输入按钮 | 通过 |
 | A29 | 11 | Flask + Vue3、会话 JSON 落盘、CLI 子进程执行、输入拼装与结构化输出解析模块齐备 | 语法编译 + Flask test_client 接口测试 + CDP 页面挂载 | 通过（端到端用注入的 FakeRunner，未调用真实 CLI 子进程，避免真实 token 消耗） |
+| A30 | 2 / 5.1 | 输入框打 `/` 弹出可用指令、打 `@` 弹出本会话成员；↑↓ 选择、Enter 补全、Esc 关闭；候选打开时 Enter 不发送消息，输入法组词时 Enter 不误选；选完 `/collab` 直接接着选成员 | CDP `verify_suggest.mjs`：16 项全通过（命令列表、成员过滤、方向键、Esc 保留输入、正文里的 `/` 不误弹、中文后紧跟 `@` 也弹、邮箱不误弹、Enter 不发送、IME 不误选） | 通过 |
+| A31 | 4.1 | `/collab` 的提及按出现顺序判定、可散落在句子里；`@//agy/` 路径写法、大小写、按目录名写的 `@deepseek-v4/(DS4)` 都能认出；邮箱等对不上的 `@` 不算提及；前端校验提示与后端同一套解析（`/api/collab/validate`） | `test_mentions_may_be_spread_across_the_sentence`、`test_file_reference_style_mentions_are_accepted`、`test_dashed_full_name_with_parenthesis_is_accepted`、`test_mentions_are_case_insensitive`、`test_email_and_path_are_not_mentions`、`test_first_mention_wins_for_single_task` + CDP `verify_collab.mjs`：6 项全通过 | 通过 |
 | A30 | 全局 | 双语：新增界面文案有英文词条 | CDP：`stateLabel('running')='Running'`、`stateLabel('delivered')='Delivered'`；词典共 206 条（本轮新增「主创 / 协助成员已停用」两条中英对照）；脚本核对 `t()` 的中文词条无遗漏、无重复键 | 通过 |
 | A31 | 全局 | 旧代码与旧接口删除：`core/engine.py`、`core/streaming.py`、`core/i18n.py` 以及 `/stream`、`/pause`、`/resume`、`/interrupt`、`/skip`、`/task/stop`、旧消息 `/retry` 全部不存在 | `git status` 显示 3 个模块已删除；`app.url_map` 路由清单 21 条，逐条确认无旧路径；全仓 grep 无 `core.engine` / `core.streaming` / `core.i18n` 引用 | 通过 |
 | A32 | 全局 | 旧数据清除：`settings.json` 只有 `ui_language` 与 `employees`（3 个可用成员）；旧会话文件清空；新会话不再有 `status` / `phase` / `mode` / `document` / `current_speaker` 等旧字段 | 文件内容核对；接口冒烟：带 `moderator` / `collab` / `default_mode` 的旧配置读取后只回两个键，POST 写入也只落两个键；带 `mode` / `phase` 创建会话，返回字段里无旧字段；`data/sessions/` 只剩 `.gitkeep` | 通过 |
 | A33 | 10 | 主持人配置删除：界面无主持人卡片、设置无 `moderator`、`load_settings` 不再按旧字段做兼容 | CDP 设置面板文案无「主持人」；`settingsKeys` 无 `moderator`；`core/storage.py` 改为只按白名单字段构造设置 | 通过 |
 | A34 | 全局 | 用户可见文案与规格一致：界面、词典、启动提示、重启/停止确认、run.sh、README 都改为「会话 / 成员 / 任务 / 已取消可重试」 | CDP 首屏 + 新建会话弹窗 + 设置面板 + 服务页：旧词命中数 0；词典 206 条旧词命中 0；重启/停止确认含「已取消」「任务卡片」且不含「恢复讨论」；全仓中文旧词 grep 无业务残留 | 通过 |
 | A35 | 全局 | 中英 README 与 `run.sh` 同步任务系统；旧圆桌演示 GIF 移除 | README 两份按规格 11 章结构重写，目录树与真实文件一致；`run.sh status` 读 `active_tasks`、启动/重启提示改为任务表述；`git rm docs/demo.gif docs/demo-en.gif`（已备份到 `/tmp/aim-legacy-backup-20261111-184514/`） | 通过 |
-
-| A36 | 4.2 / 5.1 | 成员输入包含「会话背景」：最近 8 条消息（单条 600 字、合计 3000 字上限），被截断的更早部分压成一段进展摘要；系统播报与各环节执行记录不进背景；没点名成员的消息因此真正作为上下文生效；重试时原话之后补充的约束一并带上 | `test_recent_messages_fill_context`、`test_context_skips_system_and_records`、`test_current_message_is_not_duplicated`、`test_prompt_contains_context_section`、`test_retry_carries_later_user_constraints` | 通过 |
+| A36 | 2 / 6.1 | 从协助卡片里点「查看输入 / 原始输出」，详情弹窗必须盖在卡片之上（原先同为 `z-50`、DOM 在前，被卡片压住） | CDP `verify_inspect2.mjs`：inspect `z=90` / 卡片 `z=50`，`elementFromPoint(视口中心)` 命中的是 inspect 弹窗，7 项全通过 | 通过 |
+| A37 | 6.2 | 环节发起时就把本轮 Prompt 写进 `part_a.sent_prompt` / `part_b[].sent_prompt` / `part_a.final_sent_prompt`，进行中点开即可查看；三者都为空时按环节状态区分说法（未开始 / 进行中 / 老记录） | `test_prompt_is_readable_while_stage_is_running`（用闸门把主创与审核卡在执行中，断言此时 Prompt 已可读且 `msg_id` 指向本轮记录）、`test_rerun_exec_failure_does_not_keep_previous_round`（失败保留本轮 Prompt、清掉简报与产物）；CDP：第一部分 1234 字符 / 2 段、waiting 显示「还没开始」、done 且为空仍显示老文案，7 项全通过 | 通过 |
+| A38 | 6.2 | 协助卡片按三个环节分块：顶部三步进度条（执行 → 审核 → 交付，完成打勾、失败标「!」、进行中高亮），下面依次是「1 · 主创执行（简报 + 产物清单）」「2 · 协助审核（每位成员一个位置，标题旁 n/m 已完成）」「3 · 主创交付（交付摘要 + 对审核意见的处理 + 自己的取消/重试/查看入口）」；流水里的内部成员 id 显示为成员名 | CDP `verify_card_steps.mjs`：12 项全通过（三步存在且顺序正确、三个分块标题与内容各就位、旧两段式标题已消失、审核进度 2/2、四个「查看输入」入口）；聊天流里的折叠卡片同样显示 `✓执行 → !审核 → ✓交付` 徽标；流水实测 `agy 开始执行`（早期记录里的 `emp_agy` 也在显示层换成名字） | 通过 |
+| A39 | 5.2 | CLI 启动阶段的端口抢占（`EADDRINUSE`）自动重试一次；已有产出的失败不重试，避免重复工作；重试仍失败时给出中文说明 | `tests/test_executor.py`：5 项全通过（冲突识别、零产出时重试、有产出不重试、重试耗尽提示、普通失败不重试） | 通过 |
+| A40 | 5.2 | 起 CLI 子进程时只放行白名单环境变量，宿主注入的 `SERVER__PORT` / `CLIENT_INFO_*` / `CLAUDE_*` / `CODEBUDDY_*` 与环回代理一律不传；用户自配的 `CODEBUDDY_API_KEY` 等凭据与外部代理保留 | `tests/test_executor.py`：`test_host_identity_vars_are_excluded`、`test_unknown_vars_are_not_forwarded`（未来新增的宿主变量默认不传）、`test_user_credentials_and_external_proxy_are_kept`、`test_host_sandbox_proxy_is_stripped`、`test_spawn_passes_clean_env`；实测环境变量 233 → 10 | 通过 |
+| A41 | 6.2 | 聊天流里的协助卡片直接给出「谁做了什么」：主创执行 / 每位协助审核 / 主创交付各一段简报，带各自状态与**该环节自己的耗时**；简报默认三行截断，可原地展开；点某一段直接打开该环节的 Prompt 与原始输出；取消与报错不把内部提示（`【任务已被用户取消】`、`【CLI 执行报错…EADDRINUSE】`）原样铺在卡片上；产物清单、实时流水、历次记录留在「完整任务详情」弹窗 | CDP `verify_chat_card.mjs`：23 项全通过（四段顺序 执行/审核/审核/交付、执行 1m14s / 审核 32s / 29s / 交付 43s、长简报默认三行且样式生效、展开后出现「收起」、点段打开对应 Prompt 且弹窗 `z=90` 覆盖卡片、运行中显示「正在执行 / 排队等待中」占位、无意见写「未提出意见」、取消写「已取消，未给出意见」、EADDRINUSE 报错折叠成「执行失败，点击查看报错详情」而模型自己写的失败说明照常展示、底部入口进大弹窗）；后端 `part_a.elapsed` / `part_a.final_elapsed` / `part_b[].elapsed` 由实测任务落库（执行 39.08s、审核取消 293.98s、交付 42.18s） | 通过 |
+| A42 | 5.2 | 消息与卡片都能直接重跑：失败的显示「重试」，已成功的单任务消息显示「重新生成」（按同一份输入重写这条回答）；协助任务的每一段右下角都有自己的入口，点哪一段只重跑哪一段——主创执行段「重新执行」、每位审核段各自「重新审核」、交付段「重新生成交付」，运行中的那一段变「取消」，失败态是「重试…」，主创执行没成功时交付段不给入口；已交付后重跑执行等于整轮重来，重跑某位审核时该位重审、其余审核都有结论后自动补一次交付 | CDP `verify_row_actions.mjs`：17 项全通过（已交付卡片四段依次为 重新执行 / 重新审核 / 重新审核 / 重新生成交付、执行中卡片执行段变「取消」且排队中的审核与交付没有入口、执行失败的卡片只有「重试执行」且不能重跑交付、三次点击分别打到 `stage=exec`、`stage=review&member_id=codebuddy-ds4`、`stage=deliver`，点按钮不会误开输入输出弹窗）；后端 `test_redo_exec_on_delivered_collab_restarts_round`（已交付后重跑执行＝执行/审核/交付各重跑一次、流水写「重新生成执行」、不新增任务）、`test_redo_review_on_delivered_collab_refreshes_delivery`（重审后终稿自动更新、`deliver_stale` 落库再清除）、`test_message_and_cancel_retry_endpoints`（已交付任务拒绝取消 409、允许重新生成 200） | 通过 |
+| A43 | 6.1 | 聊天里展示的始终是正文，不是 JSON：协议要求「正文正常写 + 产物清单用末尾 JSON 代码块登记」，解析时把登记块摘掉；整段 JSON 的旧写法取 `summary`；连 `summary` 都没有时把字段拼成可读文字，不把 `{...}` 原样丢给用户 | `tests/test_tasks.py`：`test_body_plus_artifact_block_keeps_body_only`、`test_whole_json_without_summary_is_still_readable`、`test_markdown_fence_with_prose_inside_is_parsed`、`test_plain_text_output_fallback` | 通过 |
+| A44 | 8 | 右侧工作目录点文件在弹窗里预览：Markdown 按文档渲染（标题/列表/表格/代码块），图片直接显示，其余文本走等宽 `<pre>`，二进制只给说明并可复制路径；文本 >500KB、图片 >20MB 时提示不支持；Esc / 点遮罩关闭；弹窗内外部链接在新标签打开 | CDP `verify_file_preview.mjs` 12 项（marked/DOMPurify 已加载、点 md 行打开弹窗且 `.markdown-body` 有标题与表格/列表、不再出现原始 `## ` 与表格分隔线、弹窗 `z=92` 在最上层、Esc 关闭、`/api/workspace/raw` 拒绝非图片）+ `verify_preview_kinds.mjs` 6 项（py→text+`<pre>`、zip→binary 提示、png→img+raw 地址、点目录只展开不弹窗）；`tests/test_workspace_preview.py` 6 项（大文件返回 `too_large` 且 content 为空、raw 只服务图片、`/etc/hosts` 被拒、缺文件 404） | 通过 |
 
 ---
 
@@ -198,3 +207,176 @@ CDP 界面验证 `verify_ui.mjs` / `verify_cleanup.mjs` 全项通过（词典 20
      `test_reviewer_without_cli_is_rejected`、`test_disabled_owner_is_rejected`；CDP 实测提示文案正确，词典 206 条）。
 
 回归：`Ran 54 tests in 3.0s — OK`。
+
+---
+
+## 本轮（卡片三段化 + CLI 端口冲突）
+
+协助卡片原先只有「第一部分 / 第二部分」两块，交付摘要塞在第一部分里，看不出「执行→审核→交付」这条线。现按三个环节分块，并加一条三步进度条（A38）。
+
+另外修了并行审核时的 `EADDRINUSE`：`codebuddy` 启动要自己挑本地端口起服务，探测与 listen 之间有窗口期，并发起两个实例时会撞上同一端口而直接退出。执行层现在识别这类错误、零产出时自动重试一次（A39）。
+
+回归：`Ran 68 tests in 3.7s — OK`；CDP `verify_card_steps.mjs` 12/12、`verify_inspect2.mjs` 7/7、`verify_suggest.mjs` 16/16、`verify_collab.mjs` 6/6。
+
+---
+
+## 补充（EADDRINUSE 的真正根因）
+
+上一节把 `EADDRINUSE` 归因为「并发抢端口 + 探测窗口期」，**这个结论错了**。
+
+真实原因是环境变量继承：宿主（WorkBuddy / IDE）把自己的本地服务端口以 `SERVER__PORT` 注入它拉起的每个子进程，而 `codebuddy` 启动时是 `parseInt(process.env.SERVER__PORT) || 配置里的端口`——环境里有就直接用，不再挑空闲端口。于是每个 CLI 子进程都去 `listen` 宿主自己的端口（实测 `127.0.0.1:62587`，宿主 Electron 正在监听），2 秒即退出。**不是偶发碰撞，是 100% 必现**；两个审核同时失败只是因为它们读的是同一个常量。
+
+清理过程中还发现第二个坑：宿主注入的 `HTTP_PROXY=127.0.0.1:62616`（沙箱代理）和 `CLIENT_INFO_*` + `CLAUDE_*` 组合，会让 CLI 判定「我在 IDE 里运行」，改走 IDE 凭据通道，报 `Authentication required`。按前缀删除（黑名单）防不住——宿主注入的变量实测有 81 个且随版本变化，删了这批还有下一批。
+
+最终改为**白名单**：只放行运行必需（`PATH`/`HOME`/`TERM`/`SHELL`/`TMPDIR`/`SSH_AUTH_SOCK` 等）+ 用户自配凭据（`CODEBUDDY_API_KEY`/`CODEBUDDY_BASE_URL`/`CODEBUDDY_CONFIG_DIR`/`ANTHROPIC_API_KEY` 等）+ 非环回代理。实测 233 个变量收敛到 10 个。
+
+验证：单跑 4.6s 成功；并发 2 个 × 3 轮共 6 次全部成功；端到端 `/collab`（agy 主创 + DS4/HY4 并行审核）走到 `delivered`，两位审核均 `done`，无端口错误、无鉴权失败。
+
+**部署前提**：CLI 需在本机自行登录过（`codebuddy /login`）。若看到 `Authentication required`，说明该 CLI 没有独立登录态，不是本服务的 bug。
+
+---
+
+## 补充（旧记录会一直显示旧的端口报错）
+
+端口冲突修好后仍会被问到「为什么还报」。原因是**历史记录的原文不会变**：`data/sessions/*.json` 里存着修复前那次执行的 `raw_output`（`Exit code: 1 / Error: listen EADDRINUSE … 127.0.0.1:62587`），重启服务、升级代码都不会改写它，点开「输入输出」看到的仍是当时那段英文。
+
+两件事要分开看：
+
+- **旧记录**：11-11 22:46 那两位审核的失败原文，任务本身最终是 `delivered` 的。
+- **新执行**：白名单环境实测 `codebuddy --model deepseek-v4-pro -p …` 6.4s 正常返回；宿主 233 个变量收敛到 10 个，`SERVER__PORT` 不再传给子进程。
+
+为避免下次再误判，A45 在「输入输出」弹窗的原始输出上方加了一条解释（原文一个字不改，可复制、可排查）：
+
+- `EADDRINUSE` / `address already in use` → 说明这是 CLI 启动端口被占、当前版本已改为干净环境启动且会重试，并提示旧记录点「重试」即可确认；
+- `Authentication required` / `not logged in` → 说明是 CLI 自己的登录态失效，与本服务无关；
+- 正常回复不显示任何提示条。
+
+A45 验收（`/tmp/verify_inspect_note.mjs`，6/6）：提示条出现、渲染在弹窗内、原文未被改写、登录失效提示、正常回复不打扰、关闭按钮可点。回归：`Ran 86 tests in 3.9s — OK`；词典 259 条、界面中文 key 228 条、未收录 0。
+
+---
+
+## A46 · 简报与输入输出改按 markdown 渲染
+
+模型输出的是 markdown（`## 审核结论`、`**边界条件**`、`- 列表`），交付前只做了结构化解析、没做渲染，所以卡片简报、任务详情、输入输出里看到的都是带记号的源码。三处一起改：
+
+- **聊天卡片简报**：`briefText(row)` 交给 `renderMdText` 渲染。收起时 `-webkit-line-clamp: 3` 要求内容是行内流，所以 `.brief-clamp` 下的块级子元素统一压成 `inline`（列表项之间补 `·` 分隔、标题保留 600 字重），展开后恢复正常的段落/列表/引用块。
+- **任务详情**：执行简报、每位成员的审核意见、交付摘要与「对审核意见的处理」都改 `v-html="renderMdText(...)"`，用 `.md-brief` 压掉标题与段落的大间距（不然一小段字被 margin 撑出一大块空白）。
+- **输入输出**：这里存的是 CLI 完整 stdout，正文后面常挂着 ```json {"summary":…,"artifacts":[…]}``` 的产物登记。整段渲染会把登记铺成一个大代码块、正文被挤到下面——正是「还是 md 源码」的来源。新增 `splitRegistry()` 按后端 `parse_output` 的同一规则把登记块摘出来：正文用 `.markdown-body .md-compact-doc` 渲染，登记放进 `<details>` 折叠；整段就是 JSON 的老记录退回到 `summary` 字段显示。右上角加「查看原文 / 美化显示」开关，原文一个字不改。
+
+另外 `marked` 设成 `gfm + breaks`：模型习惯用单换行分行，不开 `breaks` 会和成一个空格，简报与审核意见会挤成一坨。
+
+验收：
+
+- `verify_md_render.mjs` 11/11：卡片有 HTML 结构、无 `**` 漏出、收起仍 3 行；详情简报是结构化；输入输出默认渲染、可切原文。
+- `verify_md_registry.mjs` 8/8：正文与登记分离、默认不铺花括号、登记折叠、原文可见、普通回复正常。
+- `verify_card_md.mjs` 6/6：收起时块级压成行内且约 3 行、展开后列表恢复 `list-item`、标题 600 字重。
+- 回归：`Ran 86 tests — OK`；i18n 263 条、未收录 0。
+
+---
+
+## A47 · 文件预览里的 mermaid 流程图
+
+预览弹窗把 md 交给 marked 渲染，```` ```mermaid ```` 只会变成 `<pre><code class="language-mermaid">`，看到的仍是代码。现在在 DOM 落地后把这类代码块换成 SVG。
+
+- 库放 `static/vendor/mermaid.min.js`（11.4.1，2.4MB，跟 marked / DOMPurify 一样离线可用）。**懒加载**：页面上真出现 `code.language-mermaid` 才插 script，不拖首屏。
+- 用 `MutationObserver` 观察 body：聊天流、预览弹窗、任务详情都会插入新节点，不必每处各调一次；`pre.dataset.mermaidDone` 防重复处理。
+- 渲染失败时保留原代码并给一行 `.mermaid-error` 说明（「不让用户看到一块空白」）；顺手清掉 mermaid 留在 body 里的临时节点。
+- 初始化 `securityLevel: 'strict'`，图里的 html 标签不会被当 HTML 执行。
+- 图放在 `.mermaid-box`（浅色边框、横向可滚、`svg` 居中限宽）。
+
+验收 `verify_preview_mermaid.mjs` 6/6：用真实 md（标题 + mermaid + 表格）走 `/api/workspace/file` 打开预览 → 出图、节点文字正确、不再残留代码块、表格照常渲染、无报错提示。
+
+## A48 · 删除单条聊天消息
+
+聊天里每条消息右上角加了删除入口：平时不显示，鼠标移到这一条上才浮出圆形 ✕（初版 `.msg-row:hover > .msg-del`，触发范围为整行；**A53 已改为只有右上角热区才触发**）。点了先 `confirm` 再删。
+
+- 接口 `DELETE /api/sessions/<sid>/messages/<mid>`：在 `session_lock` 里把该条从 `messages` 物理移除，返回 `{success, remaining}`；消息不存在 404、会话 id 非法 400、并发删两次第二次 404。
+- **删除即不进上下文**：`build_context()` 直接读 `session["messages"]`，物理删掉后下次任务拼的 Prompt 里就不会再有这段，不需要额外的「忽略标记」。
+- 前端乐观隐藏：本地用 `deletedMsgIds` 先屏蔽，避免 1.5s 轮询刚好返回旧数据把消息「闪回来」；失败时撤销标记并提示。
+- 删除不影响正在跑的任务：进程继续、产物照旧落盘，只是这条消息不再出现在对话里。
+
+验收：`tests/test_message_delete.py` 5/5（只删目标、上下文不再包含、未知消息 404、非法 id 400、重复删 404）；`verify_mermaid_delete.mjs` 16/16 中的删除部分 10 项（默认 opacity=0 且 pointer-events:none、hover 后 opacity=1 可点、点击调用接口并消失、其他消息保留、确认框取消不删）。回归 `Ran 91 tests — OK`。
+
+## A49 · 删除消息与历史任务 Prompt 的边界
+
+删除一条消息只影响**以后**拼出来的 Prompt，不改写**已经跑完**的任务记录。
+
+- 历史任务里 `part_a.sent_prompt`、`part_b[].sent_prompt`、`final_sent_prompt`（以及历次执行记录的 `sent_prompt`）都是发送当时拼好的字符串快照。点开「输入输出 → Prompt」仍能看到那段被删的消息——它记录的是那次执行实际喂了什么，改了就等于篡改执行记录，事后无法复盘。
+- 时间线：这条消息只对**删除之后新发起的任务**（以及点了重试/重新生成后重新拼的 Prompt）不再出现，因为 `build_context()` 每次都是现读 `session["messages"]`。
+- 已经产生的输出、工作目录里的产物文件同样不会回退：模型当时确实读过。
+- 固化在 `tests/test_message_delete.py::test_completed_task_prompt_snapshot_keeps_deleted_text`（删后：聊天与后续上下文均不含、历史快照仍含）。
+
+## A50 · 卡片横栏可折叠、每段带执行时间
+
+用户反馈：卡片信息太散、收起时文字被挤成一坨；点正文/头部都该是折叠，只有「输入输出」才弹窗。
+
+- **头部横栏**：`@click="toggleCardClosed(msg)"` 切换整卡内容（`v-show="!isCardClosed(msg)"`），头部与底部流水保留，右侧 ▸/▾ 指示。不再打开「完整任务详情」弹窗。
+- **简报正文**：`@click="toggleBrief"` 展开/收起这一段；只有右下角「输入输出 ›」按钮调 `openInspectMsg`。重跑按钮带 `@click.stop`，不会误触折叠。
+- **收起排版**：弃用 `-webkit-line-clamp`（它要求行内流，之前把 `<p>/<ul>/<li>` 压成 inline 才裁得准，结果文字堆成一坨）。改成 `.brief-body.is-clamped { max-height: 156px; overflow: hidden }` + 底部渐隐——收起时看到的就是展开排版的前约 8 行，块级 `<h3>/<ul>/<li>` 全部保留。短内容不裁切，不强行撑高。
+- **每段执行时间**：后端 `part_a` / `part_b[]` / `part_a.final_*` 各存 `started_at` / `finished_at`（`_execute` 返回时落库，`retry` 时清零），`build_card` 输出；前端 `briefWhen(row)` 显示「开始时刻 · 用时」，`briefWhenTitle` 悬停显示「开始 X · 返回 Y」。老任务没有这两个字段时退回只显示耗时，不出现 Invalid Date。
+
+验收 `verify_card_fold_time.mjs` 14/14：每段标题带时间且跟耗时、收起保留块级排版（`display=block`）、收起 156px≈8 行 / 展开 182px、点正文展开再收回、点头部收起不弹窗且出 ▸、再点恢复、点「输入输出」弹窗顶部有时间。
+
+## A51 · 输入输出弹窗显示开始/返回时间
+
+弹窗顶部新增一行「开始 X · 返回 Y · 用时 Z」，数据来自 `inspectingMsg`。
+
+- `openInspectMsg()` 现在把 `started_at / finished_at / created_at / elapsed / stage_label / sender_name` 一并透传。上一版只传了内容/Prompt/状态，时间字段在组装时被丢掉，导致这一行永远为空。
+- 卡片每段的 `inspect`、详情弹窗的 `inspectForCard()`、历次执行记录三处入口都走同一个 `openInspectMsg`，共用这一个弹窗。
+- 普通消息没有独立的 `finished_at`，用消息落库的 `created_at` 兜底当作「返回」时刻；运行中且没有返回时刻时显示「执行中」。
+- 词典新增「开始 {a}」「返回 {b}」「用时 {d}」等带占位符条目，由 `t(text, params)` 替换。
+
+## A52 · 重审不再自动生成交付（已被 A54 撤销）
+
+> 后续用户改口，认可「所有审核都有结论就自动补一次交付」，只要求标出来源；现在的实际行为见 **A54**。
+
+用户反馈：只重新审核了两条失败消息，最后阶段的交付却自己跑了。
+
+- 原因：`_retry_worker` 里有一段「所有审核都有结论就自动补一次交付」，本意是避免卡片停在「执行中」，但没点过的执行不该自己发生。
+- 改为：重审成功时只 `task["deliver_stale"] = True`，终稿内容原样保留可见，卡片交付段显示「意见已更新」，流水加「审核意见已更新，终稿待重新生成」。是否重出终稿由用户点「重新生成交付」决定。
+- 任务状态在该轮重审结束后回到 `delivered`（终稿还在）或 `done`（没出过终稿），不再停在 `running`。
+- 测试改写：`test_redo_review_on_delivered_collab_marks_delivery_stale`、`test_retry_review_only_updates_that_member` 断言交付次数不再增加、`deliver_stale` 为真。
+
+## A53 · 删除按钮只在右上角热区 hover 时显示（用户消息的位置见 A55）
+
+> **A55 补充**：用户自己的消息改为左上角，其余消息仍按本节保持右上角。
+
+用户反馈：鼠标放在气泡任意位置都会冒出 ✕，应该只有放到右上角才显示。
+
+- 旧实现 `.msg-row:hover > .msg-del` —— 整行都是触发区。改为在气泡内部放一块透明的 `.msg-del-zone`（26×26，贴气泡右上角、大半在气泡外），只有 `.msg-del-zone:hover .msg-del` 才让 ✕ 浮出并变为可点。默认仍是 `opacity:0; pointer-events:none`，防误触。
+- **顺带修正定位**：旧按钮 `right:0` 相对 `.msg-row`（整行宽），对靠左的助手气泡会跑到屏幕最右边。现在 `.msg-del-zone` 放在各自气泡容器内（气泡加 `relative`），贴的是「这个气泡」自己的右上角；卡片外层补了一层 `relative w-full`，保持卡片占满整行。
+- 感应区位置避开了气泡头部右侧的「回复 / 取消 / ℹ️」等按钮。
+
+验收：`verify_mermaid_delete.mjs` 20/20（新增「hover 正文中间不显示 ✕」「hover 正文时点不到」「感应区贴气泡右上角」等）；`verify_del_zone_position.mjs` 7/7（用户气泡与靠左的助手气泡各自贴自己的右上角、hover 一条不会让另一条跟着显示）；`verify_del_realclick_card.mjs` 真实鼠标按下/抬起能命中并调删除接口；`verify_del_card_only.mjs` 6/6（卡片仍有感应区、贴右上角、卡片宽度不缩、hover 可显示可点）。回归 `Ran 92 tests — OK`；i18n 278 条、未收录 0。资源版本 `?v=20261112n`。
+
+## A54 · 审核结论齐全后自动补一次交付，并标注来源
+
+用户改口：「所有审核都有结论自动补一次交付挺好的，在交付那里标一下这是审核补全以后重新生成的交付」。A52 的「不自动补交付」就此撤销。
+
+- 后端 `_retry_worker` 的审核分支恢复自动补交付，但加了去重与标注：`retry()` 点一次「重新审核」就把 `review_generation + 1`；所有审核都落在 `done / no_opinion`（有结论）时，若 `review_generation > auto_deliver_generation` 就在 `session_lock` 里认领一次（同时置 `auto_deliver_inflight`），调用 `_run_deliver(..., source="review_auto")`。两位审核并发重跑也只补一次；还有审核失败 / 超时 / 被取消时不补，只留 `deliver_stale` +「终稿待重新生成」。
+- `_run_deliver` 成功后把 `deliver_source="review_auto"`、`deliver_source_at`、`part_a.final_source` 落库，`build_card` 透传；用户手点「重新生成交付」写 `manual`，正常首轮交付为空，重跑执行整轮重来时清掉标签。失败 / 取消不挂标签，并解开 `auto_deliver_inflight`；服务重启也会解锁遗留占用。
+- 流水两条：「全部审核已出结论，自动补一次交付」+「审核结论已齐，系统自动补一次交付（终稿重新生成）」，紧跟原来的「主创交付完成」。
+- 卡片交付段挂「↻ 审核补全后重新生成」靛蓝标签，悬停显示原因与重出时刻；「完整任务详情」的交付块同样挂标签并加一行说明。手动重出后标签消失。
+- 测试：改写 `test_retry_review_only_updates_that_member`、`test_redo_review_on_delivered_collab_auto_regenerates_delivery`（断言补一次且来源正确），新增 `test_two_review_retries_supplement_delivery_only_once`、`test_failed_retry_review_does_not_supplement_delivery`、`test_manual_regeneration_replaces_auto_badge`。
+
+## A55 · 我的消息删除按钮移到左上方
+
+- `.msg-del-zone.is-left { right: auto; left: -10px }`，气泡模板按 `msg.sender === 'user'` 加 `is-left`；用户气泡（靠右、贴屏幕边）✕ 贴自己左上角，助手 / 系统 / 任务卡片仍是右上角。
+- 触发范围不变：只有这一块 26×26 热区 hover 才浮出 ✕，hover 正文或另一个角都不会出现。
+
+## A56 · 任务卡片显示创建时间
+
+- `build_card` 透传 `task.created_at`（任务创建时已落库）；卡片头部与「完整任务详情」弹窗头部显示 `🕒 创建 YYYY-MM-DD HH:MM:SS`，`cardCreatedAt(msg)` 带日期，老会话没有该字段时退回卡片消息 `created_at`。
+- 测试 `test_new_task_card_exposes_creation_time`。
+
+验收：`verify_auto_badge_left_created.mjs` 14/14（用户气泡 ✕ 贴左上角且只有该热区可唤出、助手仍右上、卡片标签与悬停说明、卡片/弹窗创建时间、手动重出后标签消失）；CDP 定点截图 `/tmp/shot_left_del_zone.png`、`/tmp/shot_badge_focus.png` 目视无重叠。回归 `.venv/bin/python -m unittest discover -s tests` → `Ran 96 tests — OK`；i18n 词典 284 条、`t()` 未收录 0。资源版本 `?v=20261112o`。
+
+## A57 · README 重写 + 演示动图重制
+
+用户要求：重写 README、重做 GIF，示例同时包含单任务与协助任务，切换/滚动放慢让人看清。
+
+- `README.md` / `README_zh.md` 全量重写：顶部嵌入新动图；补齐卡片四段简报、逐段重跑、审核补全自动交付标签与创建时间、消息删除位置与上下文边界、文件预览（Markdown 表格 / Mermaid）、输入输出时间、CLI 环境白名单、96 项测试与 A1–A56 验收等与旧版不符的描述。目录 11 个锚点、相对链接与图片路径均已校验存在。
+- 动图 `docs/demo.gif`（中文）/ `docs/demo-en.gif`（英文）：真实界面逐帧截屏（1200×750，CDP 注入**虚构**会话），6 fps、306 帧、51 秒；每场景静止约 2.7 秒，滚动 10 步 × 2 帧约 3.3 秒，比旧版明显放慢；带编号字幕条；场景间用浅白场过渡。
+- 场景覆盖：片头 → 单任务结果消息 + `/collab` 指令 + 卡片（同类画面里两类任务同框）→ 单任务输入输出弹窗（开始/返回/用时）→ 卡片头部与创建时间 → 四段简报慢速滚动 → 完整任务详情弹窗 → 「↻ 审核补全后重新生成」标签 → 文件预览弹窗（Markdown 表格 + Mermaid 流程图）→ 收尾 → 片尾要点卡。
+- 生成链路：`/tmp/make_demo.mjs`（Node + CDP 截帧）→ `ffmpeg` palettegen/paletteuse（160 色、`diff_mode=rectangle`）合成；成片 4.1 MB / 3.9 MB。程序滚动会触发「回到最新」浮动按钮，已在演示样式里隐藏；过渡白场由 0.9 降到 0.55，避免出现近乎空白的帧。
+- 校验：成片抽帧目视（第 60 / 225 / 299 帧）文字清晰、Mermaid 已出图、片尾完整；两版 ffprobe 均为 1200×750 / 306 帧 / 51.0 秒。

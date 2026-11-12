@@ -1,4 +1,5 @@
 import os
+import random
 import re
 import signal
 import subprocess
@@ -6,6 +7,7 @@ import time
 import shlex
 import threading
 from typing import Dict, Any, Tuple, Optional, List
+from urllib.parse import urlsplit
 from dataclasses import dataclass
 
 # 白名单只允许「AI CLI 客户端」。
@@ -60,6 +62,108 @@ class ExecutionResult:
 
 _PROCESS_LOCK = threading.Lock()
 ACTIVE_PROCESSES: Dict[str, List[subprocess.Popen]] = {}
+
+# CLI 启动时要自己挑一个本地端口起服务（codebuddy 会监听 127.0.0.1:<随机>）。
+# 「探测空闲端口」和「真正 listen」之间有窗口期，并发起多个实例时仍可能撞上同一个端口，
+# 进程还没干活就因 EADDRINUSE 退出。属于瞬时错误，重试一次即可（下次会挑别的端口）。
+#
+# 注意：更常见的 EADDRINUSE 不是并发碰撞，而是环境变量被继承（见 build_cli_env）。
+_PORT_CONFLICT_HINTS = ("EADDRINUSE", "address already in use")
+CLI_PORT_CONFLICT_RETRIES = 2
+
+# ---------------------------------------------------------------------------
+# 起 CLI 子进程时必须在干净环境里跑，不能全量继承宿主进程的环境变量。
+#
+# 起因（实测）：WorkBuddy / IDE 会把自己的本地服务端口以 SERVER__PORT 注入到它拉起的
+# 所有子进程里。而 codebuddy CLI 启动时是这么取端口的：
+#     parseInt(process.env.SERVER__PORT) || config.cell.server.port
+# 也就是说「环境里有就直接用，不再挑空闲端口」。于是从 IDE 终端启动本服务后，
+# 每个 CLI 子进程都去 listen 宿主自己的端口（例如 127.0.0.1:62587，宿主 Electron 正在监听），
+# 必定 EADDRINUSE，2 秒就退出——不是偶发碰撞，是 100% 复现。
+#
+# 同理，CODEBUDDY_SESSION_* / CODEBUDDY_DAEMON_* / CODEBUDDY_GATEWAY_* 这些会让 CLI 以为
+# 自己是宿主的内嵌会话，转而向宿主索取凭据，结果是「Authentication required」，
+# 反而读不到 CLI 自己的登录态。
+#
+# 为什么用白名单而不是黑名单：宿主注入的变量实测有 81 个（CODEBUDDY_*、WORKBUDDY_*、
+# CLIENT_INFO_*、CLAUDE_*、SERVER__*、沙箱代理……），且随宿主版本变化。先前按前缀删，
+# 仍然漏掉了 CLIENT_INFO_* 与 CLAUDE_* 的组合——它们凑齐后 CLI 判定「我在 IDE 里」，
+# 改走 IDE 凭据通道，于是随机报 Authentication required。黑名单永远防不住下一个新变量，
+# 所以反过来只放行确实需要的那些。
+#
+# 实测对照（同一台机器、同一条命令）：
+#   继承环境                → 2.1s 失败，EADDRINUSE 127.0.0.1:62587
+#   按前缀删（黑名单）       → 单跑时好时坏，两个并发必失败
+#   只放行白名单            → 单跑 4~8s 正常；并发 2 个 × 3 轮全部成功
+# ---------------------------------------------------------------------------
+# 只放行「进程跑起来必需」+「用户自己配的凭据」。名单之外一律不带过去。
+_CLI_ENV_ALLOW = {
+    # 运行必需
+    "PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "SHELL", "USER", "LOGNAME",
+    "TMPDIR", "PWD", "TZ", "SSH_AUTH_SOCK",
+    # Windows
+    "SYSTEMROOT", "COMSPEC", "PATHEXT", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "TEMP", "TMP",
+    # 用户自己配的凭据 / 服务地址：不带过去 CLI 会连不上
+    "CODEBUDDY_API_KEY", "CODEBUDDY_BASE_URL", "CODEBUDDY_CONFIG_DIR",
+    "CLAUDE_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY",
+}
+
+# 代理单独处理：宿主会把自己的沙箱代理（实测 127.0.0.1:62616，属于 sandbox-client 进程）
+# 塞进 HTTP_PROXY/HTTPS_PROXY，让所有子进程的网络请求经它转发，CLI 走它就会时好时坏。
+# 只放行指向外部的代理；公司/外网代理（10.x、proxy.corp.com）要保留，否则连不上网。
+_PROXY_KEYS = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+               "http_proxy", "https_proxy", "all_proxy", "no_proxy")
+_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1", "0.0.0.0"}
+
+
+def _is_loopback_proxy(value: str) -> bool:
+    """代理地址是否指向本机（宿主注入的沙箱代理都是环回地址）。"""
+    raw = (value or "").strip()
+    if not raw:
+        return False
+    if "//" not in raw:
+        raw = "//" + raw
+    try:
+        host = urlsplit(raw).hostname
+    except ValueError:
+        return False
+    return (host or "").lower() in _LOOPBACK_HOSTS
+
+
+def build_cli_env(base: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    """构造 CLI 子进程的环境：只放行白名单，其余宿主变量一律不传。"""
+    src = os.environ if base is None else base
+    env: Dict[str, str] = {}
+    keep_loopback_proxy = os.environ.get("AIMEET_KEEP_LOOPBACK_PROXY") == "1"
+
+    for key, value in src.items():
+        if key in _CLI_ENV_ALLOW:
+            env[key] = value
+        elif key in _PROXY_KEYS:
+            # 外部代理保留；环回代理默认视为宿主注入，除非用户显式要求保留
+            if keep_loopback_proxy or not _is_loopback_proxy(value):
+                env[key] = value
+
+    # 少数 CLI 在 TERM 缺失时不输出彩色/进度，给个默认值避免行为差异
+    env.setdefault("TERM", "xterm-256color")
+    return env
+
+
+def is_port_conflict(text: str) -> bool:
+    return any(hint in (text or "") for hint in _PORT_CONFLICT_HINTS)
+
+
+def _unregister_process(session_id: str, proc: Optional[subprocess.Popen]) -> None:
+    """把进程从活动表里摘掉（取消时按这张表找进程杀）。"""
+    if not proc:
+        return
+    with _PROCESS_LOCK:
+        procs = ACTIVE_PROCESSES.get(session_id)
+        if procs and proc in procs:
+            procs.remove(proc)
+            if not procs:
+                ACTIVE_PROCESSES.pop(session_id, None)
+
 
 
 def validate_cli_template(cmd_template: str) -> Tuple[bool, str]:
@@ -356,6 +460,8 @@ class Executor:
         try:
             popen_kwargs = dict(
                 cwd=cwd,
+                # 不清环境的话，CLI 会拿宿主注入的 SERVER__PORT 当自己的监听端口，启动即失败
+                env=build_cli_env(),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -366,39 +472,63 @@ class Executor:
                 # 独立进程组，便于整组回收子进程
                 popen_kwargs["preexec_fn"] = os.setsid
 
-            p = subprocess.Popen(final_args, **popen_kwargs)
-            with _PROCESS_LOCK:
-                ACTIVE_PROCESSES.setdefault(session_id, []).append(p)
+            for attempt in range(1, CLI_PORT_CONFLICT_RETRIES + 1):
+                p = subprocess.Popen(final_args, **popen_kwargs)
+                with _PROCESS_LOCK:
+                    ACTIVE_PROCESSES.setdefault(session_id, []).append(p)
 
-            stdout, stderr = p.communicate(timeout=timeout)
+                stdout, stderr = p.communicate(timeout=timeout)
 
-            # 只有被 kill_session_process 显式标记过的才算「用户取消」
-            # （否则 CLI 自己 exit(9)/exit(15) 会被误判为用户中断）
-            if getattr(p, "wb_interrupted", False):
+                # 只有被 kill_session_process 显式标记过的才算「用户取消」
+                # （否则 CLI 自己 exit(9)/exit(15) 会被误判为用户中断）
+                if getattr(p, "wb_interrupted", False):
+                    return ExecutionResult(
+                        status="interrupted",
+                        output="【任务已被用户取消】",
+                        raw_output=(stderr or "").strip() or (stdout or "").strip(),
+                        elapsed=0.0,
+                        error_msg="Process interrupted by user cancellation"
+                    )
+
+                if p.returncode != 0:
+                    err_text = (
+                        (stderr or "").strip() or (stdout or "").strip()
+                        or f"Process exited with code {p.returncode}"
+                    )
+                    conflict = is_port_conflict(err_text)
+                    # 只在「一个字的产出都没有」时重试：进程启动就挂了，
+                    # 重跑不会重复已经完成的工作
+                    if (
+                        conflict
+                        and attempt < CLI_PORT_CONFLICT_RETRIES
+                        and not (stdout or "").strip()
+                    ):
+                        # 加抖动：协助任务的审核是并行的，两个实例同时失败、
+                        # 又同时醒来重试的话会再撞一次
+                        delay = attempt + random.uniform(0, 0.8)
+                        print(f"[Executor] CLI 端口被占用，{delay:.1f} 秒后重试: {err_text[:120]}")
+                        _unregister_process(session_id, p)
+                        p = None
+                        time.sleep(delay)
+                        continue
+                    hint = (
+                        f"（本机端口被占用，已自动重试 {CLI_PORT_CONFLICT_RETRIES} 次仍失败）"
+                        if conflict else ""
+                    )
+                    return ExecutionResult(
+                        status="error",
+                        output=f"【CLI 执行报错{hint}: {err_text}】",
+                        raw_output=f"Exit code: {p.returncode}\n{err_text}",
+                        elapsed=0.0,
+                        error_msg=err_text
+                    )
+
                 return ExecutionResult(
-                    status="interrupted",
-                    output="【任务已被用户取消】",
-                    raw_output=(stderr or "").strip() or (stdout or "").strip(),
-                    elapsed=0.0,
-                    error_msg="Process interrupted by user cancellation"
+                    status="success",
+                    output=(stdout or "").strip(),
+                    raw_output=stdout or "",
+                    elapsed=0.0
                 )
-
-            if p.returncode != 0:
-                err_text = (stderr or "").strip() or (stdout or "").strip() or f"Process exited with code {p.returncode}"
-                return ExecutionResult(
-                    status="error",
-                    output=f"【CLI 执行报错: {err_text}】",
-                    raw_output=f"Exit code: {p.returncode}\n{err_text}",
-                    elapsed=0.0,
-                    error_msg=err_text
-                )
-
-            return ExecutionResult(
-                status="success",
-                output=(stdout or "").strip(),
-                raw_output=stdout or "",
-                elapsed=0.0
-            )
 
         except subprocess.TimeoutExpired:
             if p:
@@ -426,10 +556,4 @@ class Executor:
                 error_msg=str(ex)
             )
         finally:
-            if p:
-                with _PROCESS_LOCK:
-                    procs = ACTIVE_PROCESSES.get(session_id)
-                    if procs and p in procs:
-                        procs.remove(p)
-                        if not procs:
-                            ACTIVE_PROCESSES.pop(session_id, None)
+            _unregister_process(session_id, p)

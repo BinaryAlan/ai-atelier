@@ -64,6 +64,105 @@
     .bubble-md p { margin-bottom: 0.5rem; line-height: 1.65; }
     .bubble-md ul, .bubble-md ol { list-style-position: inside; padding-left: 0.25rem; }
 
+    /* 聊天里的协助卡片：每段简报默认收起，只露约 8 行。
+       用「限高 + 溢出裁掉」而不是 -webkit-line-clamp：line-clamp 要求内容是
+       行内流，之前为了裁准把 <p>/<ul>/<li> 全压成 inline，结果列表项、段落
+       挤成一坨，和展开后的排版完全两样。限高可以保留原样的块级排版，
+       收起时看到的就是展开排版的前 8 行，视觉上是连续的。 */
+    .brief-body { position: relative; }
+    .brief-body.is-clamped {
+      max-height: 156px;      /* 约 8 行（12px 字号 / 1.6 行高） */
+      overflow: hidden;
+    }
+    /* 底部一条渐隐，提示「下面还有」，而不是一刀切断文字 */
+    .brief-body.is-clamped::after {
+      content: '';
+      position: absolute;
+      left: 0; right: 0; bottom: 0;
+      height: 2.2em;
+      background: linear-gradient(to bottom, rgba(255,255,255,0), #ffffff 78%);
+      pointer-events: none;
+    }
+    .brief-body.is-clamped:hover { cursor: pointer; }
+
+    /* 简报 / 详情里的紧凑 markdown：压掉标题与段落的大间距，避免一小段文字
+       因为 margin 撑出大片空白。 */
+    .md-brief { overflow-wrap: anywhere; word-break: break-word; }
+    .md-brief > *:first-child { margin-top: 0; }
+    .md-brief > *:last-child { margin-bottom: 0; }
+    .md-brief p { margin: 0 0 0.4rem; line-height: 1.65; }
+    .md-brief h1, .md-brief h2, .md-brief h3, .md-brief h4, .md-brief h5, .md-brief h6 {
+      font-size: 1em; font-weight: 600; margin: 0.5rem 0 0.25rem;
+      border: none; padding: 0; line-height: 1.5;
+    }
+    .md-brief ul, .md-brief ol { margin: 0 0 0.4rem; padding-left: 1.15rem; }
+    .md-brief ul { list-style: disc; }
+    .md-brief ol { list-style: decimal; }
+    .md-brief li { margin: 0.1rem 0; line-height: 1.6; }
+    .md-brief code {
+      background: #f3f4f6; padding: 0.05rem 0.25rem; border-radius: 0.25rem;
+      font-size: 0.92em; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+    .md-brief pre {
+      background: #f8fafc; border: 1px solid #e5e7eb; color: #111827;
+      padding: 0.5rem 0.6rem; border-radius: 0.5rem; margin: 0.35rem 0;
+      overflow-x: auto; white-space: pre-wrap; overflow-wrap: anywhere;
+    }
+    .md-brief pre code { background: transparent; padding: 0; }
+    .md-brief blockquote {
+      border-left: 3px solid #e5e7eb; padding-left: 0.6rem; margin: 0.35rem 0; color: #4b5563;
+    }
+    .md-brief a { color: #2563eb; text-decoration: underline; }
+    .md-brief table { border-collapse: collapse; margin: 0.35rem 0; font-size: 0.95em; }
+    .md-brief th, .md-brief td { border: 1px solid #e5e7eb; padding: 0.2rem 0.45rem; text-align: left; }
+    .md-brief th { background: #f9fafb; font-weight: 600; }
+    .md-brief hr { border: none; border-top: 1px solid #e5e7eb; margin: 0.5rem 0; }
+
+    /* 输入输出弹窗里的长文：字号跟着弹窗走，标题按 em 收，不然 1.4rem 的 h1
+       在小弹窗里比正文大出一截。 */
+    .md-compact-doc { font-size: 12px; line-height: 1.75; }
+    .md-compact-doc h1 { font-size: 1.25em; }
+    .md-compact-doc h2 { font-size: 1.12em; }
+    .md-compact-doc h3 { font-size: 1.02em; }
+    .md-compact-doc p { margin-bottom: 0.55em; }
+    .md-compact-doc ul, .md-compact-doc ol { margin-bottom: 0.55em; padding-left: 1.3em; }
+    .md-compact-doc li { margin: 0.15em 0; }
+
+    /* 删除按钮：只有鼠标移到「自己那一小块感应区」才浮出来。
+       早先写的是 .msg-row:hover —— 鼠标划过气泡正文也会冒出 ✕，既打扰阅读又容易误触。
+       现在用一块透明的 26×26 感应区包住按钮，大半落在气泡外，不盖住气泡头部的按钮。
+       助手 / 系统 / 任务卡片贴右上角；**用户自己的消息贴左上角**（右侧气泡靠屏幕边，
+       右上角太贴边不好点，用户也要求 ✕ 在左上方）。
+       不用 Tailwind group-hover：卡片内部已有一层 group，CDN 版嵌套命名 group 不稳定。 */
+    .msg-row { position: relative; }
+    .msg-del-zone {
+      position: absolute; top: -13px; right: 0; z-index: 6;
+      width: 26px; height: 26px;
+      display: flex; align-items: center; justify-content: center;
+    }
+    .msg-del-zone.is-left { right: auto; left: -10px; }
+    .msg-del {
+      width: 20px; height: 20px; border-radius: 9999px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 11px; line-height: 1; cursor: pointer;
+      color: #6b7280; background: #fff; border: 1px solid #e5e7eb;
+      box-shadow: 0 1px 3px rgba(15, 23, 42, 0.1);
+      opacity: 0; pointer-events: none; transition: opacity 0.12s ease, color 0.12s ease;
+    }
+    .msg-del-zone:hover .msg-del { opacity: 1; pointer-events: auto; }
+    .msg-del:hover { color: #dc2626; border-color: #fecaca; background: #fef2f2; }
+
+    /* mermaid 图：默认居中、限宽，横向过宽时允许滚动 */
+    .mermaid-box {
+      margin: 0.5rem 0; padding: 0.5rem; border: 1px solid #e5e7eb; border-radius: 0.5rem;
+      background: #fff; overflow-x: auto; text-align: center;
+    }
+    .mermaid-box svg { display: block; margin: 0 auto; max-width: 100%; height: auto; }
+    .mermaid-error {
+      margin: 0.35rem 0 0.5rem; padding: 0.4rem 0.6rem; border-radius: 0.4rem;
+      background: #fffbeb; border: 1px solid #fde68a; color: #92400e; font-size: 11px;
+    }
+
   </style>
 </head>
 <body class="bg-gray-50 text-gray-800 antialiased h-screen overflow-hidden">
@@ -254,36 +353,147 @@
         <div
           v-for="msg in visibleMessages"
           :key="msg.id"
-          :class="['flex gap-3', msg.sender === 'user' ? 'justify-end' : 'justify-start']"
+          :class="['msg-row flex gap-3', msg.sender === 'user' ? 'justify-end' : 'justify-start']"
         >
-          <!-- 协助任务卡片：默认折叠，外壳实时显示流水状态 -->
+          <!-- 删除入口放在各自气泡内部（见下方两处 msg-del-zone），定位贴的是气泡自己
+               的角，而不是整行的最右端；用户气泡用 .is-left 贴左上角。 -->
+          <!-- 协助任务卡片：聊天流里直接给三段简报（主创执行 / 协助审核 / 主创交付），
+               完整 Prompt、产物清单、实时流水都在「完整任务详情」弹窗里 -->
           <template v-if="msg.kind === 'task_card' && msg.card">
-            <div
-              @click="openCardModal(msg)"
-              class="w-full rounded-xl border border-slate-200 bg-white shadow-sm px-4 py-3 cursor-pointer hover:border-blue-300 transition"
-            >
-              <div class="flex items-center justify-between gap-2">
-                <div class="flex items-center gap-2 min-w-0">
-                  <span>🗂️</span>
-                  <span class="text-sm font-semibold text-gray-800 truncate">{{ t('协助任务') }} · {{ msg.card.goal }}</span>
+            <div class="relative w-full">
+            <!-- 只有鼠标进入右上角这小块，✕ 才浮出来；hover 正文不会出现 -->
+            <div class="msg-del-zone">
+              <button
+                class="msg-del"
+                @click.stop="deleteMessage(msg)"
+                :title="t('删除这条消息（删除后不再进入后续对话的上下文）')"
+              >✕</button>
+            </div>
+            <div class="w-full rounded-xl border border-slate-200 bg-white shadow-sm overflow-hidden">
+              <!-- 头部：任务是什么、整体到哪一步。点这一条横栏收起 / 展开整张卡片的内容，
+                   但不会打开弹窗——要看 Prompt 与原始输出请点各段右下角的「输入输出」 -->
+              <div
+                @click="toggleCardClosed(msg)"
+                class="px-4 pt-3 pb-2 cursor-pointer hover:bg-slate-50/70 transition-colors select-none"
+                :title="t('点击收起或展开这张卡片的内容')"
+              >
+                <div class="flex items-start gap-2">
+                  <span class="text-base leading-5 shrink-0">🗂️</span>
+                  <div class="min-w-0 flex-1">
+                    <div class="flex items-center gap-1.5 text-[11px] text-gray-500 flex-wrap">
+                      <span class="font-medium text-gray-600">{{ t('协助任务') }}</span>
+                      <span class="text-gray-300">·</span>
+                      <span>{{ msg.card.owner_name }} + {{ msg.card.part_b.length }} {{ t('位审核') }}</span>
+                      <template v-if="msg.card.artifacts && msg.card.artifacts.length">
+                        <span class="text-gray-300">·</span>
+                        <span>{{ msg.card.artifacts.length }} {{ t('个产物') }}</span>
+                      </template>
+                      <template v-if="cardCreatedAt(msg)">
+                        <span class="text-gray-300">·</span>
+                        <span class="font-mono text-[10px] text-gray-400" :title="t('任务创建时间')">
+                          🕒 {{ t('创建') }} {{ cardCreatedAt(msg) }}
+                        </span>
+                      </template>
+                    </div>
+                    <div class="mt-0.5 text-[13px] font-semibold text-gray-900 leading-snug break-words line-clamp-2">
+                      {{ msg.card.goal }}
+                    </div>
+                  </div>
+                  <div class="flex flex-col items-end gap-1 shrink-0">
+                    <span class="text-[10px] px-1.5 py-0.5 rounded border" :class="statusClass(msg.card.status)">{{ stateLabel(msg.card.status) }}</span>
+                    <span class="text-[10px] text-gray-400 font-mono">⏱ {{ taskElapsed(msg.card) }}</span>
+                  </div>
+                  <span class="text-[10px] text-gray-300 shrink-0 leading-5">{{ isCardClosed(msg) ? '▸' : '▾' }}</span>
                 </div>
-                <div class="flex items-center gap-2 shrink-0">
-                  <span class="text-[11px] px-2 py-0.5 rounded border" :class="statusClass(msg.card.status)">{{ stateLabel(msg.card.status) }}</span>
-                  <span class="text-[11px] text-gray-500">⏱ {{ taskElapsed(msg.card) }}</span>
-                  <span class="text-xs text-blue-600 shrink-0">{{ t('展开查看') }} ›</span>
+                <!-- 三步进度：不点开也能看出卡在哪一环 -->
+                <div class="mt-2 flex items-center gap-1.5 text-[10px]">
+                  <template v-for="(s, i) in cardStepsOf(msg.card)" :key="s.key">
+                    <span :class="['inline-flex items-center gap-1 px-1.5 py-0.5 rounded border', stepDotClass(s.status)]">
+                      <span class="font-bold">{{ stepGlyph(s, i) }}</span>{{ s.label }}
+                    </span>
+                    <span v-if="i < 2" class="text-gray-300">→</span>
+                  </template>
+                  <span v-if="reviewProgressOf(msg.card)" class="ml-auto text-gray-400">{{ reviewProgressOf(msg.card) }}</span>
+                </div>
+                <div v-if="queueHint(msg.card.task_id, msg.card.owner.id)" class="mt-1 text-[11px] text-amber-600">
+                  ⏳ {{ queueHint(msg.card.task_id, msg.card.owner.id) }}
                 </div>
               </div>
-              <div class="mt-2 text-[11px] text-gray-500">{{ t('当前环节') }}：{{ stageLabel(msg.card) }}</div>
-              <div v-if="queueHint(msg.card.task_id, msg.card.owner.id)" class="mt-1 text-[11px] text-amber-600">
-                ⏳ {{ queueHint(msg.card.task_id, msg.card.owner.id) }}
+
+              <!-- 三段简报：每一段就是一位成员在这一轮里的结论。
+                   点正文 = 展开/收起这一段的全文；点「输入输出」才会弹窗 -->
+              <div v-show="!isCardClosed(msg)" class="border-t border-slate-100">
+                <div
+                  v-for="row in cardBriefRows(msg.card)"
+                  :key="row.key"
+                  class="px-4 py-2 border-b border-slate-50 last:border-b-0 hover:bg-slate-50/70 transition-colors group"
+                >
+                  <div class="flex items-center gap-1.5 text-[11px]">
+                    <span class="shrink-0">{{ row.icon }}</span>
+                    <span class="font-semibold text-gray-800 truncate">{{ row.name }}</span>
+                    <span class="text-gray-400 shrink-0">{{ briefRoleText(row) }}</span>
+                    <span v-if="briefBusy(row)" class="w-1.5 h-1.5 rounded-full bg-blue-500 animate-pulse shrink-0"></span>
+                    <!-- 执行时间：几点开始 + 用了多久。没有开始时刻就不占位（老任务没有这两个字段） -->
+                    <span
+                      v-if="briefWhen(row)"
+                      class="ml-auto shrink-0 text-[10px] text-gray-400 font-mono"
+                      :title="briefWhenTitle(row)"
+                    >{{ briefWhen(row) }}</span>
+                    <span
+                      class="shrink-0 text-[10px] px-1.5 py-0.5 rounded border"
+                      :class="statusClass(row.status)"
+                    >{{ stateLabel(row.status) }}</span>
+                    <span
+                      v-if="row.key === 'deliver' && msg.card.deliver_stale"
+                      class="shrink-0 text-[10px] text-amber-700 px-1.5 py-0.5 rounded border border-amber-200 bg-amber-50"
+                      :title="t('审核意见在这次交付之后又更新了，终稿是按旧意见写的')"
+                    >{{ t('意见已更新') }}</span>
+                    <!-- 所有审核出结论后系统自动补的那一次交付：标清楚来源，别和用户手点的混在一起 -->
+                    <span
+                      v-if="row.key === 'deliver' && msg.card.deliver_source === 'review_auto'"
+                      class="shrink-0 text-[10px] text-indigo-700 px-1.5 py-0.5 rounded border border-indigo-200 bg-indigo-50"
+                      :title="autoDeliverTitle(msg.card)"
+                    >↻ {{ t('审核补全后重新生成') }}</span>
+                  </div>
+                  <div
+                    @click="toggleBrief(msg.card, row)"
+                    :class="['mt-1 text-[12px] leading-relaxed md-brief brief-body',
+                             (isBriefOpen(msg.card, row) || !briefLong(row)) ? 'text-gray-700' : 'text-gray-600 is-clamped']"
+                    :title="isBriefOpen(msg.card, row) ? t('点击收起') : t('点击展开全文')"
+                    v-html="renderMdText(briefText(row))"
+                  ></div>
+                  <div class="mt-1 flex items-center gap-3 text-[10px]">
+                    <button
+                      v-if="briefLong(row)"
+                      @click.stop="toggleBrief(msg.card, row)"
+                      class="text-blue-600 hover:underline"
+                    >{{ isBriefOpen(msg.card, row) ? t('收起') : t('展开全文') }}</button>
+                    <!-- 只有这里会打开「输入输出」弹窗，其余位置点了只折叠，不弹窗 -->
+                    <button
+                      @click.stop="openInspectMsg(row.inspect)"
+                      class="text-gray-400 hover:text-blue-600 transition-colors"
+                    >{{ t('输入输出') }} ›</button>
+                    <!-- 每一段自己的重跑入口：只重跑这一段，不用先展开详情 -->
+                    <button
+                      v-if="briefAction(msg.card, row)"
+                      @click.stop="briefAct(msg, row)"
+                      class="ml-auto shrink-0 px-1.5 py-0.5 rounded border transition"
+                      :class="briefAction(msg.card, row).kind === 'cancel'
+                        ? 'bg-gray-50 text-gray-600 border-gray-200 hover:bg-gray-100'
+                        : 'bg-blue-50 text-blue-700 border-blue-200 hover:bg-blue-100'"
+                      :title="t('只重跑这一段，已完成的其他环节保持不动')"
+                    >{{ briefAction(msg.card, row).kind === 'cancel' ? '✕' : '🔄' }} {{ briefAction(msg.card, row).label }}</button>
+                  </div>
+                </div>
               </div>
-              <div class="mt-2 flex flex-wrap gap-1.5">
-                <span class="text-[11px] px-2 py-0.5 rounded bg-emerald-50 text-emerald-700 border border-emerald-100">🎯 {{ msg.card.owner_name }} · {{ stateLabel(msg.card.part_a.status) }}</span>
-                <span v-for="item in msg.card.part_b" :key="item.member_id" class="text-[11px] px-2 py-0.5 rounded bg-sky-50 text-sky-700 border border-sky-100">🤝 {{ item.name }} · {{ stateLabel(item.status) }}</span>
+
+              <!-- 底部：最新一条流水 + 进入完整详情（重跑入口已经分到每一段上） -->
+              <div class="px-4 py-1.5 bg-slate-50/80 flex items-center gap-2 text-[10px]">
+                <span class="text-gray-400 shrink-0">{{ t('流水') }}：</span>
+                <span class="text-gray-500 truncate flex-1">{{ latestFlowText(msg.card) }}</span>
+                <button @click="openCardModal(msg)" class="text-blue-600 hover:underline shrink-0">{{ t('完整任务详情') }} ›</button>
               </div>
-              <div v-if="msg.card.flow && msg.card.flow.length" class="mt-2 text-[11px] text-gray-400 truncate">
-                {{ t('流水') }}：{{ msg.card.flow[msg.card.flow.length - 1].text }}
-              </div>
+            </div>
             </div>
           </template>
 
@@ -297,15 +507,23 @@
             {{ getEmployeeAvatar(msg.sender) }}
           </div>
 
-          <!-- 气泡主体 -->
+          <!-- 气泡主体：relative 让删除感应区贴的是「这个气泡」的右上角 -->
           <div
             :class="[
-              'max-w-[85%] rounded-2xl px-4 py-3 shadow-sm text-sm leading-relaxed border',
+              'relative max-w-[85%] rounded-2xl px-4 py-3 shadow-sm text-sm leading-relaxed border',
               msg.sender === 'user' ? 'bg-blue-600 text-white border-blue-600 rounded-tr-none' :
               msg.sender === 'system' ? 'bg-amber-50 text-amber-900 border-amber-200 w-full text-center' :
               'bg-white border-gray-200 text-gray-800 rounded-tl-none'
             ]"
           >
+            <!-- 用户消息贴左上角、其余贴右上角；只有这一小块能唤出 ✕，hover 正文不会冒出来 -->
+            <div :class="['msg-del-zone', msg.sender === 'user' ? 'is-left' : '']">
+              <button
+                class="msg-del"
+                @click.stop="deleteMessage(msg)"
+                :title="t('删除这条消息（删除后不再进入后续对话的上下文）')"
+              >✕</button>
+            </div>
             <!-- 气泡头部 -->
             <div v-if="msg.sender !== 'system'" class="flex items-center justify-between gap-3 mb-1 text-xs opacity-80">
               <div class="flex items-center gap-1.5">
@@ -326,7 +544,7 @@
                   :title="t('引用这条消息回复（发送后由该成员作答）')"
                 >💬 {{ t('回复') }}</button>
 
-                <!-- 单任务：取消与重试只出现在这条输出消息上 -->
+                <!-- 单任务：执行中的取消、失败的重试、成功后的重新生成，都挂在同一条输出消息上 -->
                 <button
                   v-if="msg.kind === 'task_result' && (msg.status === 'running' || msg.status === 'queued')"
                   @click.stop="cancelTask(msg, 'exec')"
@@ -339,6 +557,12 @@
                   class="text-[10px] px-1.5 py-0.5 rounded bg-blue-50 text-blue-700 border border-blue-200 hover:bg-blue-100 transition shrink-0"
                   :title="t('按原输入重新执行这一次任务')"
                 >🔄 {{ t('重试') }}</button>
+                <button
+                  v-if="msg.kind === 'task_result' && ['delivered', 'done'].includes(msg.status)"
+                  @click.stop="retryTask(msg, 'exec')"
+                  class="text-[10px] px-1.5 py-0.5 rounded bg-blue-50 text-blue-700 border border-blue-200 hover:bg-blue-100 transition shrink-0"
+                  :title="t('按同一份输入重新生成这条回答')"
+                >🔄 {{ t('重新生成') }}</button>
 
                 <button
                   v-if="msg.sender !== 'user'"
@@ -462,11 +686,13 @@
         </div>
 
         <!-- 文本输入框 (Backspace 整删 @ 标签，防输入法回车误触发送) -->
-        <div class="flex gap-2">
+        <div class="relative flex gap-2">
           <textarea
             ref="chatInput"
             v-model="inputContent"
+            @input="onInputSuggest"
             @keydown="onInputKeydown"
+            @blur="onSuggestBlur"
             @compositionstart="isComposing = true"
             @compositionend="onCompositionEnd"
             rows="2"
@@ -479,6 +705,45 @@
           >
             {{ t('发送') }}
           </button>
+
+          <!-- 候选输入：打 / 出可用命令，打 @ 出可艾特的成员。
+               用 mousedown.prevent 选中，避免 textarea 先失焦导致光标丢失。 -->
+          <div
+            v-if="suggest"
+            class="absolute left-0 right-0 bottom-full mb-2 z-50 rounded-xl border border-gray-200 bg-white shadow-lg overflow-hidden"
+          >
+            <div class="px-3 py-1.5 bg-gray-50 border-b border-gray-100 flex items-center justify-between text-[11px] text-gray-500">
+              <span class="font-medium text-gray-600">
+                {{ suggest.kind === 'command' ? t('可用命令') : t('可以 @ 的成员') }}
+              </span>
+              <span class="shrink-0 ml-2">{{ t('↑↓ 选择 · Enter 确认 · Esc 关闭') }}</span>
+            </div>
+            <div class="max-h-56 overflow-y-auto py-1">
+              <button
+                v-for="(item, i) in suggest.items"
+                :key="item.id"
+                type="button"
+                @mousedown.prevent="pickSuggest(i)"
+                @mouseenter="suggest.active = i"
+                :disabled="item.disabled"
+                :class="['w-full text-left px-3 py-1.5 flex items-center gap-2 transition',
+                         i === suggest.active && !item.disabled ? 'bg-blue-50' : '',
+                         item.disabled ? 'opacity-50 cursor-not-allowed' : 'hover:bg-blue-50']"
+              >
+                <span class="shrink-0 text-sm">{{ item.kind === 'command' ? '⌘' : (item.avatar || '🤖') }}</span>
+                <span class="min-w-0 flex-1">
+                  <span class="block text-sm text-gray-800 truncate">{{ item.label }}</span>
+                  <span class="block text-[11px] text-gray-500 truncate">
+                    {{ item.disabled ? item.hint : item.desc }}
+                  </span>
+                </span>
+                <span v-if="i === suggest.active && !item.disabled" class="shrink-0 text-[10px] text-blue-500">↵</span>
+              </button>
+              <div v-if="!suggest.items.length" class="px-3 py-3 text-xs text-gray-400 text-center">
+                {{ t('没有匹配项') }}
+              </div>
+            </div>
+          </div>
         </div>
       </div>
     </div>
@@ -512,7 +777,8 @@
         </div>
 
         <div class="flex-1 flex flex-col min-h-0 overflow-hidden">
-          <div :class="['overflow-y-auto border-b border-gray-200 p-2 text-xs divide-y divide-gray-50 shrink-0', selectedWorkspaceFile ? 'max-h-40' : 'flex-1']">
+          <div class="px-4 pt-2 pb-1 text-[10px] text-gray-500 shrink-0">{{ t('点击文件在弹出的窗口里预览') }}</div>
+          <div class="flex-1 overflow-y-auto p-2 text-xs divide-y divide-gray-50">
             <div
               v-for="item in workspaceItems"
               :key="item.path"
@@ -527,16 +793,47 @@
             </div>
             <div v-if="workspaceItems.length === 0" class="text-xs text-gray-400 text-center py-6">{{ t('此目录下暂无文件') }}</div>
           </div>
+        </div>
+      </div>
+    </div>
 
-          <div v-if="selectedWorkspaceFile" class="flex-1 flex flex-col min-h-0 bg-gray-50">
-            <div class="px-3 py-1.5 bg-gray-100 border-b border-gray-200 flex items-center justify-between text-xs text-gray-700 shrink-0 font-medium">
-              <span class="truncate">📄 {{ selectedWorkspaceFile.name }}</span>
-              <button @click="selectedWorkspaceFile = null" class="text-gray-400 hover:text-gray-600 font-bold">×</button>
+    <!-- 文件预览弹窗：右侧文件列表点文件打开，md 渲染、图片显示、其余按等宽文本 -->
+    <div
+      v-if="showFilePreview"
+      @click.self="closeFilePreview()"
+      class="fixed inset-0 bg-black/50 z-[92] flex items-center justify-center p-4"
+    >
+      <div class="bg-white rounded-2xl shadow-xl w-full max-w-4xl max-h-[90vh] flex flex-col overflow-hidden">
+        <div class="px-5 py-3 border-b border-gray-100 flex items-start gap-3 shrink-0">
+          <div class="min-w-0 flex-1">
+            <div class="flex items-center gap-2 min-w-0">
+              <span class="shrink-0">{{ filePreview?.kind === 'image' ? '🖼️' : (filePreview?.kind === 'markdown' ? '📝' : '📄') }}</span>
+              <span class="font-semibold text-gray-900 truncate">{{ filePreview?.name }}</span>
+              <span class="text-[11px] text-gray-400 shrink-0">{{ formatFileSize(filePreview?.size) }}</span>
             </div>
-            <div class="flex-1 overflow-y-auto p-3">
-              <pre class="text-xs font-mono bg-white p-3 border border-gray-200 rounded-lg whitespace-pre-wrap select-text text-gray-800 leading-relaxed">{{ selectedFileContent }}</pre>
-            </div>
+            <div class="mt-0.5 text-[11px] text-gray-400 font-mono truncate" :title="filePreview?.path">{{ filePreview?.path }}</div>
           </div>
+          <button
+            @click="copyFilePath()"
+            class="px-2 py-1 rounded-lg border border-gray-200 text-[11px] text-gray-600 hover:bg-gray-50 transition shrink-0"
+            :title="t('复制文件的完整路径')"
+          >{{ t('复制路径') }}</button>
+          <button @click="closeFilePreview()" class="text-gray-400 hover:text-gray-600 text-2xl leading-none font-bold shrink-0">×</button>
+        </div>
+        <div class="flex-1 overflow-y-auto px-6 py-5 text-sm text-gray-800 select-text" @click="onPreviewClick">
+          <div v-if="filePreviewLoading" class="text-xs text-gray-400 py-10 text-center">{{ t('正在读取…') }}</div>
+          <div
+            v-else-if="filePreview?.error"
+            class="text-xs text-amber-700 bg-amber-50 border border-amber-100 rounded-lg px-3 py-2"
+          >{{ filePreview.error }}</div>
+          <img
+            v-else-if="filePreview?.kind === 'image'"
+            :src="filePreview.url"
+            :alt="filePreview.name"
+            class="max-w-full mx-auto rounded-lg border border-gray-100"
+          >
+          <div v-else-if="!filePreview?.content" class="text-xs text-gray-400 py-10 text-center">{{ t('（空文件）') }}</div>
+          <div v-else v-html="filePreviewHtml()"></div>
         </div>
       </div>
     </div>
@@ -1033,8 +1330,10 @@
       </div>
     </div>
 
-    <!-- 9. 消息审查与 Prompt 详情弹窗 (ℹ️ 点击打开) -->
-    <div v-if="showInspectModal" class="fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4">
+    <!-- 9. 消息审查与 Prompt 详情弹窗 (ℹ️ 点击打开)
+         层级要高于协助卡片弹窗（z-50）：从卡片里点「查看输入 / 原始输出」时，
+         同一个 z-index 会被后渲染的卡片盖住，看起来像「弹窗没在最上层」 -->
+    <div v-if="showInspectModal" class="fixed inset-0 bg-black/60 z-[90] flex items-center justify-center p-4">
       <div class="bg-white rounded-2xl shadow-2xl w-full max-w-3xl max-h-[88vh] flex flex-col overflow-hidden">
         <div class="p-4 border-b border-gray-100 flex items-center justify-between">
           <div class="flex items-center gap-2">
@@ -1044,6 +1343,15 @@
             </h4>
           </div>
           <button @click="showInspectModal = false" class="text-gray-400 hover:text-gray-600 text-lg font-bold">×</button>
+        </div>
+
+        <!-- 这一次执行的起止时刻：用户问「这条结果是什么时候跑出来的」时，
+             不必再去翻任务详情里那条流水 -->
+        <div
+          v-if="inspectTimeText()"
+          class="px-4 py-1.5 text-[11px] text-gray-500 bg-gray-50 border-b border-gray-100 flex items-center gap-2 flex-wrap shrink-0"
+        >
+          <span class="font-mono">{{ inspectTimeText() }}</span>
         </div>
 
         <div class="flex border-b border-gray-200 bg-gray-50 text-xs font-semibold text-gray-600 shrink-0">
@@ -1104,14 +1412,47 @@
               </div>
             </template>
 
-            <pre v-else class="text-xs font-mono bg-white p-4 border border-gray-200 rounded-xl whitespace-pre-wrap select-text leading-relaxed text-gray-800">{{ t('该条记录生成于 Prompt 持久化功能上线前，未留存独立 Prompt。') }}</pre>
+            <pre v-else class="text-xs font-mono bg-white p-4 border border-gray-200 rounded-xl whitespace-pre-wrap select-text leading-relaxed text-gray-800">{{ t(inspectEmptyHint) }}</pre>
           </div>
 
-          <div v-else class="relative">
-            <button @click="copyText(inspectingMsg?.raw_response || inspectingMsg?.content)" class="absolute right-2 top-2 px-2 py-1 text-[11px] bg-white border border-gray-300 rounded shadow-sm hover:bg-gray-50 transition">
-              📋 {{ t('复制回复') }}
-            </button>
-            <pre class="text-xs font-mono bg-white p-4 border border-gray-200 rounded-xl whitespace-pre-wrap select-text leading-relaxed text-gray-800">{{ inspectingMsg?.raw_response || inspectingMsg?.content || t('(无原始回复)') }}</pre>
+          <div v-else>
+            <div v-if="inspectNote" class="mb-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-[11px] leading-relaxed text-amber-800">
+              {{ inspectNote }}
+            </div>
+            <div class="mb-2 flex items-center justify-end gap-2">
+              <button
+                @click="inspectRaw = !inspectRaw"
+                class="px-2 py-1 text-[11px] bg-white border border-gray-300 rounded hover:bg-gray-50 transition"
+                :title="t('模型输出偶发半截表格/代码块时，切回原文对照')"
+              >{{ inspectRaw ? '✨ ' + t('美化显示') : '📄 ' + t('查看原文') }}</button>
+              <button
+                @click="copyText(inspectingMsg?.raw_response || inspectingMsg?.content)"
+                class="px-2 py-1 text-[11px] bg-white border border-gray-300 rounded hover:bg-gray-50 transition"
+              >📋 {{ t('复制回复') }}</button>
+            </div>
+            <!-- 「原文」= CLI 完整 stdout（含末尾那坨 JSON 登记）；
+                 「美化」= 摘掉登记后的正文按 markdown 渲染，登记另行折叠 -->
+            <pre
+              v-if="inspectRaw"
+              class="text-xs font-mono bg-white p-4 border border-gray-200 rounded-xl whitespace-pre-wrap select-text leading-relaxed text-gray-800"
+            >{{ inspectingMsg?.raw_response || inspectingMsg?.content || t('(无原始回复)') }}</pre>
+            <template v-else>
+              <div
+                v-if="inspectBody"
+                class="markdown-body md-compact-doc bg-white p-4 border border-gray-200 rounded-xl select-text text-gray-800"
+                v-html="renderMdText(inspectBody)"
+              ></div>
+              <div
+                v-else-if="!inspectRegistry"
+                class="text-xs text-gray-400 bg-white p-4 border border-gray-200 rounded-xl"
+              >{{ t('(无原始回复)') }}</div>
+              <details v-if="inspectRegistry" class="mt-2 rounded-xl border border-gray-200 bg-gray-50 overflow-hidden">
+                <summary class="cursor-pointer select-none px-3 py-2 text-[11px] text-gray-500 hover:text-gray-700">
+                  🧾 {{ t('产物登记数据') }} · JSON
+                </summary>
+                <pre class="m-0 border-0 rounded-none bg-gray-50 text-[11px] font-mono p-3 whitespace-pre-wrap select-text leading-relaxed text-gray-700">{{ inspectRegistry }}</pre>
+              </details>
+            </template>
           </div>
         </div>
 
@@ -1128,6 +1469,9 @@
           <div class="min-w-0">
             <div class="text-sm font-bold text-gray-900">🗂️ {{ t('协助任务卡片') }}</div>
             <div class="text-xs text-gray-500 truncate mt-0.5">{{ cardModalMsg.card.goal }}</div>
+            <div v-if="cardCreatedAt(cardModalMsg)" class="text-[11px] text-gray-400 font-mono mt-0.5">
+              🕒 {{ t('创建') }} {{ cardCreatedAt(cardModalMsg) }}
+            </div>
           </div>
           <div class="flex items-center gap-2 shrink-0">
             <span class="text-[11px] px-2 py-0.5 rounded border" :class="statusClass(cardModalMsg.card.status)">{{ stateLabel(cardModalMsg.card.status) }}</span>
@@ -1137,21 +1481,48 @@
         </div>
 
         <div class="flex-1 min-h-0 overflow-y-auto p-5 space-y-5">
+          <!-- 三步进度：执行 → 审核 → 交付，一眼看出卡在哪一环 -->
+          <div class="flex items-center gap-2">
+            <template v-for="(s, i) in cardSteps" :key="s.key">
+              <div class="flex items-center gap-1.5 shrink-0">
+                <span
+                  :class="['w-5 h-5 rounded-full border flex items-center justify-center text-[10px] font-bold', stepDotClass(s.status)]"
+                >{{ stepGlyph(s, i) }}</span>
+                <span class="text-[11px]" :class="s.active ? 'text-gray-900 font-semibold' : 'text-gray-500'">{{ s.label }}</span>
+              </div>
+              <span
+                v-if="i < cardSteps.length - 1"
+                class="flex-1 h-px"
+                :class="s.status === 'done' ? 'bg-emerald-300' : 'bg-gray-200'"
+              ></span>
+            </template>
+          </div>
+
           <!-- 实时流水 -->
           <div class="rounded-xl border border-slate-200 bg-slate-50 p-3">
             <div class="text-xs font-semibold text-gray-700 mb-2">{{ t('实时流水') }} · {{ stageLabel(cardModalMsg.card) }}</div>
-            <div v-for="(f, i) in cardModalMsg.card.flow.slice(-8)" :key="i" class="text-[11px] text-gray-500 flex gap-2">
+            <div v-for="(f, i) in cardFlow" :key="i" class="text-[11px] text-gray-500 flex gap-2">
               <span class="font-mono shrink-0">{{ formatFlowTime(f.at) }}</span><span class="truncate">{{ f.text }}</span>
             </div>
           </div>
 
-          <!-- 第一部分 -->
+          <!-- 第 1 步 · 主创执行 -->
           <section>
-            <h3 class="text-sm font-bold text-gray-900 mb-2">{{ t('第一部分 · 主创做了什么') }}</h3>
+            <div class="flex items-center gap-2 mb-2">
+              <h3 class="text-sm font-bold text-gray-900">1 · {{ t('主创执行') }}</h3>
+              <span class="text-[11px] px-2 py-0.5 rounded border" :class="statusClass(cardModalMsg.card.part_a.status)">
+                {{ stateLabel(cardModalMsg.card.part_a.status) }}
+              </span>
+            </div>
             <div class="rounded-xl border border-gray-200 p-4 space-y-3 text-xs text-gray-700">
               <div>
                 <div class="font-semibold text-gray-800">{{ t('执行简报') }}</div>
-                <div class="mt-1 whitespace-pre-wrap">{{ cardModalMsg.card.part_a.brief || t('（暂无）') }}</div>
+                <div
+                  v-if="cardModalMsg.card.part_a.brief"
+                  class="mt-1 md-brief"
+                  v-html="renderMdText(cardModalMsg.card.part_a.brief)"
+                ></div>
+                <div v-else class="mt-1 text-gray-400">{{ t('（暂无）') }}</div>
               </div>
               <div>
                 <div class="font-semibold text-gray-800">{{ t('产物清单') }}</div>
@@ -1162,11 +1533,6 @@
                   <span class="text-gray-400 shrink-0">{{ a.bytes }} B</span>
                 </div>
               </div>
-              <div>
-                <div class="font-semibold text-gray-800">{{ t('终版改动说明') }}</div>
-                <div class="mt-1 whitespace-pre-wrap">{{ cardModalMsg.card.part_a.final.summary || t('（暂无）') }}</div>
-                <div class="mt-1 text-gray-500 whitespace-pre-wrap">{{ cardModalMsg.card.part_a.final.opinion_handling || '' }}</div>
-              </div>
               <div class="flex flex-wrap gap-2 pt-1">
                 <button
                   v-if="['waiting', 'running', 'queued', 'in_progress'].includes(cardModalMsg.card.part_a.status)"
@@ -1174,33 +1540,36 @@
                   class="px-2.5 py-1 rounded-lg border border-gray-300 text-gray-700 hover:bg-gray-50"
                 >✕ {{ t('取消执行') }}</button>
                 <button
-                  v-if="['failed', 'cancelled', 'timeout'].includes(cardModalMsg.card.part_a.status)"
+                  v-if="['failed', 'cancelled', 'timeout', 'done'].includes(cardModalMsg.card.part_a.status)"
                   @click="retryTask(cardModalMsg, 'exec')"
                   class="px-2.5 py-1 rounded-lg border border-blue-200 text-blue-700 hover:bg-blue-50"
-                >🔄 {{ t('重试执行') }}</button>
+                >🔄 {{ cardModalMsg.card.part_a.status === 'done' ? t('重新执行') : t('重试执行') }}</button>
                 <button
-                  v-if="['done', 'failed', 'cancelled', 'timeout'].includes(cardModalMsg.card.part_a.final_status)"
-                  @click="retryTask(cardModalMsg, 'deliver')"
-                  class="px-2.5 py-1 rounded-lg border border-emerald-200 text-emerald-700 hover:bg-emerald-50"
-                >🔄 {{ t('重新生成交付内容') }}</button>
-                <button
-                  @click="openInspectMsg({ sent_prompt: cardModalMsg.card.part_a.sent_prompt, raw_response: cardModalMsg.card.part_a.raw_output, content: cardModalMsg.card.part_a.brief })"
+                  @click="openInspectMsg(inspectForCard(cardModalMsg.card, 'exec'))"
                   class="px-2.5 py-1 rounded-lg border border-gray-200 text-gray-600 hover:bg-gray-50"
                 >ℹ️ {{ t('查看输入 / 原始输出') }}</button>
               </div>
             </div>
           </section>
 
-          <!-- 第二部分 -->
+          <!-- 第 2 步 · 协助审核 -->
           <section>
-            <h3 class="text-sm font-bold text-gray-900 mb-2">{{ t('第二部分 · 协助审核') }}</h3>
+            <div class="flex items-center gap-2 mb-2">
+              <h3 class="text-sm font-bold text-gray-900">2 · {{ t('协助审核') }}</h3>
+              <span class="text-[11px] text-gray-500">{{ reviewProgress }}</span>
+            </div>
             <div class="space-y-2">
               <div v-for="item in cardModalMsg.card.part_b" :key="item.member_id" class="rounded-xl border border-gray-200 p-4 text-xs text-gray-700">
                 <div class="flex items-center justify-between gap-2">
                   <div class="font-semibold text-gray-800">🤝 {{ item.name }}</div>
                   <span class="text-[11px] px-2 py-0.5 rounded border" :class="statusClass(item.status)">{{ stateLabel(item.status) }}</span>
                 </div>
-                <div class="mt-2 whitespace-pre-wrap">{{ item.summary || t('（暂无意见）') }}</div>
+                <div
+                  v-if="item.summary"
+                  class="mt-2 md-brief"
+                  v-html="renderMdText(item.summary)"
+                ></div>
+                <div v-else class="mt-2 text-gray-400">{{ t('（暂无意见）') }}</div>
                 <div class="mt-2 flex flex-wrap gap-2">
                   <button
                     v-if="['waiting', 'running', 'queued', 'in_progress'].includes(item.status)"
@@ -1208,15 +1577,70 @@
                     class="px-2.5 py-1 rounded-lg border border-gray-300 text-gray-700 hover:bg-gray-50"
                   >✕ {{ t('取消') }}</button>
                   <button
-                    v-if="['failed', 'cancelled', 'timeout', 'no_opinion'].includes(item.status)"
+                    v-if="['failed', 'cancelled', 'timeout', 'no_opinion', 'done'].includes(item.status)"
                     @click="retryTask(cardModalMsg, 'review', item.member_id)"
                     class="px-2.5 py-1 rounded-lg border border-blue-200 text-blue-700 hover:bg-blue-50"
-                  >🔄 {{ t('重试') }}</button>
+                  >🔄 {{ item.status === 'done' ? t('重新审核') : t('重试') }}</button>
                   <button
-                    @click="openInspectMsg({ sent_prompt: item.sent_prompt, raw_response: item.raw_output, content: item.summary })"
+                    @click="openInspectMsg(inspectForCard(cardModalMsg.card, 'review', item.member_id))"
                     class="px-2.5 py-1 rounded-lg border border-gray-200 text-gray-600 hover:bg-gray-50"
                   >ℹ️ {{ t('查看输入 / 原始输出') }}</button>
                 </div>
+              </div>
+            </div>
+          </section>
+
+          <!-- 第 3 步 · 主创交付：根据审核意见改一遍，给出终版 -->
+          <section>
+            <div class="flex items-center gap-2 mb-2">
+              <h3 class="text-sm font-bold text-gray-900">3 · {{ t('主创交付') }}</h3>
+              <span class="text-[11px] px-2 py-0.5 rounded border" :class="statusClass(cardModalMsg.card.part_a.final_status)">
+                {{ stateLabel(cardModalMsg.card.part_a.final_status) }}
+              </span>
+              <span
+                v-if="cardModalMsg.card.deliver_source === 'review_auto'"
+                class="text-[10px] px-1.5 py-0.5 rounded border border-indigo-200 bg-indigo-50 text-indigo-700"
+                :title="autoDeliverTitle(cardModalMsg.card)"
+              >↻ {{ t('审核补全后重新生成') }}</span>
+            </div>
+            <div class="rounded-xl border border-gray-200 p-4 space-y-3 text-xs text-gray-700">
+              <div
+                v-if="cardModalMsg.card.deliver_source === 'review_auto'"
+                class="rounded-lg border border-indigo-100 bg-indigo-50/60 px-2.5 py-1.5 text-[11px] text-indigo-700"
+              >{{ t('这一版终稿是所有审核结论齐全后，系统自动补一次交付重新生成的，不是手动点的交付。') }}</div>
+              <div>
+                <div class="font-semibold text-gray-800">{{ t('交付摘要') }}</div>
+                <div
+                  v-if="cardModalMsg.card.part_a.final.summary"
+                  class="mt-1 md-brief"
+                  v-html="renderMdText(cardModalMsg.card.part_a.final.summary)"
+                ></div>
+                <div v-else class="mt-1 text-gray-400">{{ t('（暂无）') }}</div>
+              </div>
+              <div>
+                <div class="font-semibold text-gray-800">{{ t('对审核意见的处理') }}</div>
+                <div
+                  v-if="cardModalMsg.card.part_a.final.opinion_handling"
+                  class="mt-1 md-brief text-gray-600"
+                  v-html="renderMdText(cardModalMsg.card.part_a.final.opinion_handling)"
+                ></div>
+                <div v-else class="mt-1 text-gray-400">{{ t('（暂无）') }}</div>
+              </div>
+              <div class="flex flex-wrap gap-2 pt-1">
+                <button
+                  v-if="['running', 'in_progress'].includes(cardModalMsg.card.part_a.final_status)"
+                  @click="cancelTask(cardModalMsg, 'deliver')"
+                  class="px-2.5 py-1 rounded-lg border border-gray-300 text-gray-700 hover:bg-gray-50"
+                >✕ {{ t('取消交付') }}</button>
+                <button
+                  v-if="['done', 'failed', 'cancelled', 'timeout'].includes(cardModalMsg.card.part_a.final_status)"
+                  @click="retryTask(cardModalMsg, 'deliver')"
+                  class="px-2.5 py-1 rounded-lg border border-emerald-200 text-emerald-700 hover:bg-emerald-50"
+                >🔄 {{ t('重新生成交付内容') }}</button>
+                <button
+                  @click="openInspectMsg(inspectForCard(cardModalMsg.card, 'deliver'))"
+                  class="px-2.5 py-1 rounded-lg border border-gray-200 text-gray-600 hover:bg-gray-50"
+                >ℹ️ {{ t('查看输入 / 原始输出') }}</button>
               </div>
             </div>
           </section>
@@ -1228,7 +1652,7 @@
               <button
                 v-for="(rec, ri) in cardRecords"
                 :key="rec.id || ri"
-                @click="openInspectMsg({ sent_prompt: rec.sent_prompt, raw_response: rec.raw_response, content: rec.content })"
+                @click="openInspectMsg({ sent_prompt: rec.sent_prompt, raw_response: rec.raw_response, content: rec.content, stage_status: rec.status, elapsed: rec.elapsed_time, started_at: rec.started_at, finished_at: rec.finished_at, sender_name: rec.sender_name })"
                 class="w-full flex items-center justify-between gap-2 text-left px-3 py-2 rounded-lg border border-gray-200 hover:bg-gray-50 transition text-xs"
               >
                 <span class="truncate">🧾 {{ rec._label }}</span>
@@ -1263,7 +1687,7 @@
 
   </div>
 
-  <script src="/static/js/i18n.js?v=20261111a"></script>
-  <script src="/static/js/app.js?v=20261111a"></script>
+  <script src="/static/js/i18n.js?v=20261112o"></script>
+  <script src="/static/js/app.js?v=20261112o"></script>
 </body>
 </html>

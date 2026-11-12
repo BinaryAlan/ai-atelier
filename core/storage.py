@@ -128,7 +128,9 @@ def save_settings(settings: Dict[str, Any]):
     with _STORAGE_LOCK:
         tmp_path = f"{SETTINGS_FILE}.tmp.{uuid.uuid4().hex[:6]}"
         with open(tmp_path, "w", encoding="utf-8") as f:
+            # 结尾补换行：否则每次保存都会在 git 里多出一条「\ No newline at end of file」
             json.dump(settings, f, ensure_ascii=False, indent=2)
+            f.write("\n")
         os.replace(tmp_path, SETTINGS_FILE)
 
 

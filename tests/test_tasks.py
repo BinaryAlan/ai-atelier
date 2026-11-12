@@ -194,6 +194,16 @@ class TaskCase(unittest.TestCase):
                     return
             time.sleep(0.02)
 
+    def _wait_retries(self, timeout=8):
+        """等所有重试线程（含它内部同步跑的自动补交付）真的结束。"""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            with self.manager._lock:
+                if not self.manager._retries and not self.manager._active_keys:
+                    return
+            time.sleep(0.02)
+        self.manager.wait_idle()
+
 
 class TestCollabParsing(TaskCase):
     def test_missing_owner_is_rejected(self):
@@ -261,6 +271,75 @@ class TestCollabParsing(TaskCase):
         self.assertFalse(parsed["ok"])
         self.assertIn("主创", parsed["error"])
 
+    def test_mentions_may_be_spread_across_the_sentence(self):
+        # 用户常见的写法：先点主创并说一句，再把审核的人放在后面
+        parsed = T.parse_collab("/collab @agy 你是主创，@DS4 @HY4 负责审核", self.settings)
+        self.assertTrue(parsed["ok"], parsed["error"])
+        self.assertEqual(parsed["owner_id"], "emp_agy")
+        self.assertEqual(parsed["reviewer_ids"], ["emp_ds4", "emp_hy4"])
+        self.assertEqual(parsed["goal"], "你是主创，负责审核")
+
+    def test_file_reference_style_mentions_are_accepted(self):
+        # 微信/编辑器里 @//agy/ 这种带路径装饰的写法，以及小写的成员目录名
+        parsed = T.parse_collab(
+            "/collab @//agy/ 针对 E01 写出阶段二，@//ds4/ @//hy4/ 负责审核",
+            self.settings,
+        )
+        self.assertTrue(parsed["ok"], parsed["error"])
+        self.assertEqual(parsed["owner_id"], "emp_agy")
+        self.assertEqual(parsed["reviewer_ids"], ["emp_ds4", "emp_hy4"])
+        self.assertEqual(parsed["goal"], "针对 E01 写出阶段二，负责审核")
+
+    def test_dashed_full_name_with_parenthesis_is_accepted(self):
+        # 真实配置里成员名是「DeepSeek-V4 (DS4)」，用户按目录名写成 @//deepseek-v4/(DS4)
+        for emp in self.settings["employees"]:
+            if emp["id"] == "emp_ds4":
+                emp["name"] = "DeepSeek-V4 (DS4)"
+            if emp["id"] == "emp_hy4":
+                emp["name"] = "混元-4 (HY4)"
+        parsed = T.parse_collab(
+            "/collab @//agy/ 写阶段二，@//deepseek-v4/(DS4) @混元-4 (HY4) 负责审核",
+            self.settings,
+        )
+        self.assertTrue(parsed["ok"], parsed["error"])
+        self.assertEqual(parsed["owner_id"], "emp_agy")
+        self.assertEqual(parsed["reviewer_ids"], ["emp_ds4", "emp_hy4"])
+
+    def test_picked_from_member_list_then_spread_in_sentence(self):
+        # 用户真实输入：成员是从候选列表点出来的全名（带空格和括号），
+        # 主创在开头说一句，审核的人写在句子后半段
+        for emp in self.settings["employees"]:
+            if emp["id"] == "emp_ds4":
+                emp["name"] = "DeepSeek-V4 (DS4)"
+            if emp["id"] == "emp_hy4":
+                emp["name"] = "混元-4 (HY4)"
+        parsed = T.parse_collab(
+            "/collab @agy 你是主创，针对 E01 的问题写出阶段二的内容，"
+            "@DeepSeek-V4 (DS4) @混元-4 (HY4) 负责审核",
+            self.settings,
+        )
+        self.assertTrue(parsed["ok"], parsed["error"])
+        self.assertEqual(parsed["owner_id"], "emp_agy")
+        self.assertEqual(parsed["reviewer_ids"], ["emp_ds4", "emp_hy4"])
+        self.assertIn("针对 E01 的问题写出阶段二的内容", parsed["goal"])
+
+    def test_mentions_are_case_insensitive(self):
+        parsed = T.parse_collab("/collab @AGY @ds4 写方案", self.settings)
+        self.assertTrue(parsed["ok"], parsed["error"])
+        self.assertEqual(parsed["owner_id"], "emp_agy")
+        self.assertEqual(parsed["reviewer_ids"], ["emp_ds4"])
+
+    def test_first_mention_wins_for_single_task(self):
+        # 一条消息里点了三个人时，执行的是第一个 @ 的人，而不是名字最长的那个
+        self.assertEqual(
+            T.parse_single("@agy 你做攻略，@DS4 选酒店，@HY4 查票", self.settings),
+            "emp_agy",
+        )
+
+    def test_email_and_path_are_not_mentions(self):
+        self.assertIsNone(T.parse_single("把结果发到 a@b.com 就行", self.settings))
+        self.assertIsNone(T.parse_single("看下 src/app.js 的写法", self.settings))
+
 
 class TestTaskCreation(TaskCase):
     def test_single_task_structure(self):
@@ -279,6 +358,21 @@ class TestTaskCreation(TaskCase):
         self.assertIn("sent_prompt", result_msg)
         self.assertIn("raw_response", result_msg)
         self.manager.wait_idle()
+
+    def test_collab_with_spread_mentions_creates_card_with_reviewers(self):
+        # 用户原话：主创点在前，审核的人写在句子后半段
+        self.manager.auto_start = False
+        result = self._submit("/collab @agy 你是主创，写阶段二，@DS4 @HY4 负责审核")
+        self.assertIn("task_id", result, result)
+        session = self.store.get_session("s1")
+        task = session["tasks"][result["task_id"]]
+        self.assertEqual(task["type"], T.TYPE_COLLAB)
+        self.assertEqual(task["owner_id"], "emp_agy")
+        self.assertEqual([i["member_id"] for i in task["part_b"]], ["emp_ds4", "emp_hy4"])
+        self.assertIn("写阶段二", task["goal"])
+        cards = [m for m in session["messages"] if m.get("kind") == "task_card"]
+        self.assertEqual(len(cards), 1)
+        self.assertEqual(cards[0]["task_id"], result["task_id"])
 
     def test_no_mention_is_context_only(self):
         result = self._submit("大家先看看这段背景")
@@ -571,7 +665,7 @@ class TestCancelRetry(TaskCase):
         self.manager.wait_idle()
 
     def test_retry_review_only_updates_that_member(self):
-        # 审核失败 → 重试该成员：只更新这一位，不重做交付
+        # 审核失败 → 重试该成员：只重跑这一位；两位审核都出结论后自动补一次交付
         self.runner.fail_for = [":review:emp_ds4"]
         result = self._submit("/collab @agy @DS4 @HY4 写方案")
         self._wait(result["task_id"])
@@ -581,7 +675,8 @@ class TestCancelRetry(TaskCase):
         retry = self.manager.retry("s1", result["task_id"], T.STAGE_REVIEW, "emp_ds4")
         self.assertTrue(retry["ok"])
         # 重试必须真的跑起来（旧实现里重试线程会等自己空闲，永久卡住）
-        deadline = time.time() + 6
+        deadline = time.time() + 8
+        reviews = 0
         while time.time() < deadline:
             with self.runner.lock:
                 reviews = len([c for c in self.runner.calls
@@ -589,18 +684,159 @@ class TestCancelRetry(TaskCase):
             if reviews >= 2:
                 break
             time.sleep(0.02)
-        with self.runner.lock:
-            after_deliver = len([c for c in self.runner.calls if ":deliver:" in c["key"]])
-            reviews = len([c for c in self.runner.calls if ":review:emp_ds4" in c["key"]])
+        self.manager.wait_idle()
         self.assertEqual(reviews, 2)
-        self.assertEqual(after_deliver, before_deliver)  # 不自动重做交付
+        with self.runner.lock:
+            self.assertEqual(
+                len([c for c in self.runner.calls if ":deliver:" in c["key"]]),
+                before_deliver + 1,
+            )
         task = self._task(result["task_id"])
         self.assertEqual(task["status"], T.STATUS_DELIVERED)
         self.assertEqual(
             next(i["status"] for i in task["part_b"] if i["member_id"] == "emp_ds4"),
             T.STATUS_DONE,
         )
+        # 这一次交付是系统补的：卡片要能标出「审核补全后重新生成」
+        self.assertEqual(task.get("deliver_source"), "review_auto")
+        self.assertFalse(task.get("deliver_stale"))
+
+    def test_redo_exec_on_delivered_collab_restarts_round(self):
+        # 已交付后点执行段的「重新执行」：整轮重来（执行 → 审核 → 交付），不新增任务
+        result = self._submit("/collab @agy @DS4 @HY4 写方案")
+        self._wait(result["task_id"])
+
+        def count(part):
+            with self.runner.lock:
+                return len([c for c in self.runner.calls if f":{part}:" in c["key"]])
+
+        before = {p: count(p) for p in ("exec", "review", "deliver")}
+        retry = self.manager.retry("s1", result["task_id"], T.STAGE_EXEC)
+        self.assertTrue(retry["ok"])
+        task = self._wait(result["task_id"])
         self.manager.wait_idle()
+        after = {p: count(p) for p in ("exec", "review", "deliver")}
+        self.assertEqual(after["exec"], before["exec"] + 1)
+        self.assertEqual(after["review"], before["review"] + 2)
+        self.assertEqual(after["deliver"], before["deliver"] + 1)
+        self.assertEqual(task["status"], T.STATUS_DELIVERED)
+        self.assertTrue(all(i["status"] == T.STATUS_DONE for i in task["part_b"]))
+        # 已经成功过的环节重跑，流水里写「重新生成」而不是「重试」
+        flow = [f["text"] for f in task["flow"]]
+        self.assertIn("重新生成执行", flow)
+        self.assertEqual(len(self.store.get_session("s1")["tasks"]), 1)
+
+    def test_redo_review_on_delivered_collab_auto_regenerates_delivery(self):
+        # 已交付后点某位审核的「重新审核」：只重跑这一位；全部审核有结论后自动补一次交付，
+        # 并把这版终稿标成「审核补全后重新生成」（用户认可这个行为，但要看得出来源）
+        result = self._submit("/collab @agy @DS4 @HY4 写方案")
+        self._wait(result["task_id"])
+
+        def count_review():
+            with self.runner.lock:
+                return len([c for c in self.runner.calls if ":review:emp_ds4" in c["key"]])
+
+        def count_deliver():
+            with self.runner.lock:
+                return len([c for c in self.runner.calls if ":deliver:" in c["key"]])
+
+        before_review, before_deliver = count_review(), count_deliver()
+        retry = self.manager.retry("s1", result["task_id"], T.STAGE_REVIEW, "emp_ds4")
+        self.assertTrue(retry["ok"])
+        # 刚点下去：卡片回到「审核中」，旧意见被清掉；终稿内容保留不动
+        task = self._task(result["task_id"])
+        self.assertEqual(task["status"], T.STATUS_RUNNING)
+        self.assertEqual(task["part_a"]["final_status"], T.STATUS_DONE)
+        self.assertFalse(task.get("deliver_stale"))
+        self.assertEqual(
+            next(i["status"] for i in task["part_b"] if i["member_id"] == "emp_ds4"),
+            T.MEMBER_WAITING,
+        )
+        self._wait(result["task_id"])
+        self.manager.wait_idle()
+        self.assertEqual(count_review(), before_review + 1)
+        # 用户没点交付，但所有审核都出了结论 → 系统自动补一次，且只补一次
+        self.assertEqual(count_deliver(), before_deliver + 1)
+        task = self._task(result["task_id"])
+        self.assertEqual(task["status"], T.STATUS_DELIVERED)
+        self.assertEqual(task["part_a"]["final_status"], T.STATUS_DONE)
+        # 重出成功后过期标记解除；流水里能看出这次是自动补的
+        self.assertFalse(task.get("deliver_stale"))
+        self.assertEqual(task.get("deliver_source"), "review_auto")
+        self.assertEqual(task["part_a"].get("final_source"), "review_auto")
+        self.assertTrue(task.get("deliver_source_at"))
+        self.assertEqual(task.get("auto_deliver_generation"), task.get("review_generation"))
+        flow = [f["text"] for f in task["flow"]]
+        self.assertIn("全部审核已出结论，自动补一次交付", flow)
+        self.assertTrue(any("系统自动补一次交付" in x for x in flow))
+        # 前端拿到的是同一份标记
+        card = T.build_card(task)
+        self.assertEqual(card["deliver_source"], "review_auto")
+        self.assertTrue(card["created_at"])
+
+    def test_two_review_retries_supplement_delivery_only_once(self):
+        # 两位审核一起重跑：结论齐了只自动补一次交付，不能重出两份终稿
+        result = self._submit("/collab @agy @DS4 @HY4 写方案")
+        self._wait(result["task_id"])
+        with self.runner.lock:
+            before = len([c for c in self.runner.calls if ":deliver:" in c["key"]])
+        self.assertTrue(self.manager.retry("s1", result["task_id"], T.STAGE_REVIEW, "emp_ds4")["ok"])
+        self.assertTrue(self.manager.retry("s1", result["task_id"], T.STAGE_REVIEW, "emp_hy4")["ok"])
+        self._wait_retries()
+        with self.runner.lock:
+            after = len([c for c in self.runner.calls if ":deliver:" in c["key"]])
+        self.assertEqual(after, before + 1)
+        task = self._task(result["task_id"])
+        self.assertEqual(task["review_generation"], 2)
+        self.assertEqual(task["auto_deliver_generation"], 2)
+        self.assertEqual(task["deliver_source"], "review_auto")
+        self.assertFalse(task.get("deliver_stale"))
+        self.assertFalse(task.get("auto_deliver_inflight"))
+
+    def test_failed_retry_review_does_not_supplement_delivery(self):
+        # 审核还是失败 = 没结论：不自动补交付，也不会把上一版终稿误标成自动重出
+        result = self._submit("/collab @agy @DS4 @HY4 写方案")
+        self._wait(result["task_id"])
+        with self.runner.lock:
+            before = len([c for c in self.runner.calls if ":deliver:" in c["key"]])
+        self.runner.fail_for = [":review:emp_ds4"]
+        self.manager.retry("s1", result["task_id"], T.STAGE_REVIEW, "emp_ds4")
+        self._wait_retries()
+        with self.runner.lock:
+            self.assertEqual(
+                len([c for c in self.runner.calls if ":deliver:" in c["key"]]), before
+            )
+        task = self._task(result["task_id"])
+        self.assertEqual(
+            next(i["status"] for i in task["part_b"] if i["member_id"] == "emp_ds4"),
+            T.STATUS_FAILED,
+        )
+        self.assertNotEqual(task.get("deliver_source"), "review_auto")
+        self.assertNotEqual(task.get("auto_deliver_generation"), task.get("review_generation"))
+
+    def test_manual_regeneration_replaces_auto_badge(self):
+        # 自动补全之后再手点「重新生成交付」：来源回到手动，卡片不再挂自动标签
+        result = self._submit("/collab @agy @DS4 @HY4 写方案")
+        self._wait(result["task_id"])
+        self.manager.retry("s1", result["task_id"], T.STAGE_REVIEW, "emp_ds4")
+        self._wait_retries()
+        self.assertEqual(self._task(result["task_id"])["deliver_source"], "review_auto")
+        self.manager.retry("s1", result["task_id"], T.STAGE_DELIVER)
+        self._wait_retries()
+        task = self._task(result["task_id"])
+        self.assertEqual(task["deliver_source"], "manual")
+        self.assertEqual(task["part_a"]["final_source"], "manual")
+
+    def test_new_task_card_exposes_creation_time(self):
+        # 之后创建的任务：卡片数据里带 created_at，前端头部直接显示
+        result = self._submit("/collab @agy @DS4 @HY4 写方案")
+        self._wait(result["task_id"])
+        session = self.store.get_session("s1")
+        card_msg = next(m for m in session["messages"] if m.get("kind") == "task_card")
+        self.assertTrue(card_msg["card"]["created_at"])
+        self.assertEqual(
+            card_msg["card"]["created_at"], self._task(result["task_id"])["created_at"]
+        )
 
     def test_history_records_preserved_after_retry(self):
         # 取消 / 重试产生新记录，旧记录保留且完整输入 / 原始输出可查
@@ -684,6 +920,34 @@ class TestRecoveryAndProtocol(TaskCase):
         parsed = T.parse_output("一段没有 JSON 的纯文本")
         self.assertEqual(parsed["summary"], "一段没有 JSON 的纯文本")
         self.assertEqual(parsed["artifacts"], [])
+
+    def test_body_plus_artifact_block_keeps_body_only(self):
+        # 协议要求「正文 + 末尾登记块」：聊天里只该看到正文，登记块被摘掉
+        text = (
+            "做完了：把三段合并成一份方案。\n\n"
+            "```json\n"
+            '{"artifacts": [{"path": "docs/plan.md", "summary": "方案", "bytes": 120}],'
+            ' "changes": "采纳了 DS4 的拆分建议"}\n'
+            "```"
+        )
+        parsed = T.parse_output(text)
+        self.assertEqual(parsed["summary"], "做完了：把三段合并成一份方案。")
+        self.assertNotIn("```", parsed["summary"])
+        self.assertNotIn('"artifacts"', parsed["summary"])
+        self.assertEqual(parsed["artifacts"][0]["path"], "docs/plan.md")
+        self.assertEqual(parsed["artifacts"][0]["bytes"], 120)
+        self.assertEqual(parsed["changes"], "采纳了 DS4 的拆分建议")
+
+    def test_whole_json_without_summary_is_still_readable(self):
+        # 模型只回了一份没有 summary 的结构：也不能把花括号原样丢进聊天气泡
+        parsed = T.parse_output('{"title": "阶段二内容", "artifacts": []}')
+        self.assertEqual(parsed["summary"], "title：阶段二内容")
+        self.assertFalse(parsed["summary"].strip().startswith("{"))
+
+    def test_markdown_fence_with_prose_inside_is_parsed(self):
+        text = '正文两行\n```\n{"summary": "围栏里的旧写法", "artifacts": []}\n```'
+        parsed = T.parse_output(text)
+        self.assertEqual(parsed["summary"], "正文两行")
 
 
 class TestRegressions(TaskCase):
@@ -986,6 +1250,44 @@ class TestBusinessInvariants(TaskCase):
         self.assertEqual(self._wait(result["task_id"])["status"], T.STATUS_DELIVERED)
         self.manager.wait_idle()
 
+    def test_prompt_is_readable_while_stage_is_running(self):
+        # 环节进行中点开「查看输入 / 原始输出」时应当已经能看到本轮 Prompt：
+        # 早期实现要等执行结束才写，进行中查到的是空，UI 只能显示「未留存」
+        self.manager.auto_start = False
+        result = self._submit("/collab @agy @DS4 写方案")
+        tid = result["task_id"]
+        exec_key = T.execution_key("s1", tid, T.STAGE_EXEC, "emp_agy")
+        review_key = T.execution_key("s1", tid, T.STAGE_REVIEW, "emp_ds4")
+        gate = threading.Event()
+        self.runner.gates[exec_key] = gate
+
+        self.manager.ensure_worker("s1", "emp_agy")
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            if self._task(tid)["part_a"]["status"] == T.MEMBER_IN_PROGRESS:
+                break
+            time.sleep(0.02)
+        task = self._task(tid)
+        self.assertEqual(task["part_a"]["status"], T.MEMBER_IN_PROGRESS)
+        self.assertIn("写方案", task["part_a"]["sent_prompt"])
+        self.assertTrue(task["part_a"]["msg_id"], "进行中也应指向本轮执行记录")
+
+        # 主创放行前先给审核换一个新闸门：同一个 Event 一旦 set，后面就不会再拦住
+        review_gate = threading.Event()
+        self.runner.gates[review_key] = review_gate
+        gate.set()
+        deadline = time.time() + 6
+        while time.time() < deadline:
+            item = (self._task(tid).get("part_b") or [{}])[0]
+            if item.get("status") == T.MEMBER_IN_PROGRESS:
+                break
+            time.sleep(0.02)
+        item = (self._task(tid).get("part_b") or [{}])[0]
+        self.assertEqual(item.get("status"), T.MEMBER_IN_PROGRESS)
+        self.assertTrue(item.get("sent_prompt"), "审核进行中也应能看到本轮 Prompt")
+        review_gate.set()
+        self.manager.wait_idle()
+
     def test_rerun_exec_failure_does_not_keep_previous_round(self):
         # 首轮主创成功、交付失败 → 任务 failed；再重跑执行且这轮执行也失败
         self.runner.fail_for = [":deliver:"]
@@ -1010,9 +1312,11 @@ class TestBusinessInvariants(TaskCase):
         task = self._task(result["task_id"])
         self.assertEqual(task["status"], T.STATUS_FAILED)
         self.assertEqual(task["part_a"]["status"], T.STATUS_FAILED)
-        # 这一轮什么都没产出，就不该继续展示上一轮的简报、产物与审核意见
-        for field in ("brief", "sent_prompt", "raw_output"):
+        # 这一轮什么都没产出，就不该继续展示上一轮的简报与原始输出；
+        # Prompt 例外：本轮请求确实发出去了，留着才查得出「到底让它做了什么」
+        for field in ("brief", "raw_output"):
             self.assertEqual(task["part_a"][field], "", field)
+        self.assertTrue(task["part_a"]["sent_prompt"], "失败的一轮也应保留本轮 Prompt")
         self.assertEqual(task["part_a"]["artifacts"], [])
         self.assertEqual(task["artifacts"], [])
         self.assertTrue(all(i["status"] == T.MEMBER_WAITING for i in task["part_b"]))
@@ -1070,16 +1374,33 @@ class TestBusinessInvariants(TaskCase):
                 break
             time.sleep(0.02)
 
-        # 已交付任务：取消必须被拒（终态不可逆），重新生成交付内容应放行
+        # 已交付任务：取消必须被拒（终态不可逆），但「重新生成」要放行——重跑同一条任务
         cancelled = self.client.post(
             f"/api/sessions/{sid}/tasks/{tid}/cancel", json={"stage": "exec"}
         )
         self.assertEqual(cancelled.status_code, 409)
         self.assertEqual(cancelled.get_json().get("code"), "task_finished")
+        runner = self.fake_manager.runner  # 接口测试里的执行器挂在注入给 app 的 manager 上
+        with runner.lock:
+            before = len([c for c in runner.calls if ":exec:" in c["key"]])
         retried = self.client.post(
             f"/api/sessions/{sid}/tasks/{tid}/retry", json={"stage": "exec"}
         )
-        self.assertEqual(retried.status_code, 400)
+        self.assertEqual(retried.status_code, 200)
+        self.assertTrue(retried.get_json().get("ok"))
+        # 重新生成跑的是同一个任务、同一条消息，不新增任务
+        deadline = time.time() + 6
+        execs = before
+        while time.time() < deadline:
+            with runner.lock:
+                execs = len([c for c in runner.calls if ":exec:" in c["key"]])
+            current = self.client.get(f"/api/sessions/{sid}").get_json()
+            if execs == before + 1 and current["tasks"][tid]["status"] == T.STATUS_DELIVERED:
+                break
+            time.sleep(0.02)
+        self.assertEqual(execs, before + 1)
+        self.assertEqual(len(current["tasks"]), 1)
+        self.assertEqual(len([m for m in current["messages"] if m.get("kind") == "task_result"]), 1)
 
 
 if __name__ == "__main__":

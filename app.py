@@ -4,8 +4,9 @@ import subprocess
 import threading
 import time
 import re
+import mimetypes
 from typing import List, Optional
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify, send_from_directory, send_file
 
 from core.storage import (
     load_settings, save_settings,
@@ -310,6 +311,41 @@ def api_delete_session(session_id):
     success = delete_session(session_id)
     return jsonify({"success": success})
 
+
+@app.route("/api/sessions/<session_id>/messages/<msg_id>", methods=["DELETE"])
+def api_delete_message(session_id, msg_id):
+    """从会话里删掉一条消息（聊天里右键 X 就调这里）。
+
+    上下文（build_context）直接从 messages 里取，物理删掉即彻底不装载：
+    之后发起的任务不会再把这条内容带进 Prompt。正在执行的任务不受影响，
+    进程继续跑、产物照旧落盘，只是这条消息不再出现在对话里。
+    """
+    if not is_valid_session_id(session_id):
+        return jsonify({"error": "非法 session_id"}), 400
+    if not msg_id or len(msg_id) > 80:
+        return jsonify({"error": "非法消息 id"}), 400
+
+    try:
+        with session_lock(session_id):
+            session = get_session(session_id)
+            if not session:
+                return jsonify({"error": "会话不存在"}), 404
+
+            messages = session.get("messages") or []
+            remain = [
+                m for m in messages
+                if not (isinstance(m, dict) and m.get("id") == msg_id)
+            ]
+            if len(remain) == len(messages):
+                return jsonify({"error": "消息不存在"}), 404
+
+            session["messages"] = remain
+            save_session(session)
+    except SessionDeletedError:
+        return jsonify({"error": "会话已删除"}), 404
+
+    return jsonify({"success": True, "remaining": len(remain)})
+
 # ----------------- Workspace Explorer & Folder Picker API -----------------
 @app.route("/api/browse_dirs", methods=["GET"])
 def api_browse_dirs():
@@ -383,16 +419,45 @@ def api_workspace_file_content():
     fpath = request.args.get("path", "").strip()
     if not fpath or not is_path_safe(fpath) or not os.path.exists(fpath) or not os.path.isfile(fpath):
         return jsonify({"error": "文件不存在或无权访问"}), 404
-    
-    if os.path.getsize(fpath) > 500 * 1024:
-        return jsonify({"content": "【文件过大 (>500KB)，不支持在线快速预览】", "path": fpath})
-    
+
+    size = os.path.getsize(fpath)
+    name = os.path.basename(fpath)
+    if size > 500 * 1024:
+        # 明确告诉前端「为什么没有内容」，别让它把提示语当成文件正文渲染
+        return jsonify({
+            "content": "", "path": fpath, "name": name, "size": size,
+            "too_large": True,
+            "error": "文件过大（>500KB），暂不支持在线预览",
+        })
+
     try:
         with open(fpath, "r", encoding="utf-8", errors="replace") as f:
             content = f.read()
-        return jsonify({"content": content, "path": fpath, "name": os.path.basename(fpath)})
+        return jsonify({"content": content, "path": fpath, "name": name, "size": size})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+# 预览弹窗里能直接看图：只放行图片类型，避免这个接口变成任意文件下载器
+PREVIEW_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg", ".ico"}
+PREVIEW_IMAGE_MAX = 20 * 1024 * 1024
+
+
+@app.route("/api/workspace/raw", methods=["GET"])
+def api_workspace_file_raw():
+    fpath = request.args.get("path", "").strip()
+    if not fpath or not is_path_safe(fpath) or not os.path.exists(fpath) or not os.path.isfile(fpath):
+        return jsonify({"error": "文件不存在或无权访问"}), 404
+    ext = os.path.splitext(fpath)[1].lower()
+    if ext not in PREVIEW_IMAGE_EXTS:
+        return jsonify({"error": "该类型不支持直接预览"}), 415
+    if os.path.getsize(fpath) > PREVIEW_IMAGE_MAX:
+        return jsonify({"error": "图片过大（>20MB），暂不支持在线预览"}), 413
+    mime = mimetypes.guess_type(fpath)[0] or "application/octet-stream"
+    if ext == ".svg":
+        # 用 <img> 加载时脚本不会执行；这里再显式声明，避免被当成 HTML 打开
+        mime = "image/svg+xml"
+    return send_file(fpath, mimetype=mime, max_age=0)
 
 # ----------------- Meeting Controls API -----------------
 @app.route("/api/sessions/<session_id>/message", methods=["POST"])
