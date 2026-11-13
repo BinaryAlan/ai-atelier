@@ -661,3 +661,146 @@ agy（单任务）结果消息头部的耗时此前两种显示不一致：运�
 - 验证：无头浏览器实测 `pageHasLabel=false`、`msgHasAutoTo=true`（数据在、提示不在）；
   预览面板按钮列表里 `hasRefresh=false`、`hasLive=false`，编辑/全屏/复制路径仍在。
   i18n 331 条、未收录 0；资源版本 `?v=20261112r12`。
+
+## A74 · 中断续跑：重试 / 新指令都能拿到「上次做到哪」
+
+- 问题：成员每次执行都是新的 CLI 进程（不传 `--session-id` / `--resume`），
+  模型内部的思路、读过的文件全都不留；失败时连已经输出的正文也一起丢了
+  （`streaming.clear()` 清暂存区，聊天里只剩一句「CLI 执行报错」）。
+  结果就是「点重试」≈ 从头再来一遍，用户还得自己提醒「接着上次的写」。
+- 修法（`core/tasks.py`，提示层，不动进程模型）：
+  - 执行结束若落在「失败 / 超时 / 已取消」，把两样物证写进 `task["interrupt"]`：
+    中断前的半成品正文（流式暂存区最后一个快照，截 4000 字）+
+    那次执行期间被改动过的文件（`scan_recent_files()`：跳过依赖/缓存目录、
+    最多 4000 条目 / 6 层深、按 mtime 倒序取 20 个）。
+  - `render_resume()` 生成交接条，`build_prompt(resume=…)` 把它排在【用户原话】之后：
+    同一环节重试 → 【上次中断的进度】+【续跑要求】（先读已有文件、写完的不要重做、
+    要重写就说明理由）；**换了新指令** → 【上一条任务留下的半成品】，只给文件线索
+    不给旧正文（`recent_interrupt()`，限同一位成员、2 小时内），并注明「与本条无关就忽略」。
+  - 半成品正文同时挂到执行记录 `raw_response` 前面，「输入输出」里仍能看到中断前写到哪。
+  - 成功跑完则清掉 `interrupt`，避免下次重试误以为没跑成。
+- 验证：新增 8 项测试（交接条渲染、失败/取消落库、重试 Prompt 带续跑要求、
+  新指令只拿文件线索、成功即清空、换人/超 2 小时不打扰）；全量 `Ran 159 tests — OK`，
+  连跑 8 轮全绿。真机：给成员 6 秒超时让 codebuddy 跑到一半被打断 →
+  交接条记下那句英文自述与 `book.md`，放开超时点重试，第二轮 Prompt 里
+  `【上次中断的进度】` 与 `【续跑要求】` 都在，任务一次交付成功。
+- 已知边界：这是「物证交接」，不是真正的上下文续跑——模型没读过的东西它仍然不知道；
+  需要连思考链路一起续上的话，得接 CLI 原生 `--resume`（codebuddy `-r/--resume`、
+  agy `--continue`），当前未实现。
+
+## A75 · 一条消息 @ 多位：并行分工，每位各出一份
+
+- 问题：普通消息 `parse_single()` 只取第一个 `@`，`@a @b @c 各写一份去北京的攻略`
+  只有 a 收到任务，b、c 静默无感，界面也没有任何提示。`/collab` 顶不上——
+  它是「一位主创 + 其余审核」，产出一份终稿，语义正好相反。
+- 修法：
+  - `parse_fanout()`：普通消息（非 `/collab`、非引用回复）里 @ 到 ≥2 位可用成员时，
+    为每位各建一条单任务，共享 `source_msg_id` 与同一条用户原话，用 `fanout_id` 归组。
+    重复 @ 同一人自动去重；有人已停用 / 缺 CLI 配置则整条消息拦截（少发一份比发错更难发现）。
+  - 渲染不动：单任务本来就是「一条任务 → 一条回答气泡」，三条任务天然是三条并列回答，
+    各自带取消 / 重试 / 重新生成。不同成员各走自己的队列，所以并行且互不牵连。
+  - 产物冲突：三人同处一个工作目录，Prompt 里加【并行分工】段，要求文件名以自己的前缀开头
+    （`agy-攻略.md`、`DS4-攻略.md`）；前缀取括号里的短名（`DeepSeek-V4 (DS4)` → `DS4`），
+    并写明同批还有谁，避免模型自我发挥。
+  - 互相可见：兄弟任务彼此看不到对方的答案（避免趋同与被最慢那位拖成串行）。
+  - 输入框预览：新增 `POST /api/mentions/scan`，前端 250ms 防抖后显示
+    「将分别发给 A、B、C：各自独立作答，互不参考」。谁被 @ 到一律由服务端判定
+    （支持别名、`@//agy/`、散落在句子里），不在前端另写一套匹配。
+- 验证：新增 8 项测试（三条任务/三条气泡、各自 Prompt 前缀、单 @ 不变、重复 @ 去重、
+  停用成员拦截、一位失败不影响兄弟且重试只重跑它、`/collab` 不受影响、前缀规则）；
+  全量 `Ran 167 tests — OK`。真机三成员并行（agy / DeepSeek-V4 / 混元-4）：
+  3 条任务同 `fanout_id`、3 条回答气泡、全部 delivered，各自 Prompt 都带【并行分工】。
+  无头浏览器：`@agy @DS4 @HY4 …` 时提示条渲染出三位成员名，单 @ 与 `/collab` 均不出现。
+
+## A76 · 修掉 `./run.sh restart` 必然超时：继任进程不再继承父进程 stdio
+
+- 现象：执行 `./run.sh restart` 稳定卡满 30 秒后报「没等到新进程接管端口」，
+  且此后端口 5050 无人监听 —— 不是「重启慢」，是**新进程根本没起来**。
+- 根因（实测坐实）：`_spawn_successor()` 用 `subprocess.Popen` 拉起继任进程时没指定
+  stdio，于是它继承了父进程的 stdin/stdout/stderr。父进程随即 `os._exit(0)`，
+  那根管道 / 伪终端的**读端跟着消失**；继任进程写第一个 `print()`（启动横幅）
+  就拿到 EPIPE/EIO，Python 退出时还要 flush 一次 stdio，失败即连退出码一起变成 120。
+  旧进程已经走了、新进程又秒退，端口自然空了。
+  验证：把 `app.py` 作为子进程、stdout 接到读端已关闭的管道 → 存活 False、退出码 120、
+  端口从未监听；同样子进程 stdout 指向文件 → 正常退出。
+  （这也解释了为什么「从启动它的那个终端里 restart」有时能成，而在后台管理器/工具会话里必挂。）
+- 修法：
+  - `_spawn_successor()` 显式给继任进程 `stdin=DEVNULL`、`stdout/stderr` 指向
+    `.run/service.log`（`start_new_session` 不变）。继任进程从此与父进程的终端脱钩，
+    父进程怎么死的都不影响它。
+  - `_SPAWN_WAIT_CODE` 补日志：接管开始、等旧进程超 60 秒放弃、execv 失败各写一行；
+    日志超 2MB 轮转一代（`service.log.1`）。
+  - 继任实例启动时自己刷新 `.run/app.pid`，避免从 Web 界面触发重启后 PID 文件过期。
+  - `/api/system/restart` 的响应带上 `log_file`；`./run.sh restart` 成功后直接打印日志路径，
+    失败时自动 tail 日志最后 20 行——以前超时只给一句「看看终端有没有报错」，等于没说。
+  - 新增 `./run.sh logs` 跟踪日志。
+- 代价：restart 之后新实例的请求日志不再打在终端，而去 `.run/service.log`。
+  想在终端看日志就 `./run.sh stop && ./run.sh start`。
+- 验证：连续 `./run.sh restart` 三次全部成功（PID 24584 → 24696 → 24785 → 24829），
+  日志里能看到「旧进程 pid=… 拉起继任实例」与完整启动横幅；新增
+  `tests/test_service_restart.py` 7 项（stdio 不继承、日志标记、非 py 入口拒绝、
+  轮转、死管道必死对照实验、接口鉴权与日志路径），全量 `Ran 174 tests — OK`。
+
+## A77 · 模型选择改为「基础模型 + 推理档位」，扫描覆盖本机所有已装 AI CLI
+
+- 现象：成员管理里「本地已安装的模型」只扫 `agy` / `codebuddy` / `opencode` 三个写死的分支；
+  本机已装的 `claude` / `codex` / `cursor-agent` 完全不出现。`agy models` 里的
+  `gemini-3.8-flash-{low,medium,high}` 被当成三个不同模型摆在下拉里；编辑成员时
+  看不出已绑定的模型；模型列表常驻展开占满弹窗；会话成员行右侧的「移出」按钮可误点。
+- 修法：
+  - 新建 `core/cli_registry.py`：常用大模型 CLI 的注册表（名称、模型枚举命令、解析方式、
+    执行模板、推理档位落法、写权限开关、凭据环境变量）。`scanner.py` 遍历注册表，
+    只纳入 `shutil.which()` 找得到的 CLI；`executor.py` 的白名单 / `_WRITE_FLAGS` /
+    环境白名单同步由注册表生成，杜绝「能选不能跑」。
+  - 推理程度统一低 / 中 / 高、默认高：agy 有 `-low/-medium/-high` 变体时用真实变体 ID，
+    否则用 `--effort`；codebuddy 用 `--effort`；codex 用 `-c model_reasoning_effort=`；
+    opencode 用 `--model <id>#<variant>`；claude / cursor-agent 无此参数，只给「默认」单档。
+    每个档位自带完整 `cli_cmd`，前端不拼命令。
+  - `opencode` 只保留自家 provider（`opencode` / `opencode-go`），过滤 github-copilot / gitlab。
+  - 成员配置新增 `model_key` / `reasoning`（`_sanitize_agent` 白名单保留）；会话新增
+    `member_models[emp_id]` 覆盖表（`_clean_member_models` 校验），
+    `TaskManager._settings_for_session()` 在 `_run_task` 与 `_retry_worker` 两条执行路径上
+    替换 cli_cmd，全局设置不受影响。
+  - 前端：模型选择器默认收起、点击才展开，浮层用 `<Teleport to="body">` + fixed 定位避免被弹窗
+    `overflow-y-auto` 裁剪；触发器回显「模型 · 推理: 高」；选模型后展示该模型档位按钮。
+    设置菜单把「成员管理」挪到第一位。会话成员行改为点开选档位（仅当前会话），
+    去掉「移出」，成员增删走下方「调整 / 增减成员」。
+  - `data/settings.json` 五个既有角色统一改为高推理：agy → `gemini-3.8-flash-high`，
+    其余 codebuddy 角色补 `--effort high`，人设 prompt 与权限不变。
+  - `Executor._run_cli` 的 Popen 补 `stdin=DEVNULL`：prompt 全走 argv，避免 codex 等 CLI
+    等 stdin 输入。缓存结构版本升到 3，旧缓存自动重扫。
+- 验证：全量 `Ran 184 tests — OK`（新增 8 项：档位聚合、agy 回退、opencode provider 过滤、
+  遍历已装 CLI、各 CLI 模板合法、会话覆盖与安全拦截、会话 API 校验、内置角色配置）；
+  `/api/scan_models?refresh=1` 返回 80 条 / 6 个 CLI（agy 4、codebuddy 19、opencode 44、
+  claude 4、codex 6、cursor-agent 3），无 github/gitlab；会话 override 的 PUT / GET、
+  非法命令 400、普通字段保存不清覆盖均通过；Vue 两段新模板编译通过，搜索 / 免费过滤 /
+  编辑回显 / 档位选择 / 会话覆盖请求体逐项跑通；opencode 端到端仍返回 `OK`。
+- 已知限制（本机环境，非代码问题）：claude 报 API 404、cursor-agent 未登录、
+  codex 的 `~/.codex/config.toml` 里 `gpt-6.1-sol` 被 ChatGPT 账户拒绝；三者命令参数均已
+  被 CLI 正确解析，需在各自 CLI 登录或换用账户支持的模型后才能实际产出。
+
+## A78 · 成员名带空格：补齐 @ 候选与 Backspace 整删
+
+- 现象：把 `emp_agy` 的 `name` 从 `agy` 改成 `gemini 3.8` 后，服务端解析与任务执行都正常 ——
+  `_alias_pattern` 把空格当「可有可无的分隔符」，`submit_message` 按 `owner_id` 派发，
+  `cli_cmd` 里是 model_id，名字只做展示。隔离夹具实测 `@gemini 3.8 只回复OK` →
+  `owner_id=emp_agy`、`status=delivered`、argv 里完全没有名字。
+  但前端两处仍沿用「名字是单 token」的旧假设：
+  ① `onInputSuggest` 的 `([@/][^\s@/]*)$` 让候选在手打到 `@gemini 3` 时关闭，
+     `/collab` 后 implicit 候选的 `!/[\s@/]/` 同理；
+  ② `onInputKeydown` 的 `/@([^\s@]+)\s?$/` 让 `@gemini 3.8 ` 无法整删，退化成逐字删。
+  这不是改名才引入的问题：模型下拉自动填的 `Gemini 3.8 Flash` 本来就带空格。
+- 修法（`static/js/app.js`）：
+  - 新增 `spacedMentionToken()`：单 token 正则失配时，只在「@ 后面仍是某位会话成员
+    名字 / id 的前缀」时续开候选；写完正文、打错字、`a@b` / 路径一律照旧关闭。
+  - implicit 分支同样改用「名字 / id 前缀」判断，不再依赖「不含空白」。
+  - 新增 `spacedMentionTag()`：Backspace 在单 token 正则之外，只认「@ 后面恰好是完整的
+    成员名 / id / 括号短名（可带一个尾空格）」。刻意不放宽成 `@[^@]+`，否则
+    `@gemini 3.8 请写代码` 会被一次删掉整句话。
+  - `static/index.html` 的 `?v=` 升到 `20261113r2`（i18n 无新增文案）。
+- 验证：`node --check static/js/app.js`；Node `vm` 模拟 22 项交互全 PASS（带空格候选、
+  implicit 候选、整删，旧单 token 行为、邮箱 / 路径不弹、正文不误删、
+  候选插入 `@gemini 3.8 `）；全量 `Ran 184 tests — OK`；线上
+  `/static/js/app.js?v=20261113r2` 返回 200 且包含新方法。
+- 边界：`@agy` 仍不匹配（别名随名字变化，现为 `gemini 3.8` / `emp_agy` / 括号短名）。
+  按用户意愿不动别名与配置，需要时自行改名或写成 `gemini 3.8 (agy)`。

@@ -49,6 +49,9 @@ createApp({
       // /collab 的服务端校验结果：{ content, ok, error }；content 用来丢弃过期响应
       collabCheck: null,
       collabCheckTimer: null,
+      // 多 @ 的并行分工预览：{ content, fanout, names, error }，同样按 content 防过期
+      fanoutCheck: null,
+      fanoutCheckTimer: null,
       // 引用回复：{ id, sender, sender_name, content }，发送时把 id 交给后端定向
       replyTarget: null,
       // 长消息展开状态（按消息 id 记，轮询刷新不会把用户展开的又收回去）
@@ -103,9 +106,10 @@ createApp({
       showSettings: false,
       // 设置默认落在「成员管理」：日常最常改的就是这个，界面语言基本一次设完
       settingsTab: "members",
+      // 成员列表是日常最常改的一项，放在菜单第一位
       settingsTabs: [
-        { key: "general", icon: "🎛️", label: "界面语言" },
         { key: "members", icon: "👥", label: "成员管理" },
+        { key: "general", icon: "🎛️", label: "界面语言" },
         { key: "service", icon: "⏻", label: "服务进程" }
       ],
 
@@ -115,6 +119,14 @@ createApp({
       editingEmpIdx: -1,
       selectedModelId: "",
       scannedModels: [],
+      // 模型选择器：默认收起，点击触发器才展开（浮层 Teleport 到 body，
+      // 避免被成员弹窗的 overflow-y-auto 裁掉）
+      modelSearch: "",
+      onlyFreeModels: false,
+      modelDropdownOpen: false,
+      modelDropdownStyle: {},
+      // 会话成员列表里当前展开推理档位的成员 id（同一时刻只展开一个）
+      sessionReasoningEmpId: "",
       editingEmp: {
         id: "",
         name: "",
@@ -122,6 +134,8 @@ createApp({
         avatar_color: "#3b82f6",
         type: "cli",
         cli_cmd: "",
+        model_key: "",
+        reasoning: "",
         system_prompt: "",
         enabled: true,
         timeout: 0,
@@ -190,6 +204,32 @@ createApp({
     };
   },
   computed: {
+    // 本地模型列表：空格分隔的多关键词（如 "opencode 3.8"）全部命中才算匹配，
+    // 关键词可以是模型名、model_id、key 或 CLI 名。
+    filteredScannedModels() {
+      const terms = String(this.modelSearch || "").trim().toLowerCase().split(/\s+/).filter(Boolean);
+      return (this.scannedModels || []).filter(m => {
+        if (this.onlyFreeModels && !m.is_free) return false;
+        if (!terms.length) return true;
+        const hay = `${m.cli || ""} ${m.display_name || ""} ${m.model_id || ""} ${m.key || ""}`.toLowerCase();
+        return terms.every(t => hay.includes(t));
+      });
+    },
+    selectedModelObj() {
+      return (this.scannedModels || []).find(x => this.modelKey(x) === this.selectedModelId) || null;
+    },
+    // 选中模型后才出现的推理档位按钮
+    selectedReasoningLevels() {
+      return this.selectedModelObj ? (this.selectedModelObj.reasoning_levels || []) : [];
+    },
+    selectedModelLabel() {
+      const m = this.selectedModelObj;
+      if (!m) return "";
+      const lv = (m.reasoning_levels || []).find(x => x.id === this.editingEmp.reasoning);
+      const suffix = lv ? ` · ${this.t("推理:")} ${this.t(lv.label)}` : "";
+      return `[${m.cli}] ${m.display_name}${suffix}`;
+    },
+
     // 完整输入按【区块标题】切段：大段材料默认折叠，只留标题和体量提示
     promptSections() {
       const raw = String((this.inspectingMsg && this.inspectingMsg.sent_prompt) || "");
@@ -314,7 +354,7 @@ createApp({
       ];
     },
     inputPlaceholder() {
-      return this.t("输入任务：@ 一位成员，或 /collab @主创 @协助成员 任务内容… (Enter 发送)");
+      return this.t("输入任务：@ 成员（@ 多位则各自独立作答），或 /collab @主创 @协助成员… (Enter 发送)");
     },
     // 协助任务各环节的执行记录不进聊天流（但能在卡片弹窗里查完整输入 / 原始输出）
     visibleMessages() {
@@ -346,6 +386,21 @@ createApp({
       if (!res || res.content !== text) return null;
       if (res.ok) return { ok: true, text: this.t("格式正确：将发起一轮协助任务") };
       return { ok: false, text: this.t(res.error || "格式不正确") };
+    },
+    // 普通消息 @ 了多位：服务端会并行分工（每人一条单任务、各出一份）。
+    // 「谁被 @ 到了」同样交给服务端算：别名、`@//agy/` 这类写法本地重写一遍必然跑偏。
+    fanoutHint() {
+      const text = (this.inputContent || "").trim();
+      if (!text || this.replyTarget) return null;
+      if (/^\/collab(\s|$)/i.test(text)) return null;
+      const res = this.fanoutCheck;
+      if (!res || res.content !== text) return null;
+      if (res.error) return { ok: false, text: this.t(res.error) };
+      if (!res.fanout || !res.names.length) return null;
+      return {
+        ok: true,
+        text: this.t("将分别发给 {names}：各自独立作答，互不参考", { names: res.names.join("、") }),
+      };
     },
     // 卡片弹窗里的「历次执行记录」：取消 / 重试产生的旧记录也保留，可按记录查看完整输入与原始输出
     cardRecords() {
@@ -1124,8 +1179,14 @@ createApp({
     },
 
     handleGlobalClick(e) {
-      if (!e.target.closest(".relative")) {
+      const el = e.target && e.target.closest ? e.target : null;
+      if (!el || !el.closest(".relative")) {
         this.showMemberDropdown = false;
+        this.sessionReasoningEmpId = "";
+      }
+      // 模型浮层被 Teleport 到 body，不在弹窗的 .relative 里：单独判断是否点在外面
+      if (!el || (!el.closest(".model-dropdown") && !el.closest(".model-trigger"))) {
+        this.modelDropdownOpen = false;
       }
     },
 
@@ -1253,10 +1314,71 @@ createApp({
       }[ch]));
     },
 
-    async quickRemoveMember(empId) {
-      if (!this.currentSession || !Array.isArray(this.currentSession.employee_ids)) return;
-      this.currentSession.employee_ids = this.currentSession.employee_ids.filter(id => id !== empId);
-      await this.saveSessionEmployees();
+    // ----------------- 会话成员：会话级推理程度 -----------------
+    toggleSessionReasoning(empId) {
+      this.sessionReasoningEmpId = this.sessionReasoningEmpId === empId ? "" : empId;
+    },
+
+    // 优先用会话覆盖表里的 model_key，老配置则按 cli_cmd 反查（含推理档位）
+    sessionMemberModel(empId) {
+      const ov = ((this.currentSession || {}).member_models || {})[empId];
+      const emp = (this.settings.employees || []).find(e => e.id === empId) || {};
+      let model = null;
+      let reasoning = "";
+      if (ov && ov.model_key) {
+        model = (this.scannedModels || [])
+          .find(m => this.modelKey(m) === ov.model_key) || null;
+        reasoning = ov.reasoning || "";
+      }
+      if (!model) {
+        const hit = this.findModelByCli((ov && ov.cli_cmd) || emp.cli_cmd || "");
+        model = hit ? hit.model : null;
+        reasoning = (hit && hit.level && hit.level.id)
+          || (ov && ov.reasoning) || emp.reasoning || "";
+      }
+      return { model, reasoning, override: !!ov };
+    },
+
+    sessionReasoningLevels(empId) {
+      const info = this.sessionMemberModel(empId);
+      return info.model ? (info.model.reasoning_levels || []) : [];
+    },
+
+    sessionReasoningLabel(empId) {
+      const info = this.sessionMemberModel(empId);
+      const levels = (info.model && info.model.reasoning_levels) || [];
+      const lv = levels.find(x => x.id === info.reasoning);
+      return lv ? lv.label : "";
+    },
+
+    // 只改当前会话：PUT 一条 session.member_models[emp_id]，全局设置不动
+    async setSessionReasoning(empId, lv) {
+      if (!this.currentSession || !lv) return;
+      const info = this.sessionMemberModel(empId);
+      if (!info.model) return;
+      const overrides = Object.assign({}, (this.currentSession.member_models || {}));
+      overrides[empId] = {
+        model_key: this.modelKey(info.model),
+        reasoning: lv.id,
+        cli_cmd: lv.cli_cmd
+      };
+      try {
+        const res = await fetch(`/api/sessions/${this.currentSessionId}`, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ member_models: overrides })
+        });
+        if (!res.ok) {
+          const d = await res.json().catch(() => ({}));
+          this.showToast(d.error || `HTTP ${res.status}`);
+          return;
+        }
+        this.currentSession = await res.json();
+        this.sessionReasoningEmpId = "";
+        this.showToast(this.t("已为当前会话设置推理程度"));
+      } catch (e) {
+        this.showToast(this.t("设置推理程度失败:") + " " + e);
+      }
     },
 
     async loadSettings() {
@@ -1308,6 +1430,7 @@ createApp({
       this.selectedWorkspaceFile = null;
       this.selectedFileContent = "";
       this.showMemberDropdown = false;
+      this.sessionReasoningEmpId = "";
       this.suggest = null;
       // 引用与展开状态都属于具体会话的某条消息，切会话就清掉
       this.replyTarget = null;
@@ -1530,10 +1653,45 @@ createApp({
       }, 250);
     },
 
-    // 触发条件只看「光标前是否是一个刚敲的 token」，不看输入历史：
-    // 这样在句子中间补一个 @ 也能弹，而段落里打路径（如 a/b）不会乱弹命令。
+    // 多 @ 的并行分工预览：同样交给服务端算（/api/mentions/scan），停下 250ms 再问。
+    // 只在「有 @ 且不是 /collab」时问，避免每敲一个键发一个请求。
+    scheduleFanoutCheck() {
+      if (this.fanoutCheckTimer) {
+        clearTimeout(this.fanoutCheckTimer);
+        this.fanoutCheckTimer = null;
+      }
+      const text = (this.inputContent || "").trim();
+      if (!text.includes("@") || /^\/collab(\s|$)/i.test(text)) {
+        this.fanoutCheck = null;
+        return;
+      }
+      this.fanoutCheckTimer = setTimeout(async () => {
+        this.fanoutCheckTimer = null;
+        try {
+          const res = await fetch("/api/mentions/scan", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ content: text }),
+          });
+          const data = await res.json().catch(() => ({}));
+          // 期间又改了字：这份结果已过期，丢掉
+          if (String(this.inputContent || "").trim() !== text) return;
+          this.fanoutCheck = {
+            content: text,
+            fanout: !!data.fanout,
+            names: Array.isArray(data.names) ? data.names : [],
+            error: data.error || "",
+          };
+        } catch (err) {
+          // 预览失败不打断输入；发送时服务端还有一次权威校验
+        }
+      }, 250);
+    },
+
+    // 触发条件只看「光标前是否是一个刚敲的 token」，不看输入历史：    // 这样在句子中间补一个 @ 也能弹，而段落里打路径（如 a/b）不会乱弹命令。
     onInputSuggest(e) {
       this.scheduleCollabCheck();
+      this.scheduleFanoutCheck();
       const el = (e && e.target) || this.$refs.chatInput;
       const text = String(this.inputContent || "");
       const caret = el && Number.isFinite(el.selectionStart) ? el.selectionStart : text.length;
@@ -1544,7 +1702,13 @@ createApp({
       if (this.suggest && this.suggest.implicit) {
         const from = this.suggest.start;
         const q = caret >= from ? text.slice(from, caret) : "";
-        if (caret >= from && !/[\s@/]/.test(q)) {
+        // 成员名可以带空格（"gemini 3.8"），不能再靠「不含空白」判断候选是否该继续；
+        // 只要 q 仍是某位成员名字 / id 的前缀就继续弹，打歪了或开始写正文就关掉。
+        const stillPrefix = caret >= from && !/[@/\n]/.test(q) &&
+          this.activeSessionEmployees.some(emp =>
+            String(emp.name || "").toLowerCase().startsWith(q.toLowerCase()) ||
+            String(emp.id || "").toLowerCase().startsWith(q.toLowerCase()));
+        if (stillPrefix) {
           this.suggest = { ...this.suggest, query: q, items: this.memberSuggestItems(q), active: 0, end: caret };
           return;
         }
@@ -1554,12 +1718,21 @@ createApp({
       // 左边界用「非单词字符」而不是「空白」：中文不打空格，`请@agy` 也要能弹；
       // 同时把 a@b、src/app.js 这类邮箱/路径挡在外面。
       const hit = /(^|[^\w.\-@/])([@/][^\s@/]*)$/.exec(before);
-      if (!hit) {
-        this.suggest = null;
-        return;
+      let start, token;
+      if (hit) {
+        start = hit.index + hit[1].length;
+        token = before.slice(start);
+      } else {
+        // 名字带空格时手打到中间（`@gemini 3`）会被上面的单 token 正则丢掉，
+        // 交给 spacedMentionToken 判断是不是还停在某个成员名字的前缀上。
+        const spaced = this.spacedMentionToken(before);
+        if (!spaced) {
+          this.suggest = null;
+          return;
+        }
+        start = spaced.start;
+        token = spaced.token;
       }
-      const start = hit.index + hit[1].length;
-      const token = before.slice(start);
       const sigil = token.slice(0, 1);
       const query = token.slice(1);
 
@@ -1581,6 +1754,42 @@ createApp({
         return;
       }
       this.suggest = { kind: "member", query, items, active: 0, start, end: caret };
+    },
+
+    // 成员名允许带空格（"gemini 3.8"）：手打到 `@gemini 3` 时，上面的单 token
+    // 正则会把候选菜单误关。只在「@ 后面这段文本仍是某位会话成员名字 / id 的
+    // 前缀」时续开菜单；句子里正常的空格、写错的名字都不会把菜单一直吊着。
+    spacedMentionToken(before = "") {
+      const at = before.lastIndexOf("@");
+      // 与后端 _mention_start_ok 对齐：a@b、src/app.js 这类不算提及
+      if (at < 0 || (at > 0 && /[\w.\-@/]/.test(before[at - 1]))) return null;
+      const raw = before.slice(at);
+      const query = raw.slice(1);
+      if (!/\s/.test(query) || /[\n\r@]/.test(query)) return null;
+      const q = query.toLowerCase();
+      const stillPrefix = this.activeSessionEmployees.some(emp =>
+        String(emp.name || "").toLowerCase().startsWith(q) ||
+        String(emp.id || "").toLowerCase().startsWith(q));
+      return stillPrefix ? { start: at, token: raw } : null;
+    },
+
+    // Backspace 整删 @ 标签：带空格的名字只认「@ 后面恰好是某位成员的完整
+    // 名字 / id / 括号短名（可带一个尾空格）」。不加这层校验的话，把正则放宽成
+    // `@[^@]+` 会在 `@gemini 3.8 请写代码` 里一次删掉整句话。
+    spacedMentionTag(textBefore = "") {
+      const at = textBefore.lastIndexOf("@");
+      if (at < 0 || (at > 0 && /[\w.\-@/]/.test(textBefore[at - 1]))) return null;
+      const raw = textBefore.slice(at);
+      const body = raw.replace(/\s$/, "").slice(1);
+      if (!/\s/.test(body) || /[\n\r@]/.test(body)) return null;
+      const q = body.toLowerCase();
+      const isMember = this.activeSessionEmployees.some(emp => {
+        const name = String(emp.name || "");
+        const shorts = (name.match(/[（(]([^（）()]+)[）)]/g) || []).map(s => s.slice(1, -1));
+        return [name, emp.id, ...shorts]
+          .some(v => String(v || "").toLowerCase() === q);
+      });
+      return isMember ? raw : null;
     },
 
     // @ 候选：按名字 / id / 括号短名（DS4、HY4）做不区分大小写的包含匹配
@@ -1687,10 +1896,13 @@ createApp({
         if (start === end && start > 0) {
           const textBefore = textarea.value.substring(0, start);
           // 匹配光标前最近的一个 @成员标签（例如 "@DeepSeek-V4 (DS4) "）
-          const match = textBefore.match(/@([^\s@]+)\s?$/);
-          if (match) {
+          // 名字带空格时（"@gemini 3.8 "）单 token 正则会漏掉，交给
+          // spacedMentionTag 只认「完整成员名」，避免把整句话一口吞掉。
+          const simple = textBefore.match(/@([^\s@]+)\s?$/);
+          const tag = simple ? simple[0] : this.spacedMentionTag(textBefore);
+          if (tag) {
             e.preventDefault();
-            const tagLength = match[0].length;
+            const tagLength = tag.length;
             const newText = textarea.value.substring(0, start - tagLength) + textarea.value.substring(start);
             this.inputContent = newText;
             this.$nextTick(() => {
@@ -2934,13 +3146,85 @@ createApp({
       return m.key || `${m.cli}:${m.model_id}`;
     },
 
+    // 老配置只存了 cli_cmd：按任一推理档位的命令反查，编辑时也能回显模型/档位
+    findModelByCli(cmd) {
+      if (!cmd) return null;
+      for (const m of (this.scannedModels || [])) {
+        for (const lv of (m.reasoning_levels || [])) {
+          if (lv.cli_cmd === cmd) return { model: m, level: lv };
+        }
+        if (m.cli_cmd === cmd) return { model: m, level: null };
+      }
+      return null;
+    },
+
+    toggleModelDropdown(ev) {
+      if (this.modelDropdownOpen) {
+        this.modelDropdownOpen = false;
+        return;
+      }
+      const btn = (ev && ev.currentTarget)
+        || (ev && ev.target && ev.target.closest && ev.target.closest(".model-trigger"));
+      const r = (btn && btn.getBoundingClientRect)
+        ? btn.getBoundingClientRect()
+        : { left: 40, bottom: 120, width: 420 };
+      const width = Math.max(r.width || 420, 340);
+      const left = Math.max(8, Math.min(r.left, window.innerWidth - width - 8));
+      const top = Math.max(8, Math.min(r.bottom + 6, window.innerHeight - 340));
+      this.modelDropdownStyle = {
+        position: "fixed",
+        left: `${left}px`,
+        top: `${top}px`,
+        width: `${width}px`,
+        zIndex: 200
+      };
+      this.modelSearch = "";
+      this.modelDropdownOpen = true;
+    },
+
+    closeModelDropdown() {
+      this.modelDropdownOpen = false;
+    },
+
+    // 选模型：记下 model_key，推理程度自动落到该模型的默认档（通常是高）
+    selectScannedModel(m) {
+      this.selectedModelId = this.modelKey(m);
+      this.editingEmp.model_key = this.modelKey(m);
+      const levels = m.reasoning_levels || [];
+      const def = levels.find(l => l.id === (m.default_reasoning || "high")) || levels[0];
+      this.applyReasoning(def, m);
+      this.modelDropdownOpen = false;
+    },
+
+    selectReasoning(lv) {
+      this.applyReasoning(lv, this.selectedModelObj);
+    },
+
+    applyReasoning(lv, m) {
+      if (!lv) return;
+      this.editingEmp.reasoning = lv.id;
+      this.editingEmp.cli_cmd = lv.cli_cmd;
+      if (!this.editingEmp.name && m) {
+        this.editingEmp.name = (m.display_name || "").replace(/\[.*?\]\s*/g, "");
+      }
+      this.syncEditingEmpCli();
+    },
+
+    // 兼容旧入口（原生 select 已移除）：按 selectedModelId 重新应用一次
+    onModelSelectChanged() {
+      if (this.selectedModelObj) this.selectScannedModel(this.selectedModelObj);
+    },
+
     openAddEmployeeModal() {
       this.isEditingEmployee = false;
       this.editingEmpIdx = -1;
       this.selectedModelId = "";
-      
+      this.modelSearch = "";
+      this.modelDropdownOpen = false;
+      // 只保留「只看免费」这个偏好，搜索词每次打开都清掉
+
       const uniqueId = "emp_" + Date.now().toString(36) + "_" + Math.random().toString(36).substring(2, 6);
-      
+
       this.editingEmp = {
         id: uniqueId,
         name: "",
@@ -2948,6 +3232,8 @@ createApp({
         avatar_color: "#3b82f6",
         type: "cli",
         cli_cmd: "",
+        model_key: "",
+        reasoning: "",
         system_prompt: "",
         enabled: true,
         timeout: 0,
@@ -2966,25 +3252,35 @@ createApp({
       // 老配置只有 write_access，没有 read_access：按「有读权限」补齐
       if (this.editingEmp.read_access === undefined) this.editingEmp.read_access = true;
       if (this.editingEmp.write_access === undefined) this.editingEmp.write_access = false;
-      const match = this.scannedModels.find(m => m.cli_cmd === emp.cli_cmd);
-      this.selectedModelId = match ? this.modelKey(match) : "";
+      this.editingEmp.model_key = this.editingEmp.model_key || "";
+      this.editingEmp.reasoning = this.editingEmp.reasoning || "";
+      this.modelSearch = "";
+      this.modelDropdownOpen = false;
+
+      // 先按已保存的 model_key 回显；老配置没这个字段时按 cli_cmd 反查档位
+      let model = (this.scannedModels || [])
+        .find(m => this.modelKey(m) === this.editingEmp.model_key) || null;
+      let level = null;
+      if (!model) {
+        const hit = this.findModelByCli(emp.cli_cmd);
+        model = hit ? hit.model : null;
+        level = hit ? hit.level : null;
+      } else {
+        level = (model.reasoning_levels || [])
+          .find(l => l.id === this.editingEmp.reasoning) || null;
+      }
+      this.selectedModelId = model ? this.modelKey(model) : "";
+      if (model) {
+        this.editingEmp.model_key = this.modelKey(model);
+        const def = level
+          || (model.reasoning_levels || []).find(l => l.id === model.default_reasoning)
+          || (model.reasoning_levels || [])[0];
+        this.editingEmp.reasoning = def ? def.id : "";
+        // 收费模型别被「只看免费」藏起来
+        if (!model.is_free) this.onlyFreeModels = false;
+      }
       this.syncEditingEmpCli();
       this.showEmpEditModal = true;
-    },
-
-    onModelSelectChanged() {
-      const match = this.scannedModels.find(m => this.modelKey(m) === this.selectedModelId);
-      if (match) {
-        this.editingEmp.cli_cmd = match.cli_cmd;
-        if (!this.editingEmp.name) {
-          this.editingEmp.name = match.display_name.replace(/\[.*?\]\s*/g, "");
-        }
-        // 如果用户尚未填写 Prompt，且扫描出来的模型有预设则使用；否则保持干净空白
-        if (!this.editingEmp.system_prompt && match.default_prompt) {
-          this.editingEmp.system_prompt = match.default_prompt;
-        }
-        this.syncEditingEmpCli();
-      }
     },
 
     // 勾选读/写权限后，把模板里的 --tools 同步成实际会执行的值，

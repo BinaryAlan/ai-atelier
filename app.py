@@ -14,7 +14,10 @@ from core.storage import (
     is_valid_session_id, session_lock, SessionDeletedError
 )
 from core.executor import Executor, validate_cli_template, normalize_cli_tools
-from core.tasks import task_manager, parse_collab, STAGE_EXEC, STAGE_REVIEW, STAGE_DELIVER
+from core.tasks import (
+    task_manager, parse_collab, parse_fanout,
+    STAGE_EXEC, STAGE_REVIEW, STAGE_DELIVER,
+)
 import core.streaming as streaming
 from core.scanner import scan_local_models
 
@@ -209,6 +212,10 @@ def _sanitize_agent(raw, label: str, default_id: str) -> "tuple":
         "avatar_color": str(raw.get("avatar_color") or "#3b82f6")[:32],
         "type": raw.get("type") if raw.get("type") in ("cli", "api") else "cli",
         "cli_cmd": cli_cmd,
+        # 绑定的「基础模型 + 推理档位」：只用于界面回显与会话级覆盖，
+        # 真正执行仍以 cli_cmd 为准，避免界面状态影响命令语义。
+        "model_key": str(raw.get("model_key") or "")[:128],
+        "reasoning": str(raw.get("reasoning") or "")[:32],
         "system_prompt": str(raw.get("system_prompt") or "")[:8000],
         "enabled": bool(raw.get("enabled", True)),
         "timeout": timeout,
@@ -217,6 +224,34 @@ def _sanitize_agent(raw, label: str, default_id: str) -> "tuple":
         "write_access": write_access,
         "read_access": read_access,
     }, None
+
+
+def _clean_member_models(raw) -> "tuple":
+    """会话级「成员 → 推理档位」覆盖表。
+
+    只存执行时真正需要的最小字段；cli_cmd 走和成员配置同样的白名单校验，
+    会话文件虽然在本机，也不能让它变成绕过 CLI 校验的旁路。
+    """
+    if not isinstance(raw, dict):
+        return None, "member_models 必须为对象"
+    cleaned = {}
+    for emp_id, item in raw.items():
+        if not isinstance(emp_id, str) or not AGENT_ID_REGEX.match(emp_id):
+            return None, f"member_models 的成员 id 不合法: {emp_id}"
+        if not isinstance(item, dict):
+            return None, f"{emp_id} 的推理配置必须为对象"
+        cli_cmd = str(item.get("cli_cmd") or "").strip()
+        ok, err = validate_cli_template(cli_cmd)
+        if not ok:
+            return None, f"{emp_id} 的 CLI 命令不合法: {err}"
+        cleaned[emp_id] = {
+            "model_key": str(item.get("model_key") or "")[:128],
+            "reasoning": str(item.get("reasoning") or "")[:32],
+            "cli_cmd": cli_cmd,
+        }
+        if len(cleaned) > 100:
+            return None, "member_models 条目过多"
+    return cleaned, None
 
 
 @app.route("/api/settings", methods=["POST"])
@@ -306,6 +341,13 @@ def api_update_session(session_id):
             if new_ids is None:
                 return jsonify({"error": "employee_ids 必须为字符串数组"}), 400
             session["employee_ids"] = new_ids
+
+        # 会话内单独给某位成员挑的推理程度：只影响这一场会话
+        if "member_models" in data:
+            cleaned, err = _clean_member_models(data.get("member_models"))
+            if err:
+                return jsonify({"error": err}), 400
+            session["member_models"] = cleaned
 
         save_session(session)
         return jsonify(session)
@@ -674,6 +716,28 @@ def api_validate_collab():
     })
 
 
+@app.route("/api/mentions/scan", methods=["POST"])
+def api_scan_mentions():
+    """输入时的「这条会发给谁」预览：一条消息 @ 多位时前端据此提示并行分工。
+
+    谁被 @ 到了只有服务端说了算（支持别名、`@//agy/` 这种路径写法、散落在句子里），
+    前端不再自己写一套匹配逻辑。
+    """
+    content = str(_json_body().get("content") or "")
+    settings = load_settings()
+    owners, error = parse_fanout(content, settings)
+    names = []
+    for oid in owners:
+        emp = next((e for e in settings.get("employees") or []
+                    if isinstance(e, dict) and e.get("id") == oid), None)
+        names.append((emp or {}).get("name") or oid)
+    return jsonify({
+        "fanout": len(owners) >= 2 and not error,
+        "names": names,
+        "error": error,
+    })
+
+
 def _find_message(session: dict, msg_id: str) -> Optional[dict]:
     for m in session.get("messages") or []:
         if isinstance(m, dict) and m.get("id") == msg_id:
@@ -710,34 +774,71 @@ def _prepare_shutdown(action: str = "shutdown") -> int:
 # 无 reloader 时的“继任者”：等本进程真正退出（端口释放）后再 exec 启动脚本，
 # 否则新进程会和旧进程抢 5050 端口而启动失败
 _SPAWN_WAIT_CODE = r"""
-import os, sys, time
+import os, sys, time, traceback
 pid, target = int(sys.argv[1]), sys.argv[2]
+print("[restart] %s 继任进程已启动，等待旧进程 %d 退出" % (time.strftime("%Y-%m-%d %H:%M:%S"), pid), flush=True)
 for _ in range(600):
     try:
         os.kill(pid, 0)
     except OSError:
         break
     time.sleep(0.1)
-os.execv(sys.executable, [sys.executable, target])
+else:
+    print("[restart] 60 秒内旧进程仍未退出，放弃接管（端口可能仍被占用）", flush=True)
+    sys.exit(3)
+try:
+    os.execv(sys.executable, [sys.executable, target])
+except Exception:
+    print("[restart] 拉起新实例失败：\n" + traceback.format_exc(), flush=True)
+    sys.exit(4)
 """
+
+# 继任进程的输出去处：不继承旧进程的终端/管道（见 _spawn_successor 注释），统一写日志文件
+_SERVICE_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".run", "service.log")
 
 
 def _spawn_successor() -> bool:
-    """在无 reloader 场景下拉起一个脱离当前进程的新实例。"""
+    """在无 reloader 场景下拉起一个脱离当前进程的新实例。
+
+    关键：继任进程的 stdin/stdout/stderr 一律重定向，**不能继承父进程的**。
+    父进程常由终端或后台管理器拉起，它一退出，那根管道/伪终端的读端也跟着消失；
+    继任进程再往 fd 1 写第一个 print（启动横幅）就会拿到 EPIPE/EIO，
+    Python 于是带着退出码 120 直接死掉 —— 旧进程已 os._exit，端口没人接，
+    表现就是 `./run.sh restart` 干等 30 秒超时。
+    """
     entry = os.path.abspath(sys.argv[0] or "")
     if not entry.endswith(".py") or not os.path.exists(entry):
         # 不是 `python app.py` 启动的（例如 gunicorn / flask run），交给用户手动重启
         return False
+    log = None
     try:
+        os.makedirs(os.path.dirname(_SERVICE_LOG), exist_ok=True)
+        # 简单轮转：超过 2MB 就留一代历史，避免长期重启把日志撑爆
+        try:
+            if os.path.getsize(_SERVICE_LOG) > 2 * 1024 * 1024:
+                os.replace(_SERVICE_LOG, _SERVICE_LOG + ".1")
+        except OSError:
+            pass
+        log = open(_SERVICE_LOG, "ab", buffering=0)
+        log.write(
+            ("\n[restart] %s 旧进程 pid=%d 拉起继任实例\n"
+             % (time.strftime("%Y-%m-%d %H:%M:%S"), os.getpid())).encode("utf-8")
+        )
         subprocess.Popen(
             [sys.executable, "-c", _SPAWN_WAIT_CODE, str(os.getpid()), entry],
             cwd=os.getcwd(),
+            stdin=subprocess.DEVNULL,
+            stdout=log,
+            stderr=subprocess.STDOUT,
             start_new_session=True,
         )
         return True
     except Exception as e:
         print("[Service] 拉起后继进程失败:", e)
         return False
+    finally:
+        if log is not None:
+            log.close()  # 子进程已持有自己的 fd，父进程这份可以关
 
 
 def _schedule_exit(action: str, delay: float = 0.4) -> None:
@@ -802,6 +903,7 @@ def api_system_restart():
         "success": True,
         "action": "restart",
         "hot_reload": bool(_UNDER_RELOADER),
+        "log_file": _SERVICE_LOG,
         "message": "服务正在重启，正在执行的任务已终止，重启后可在卡片里重试",
     })
 
@@ -838,6 +940,16 @@ if __name__ == "__main__":
         print(f"⚡ 开发模式：代码热重载已启用 (无交互调试器暴露，安全模式)")
     else:
         print(f"ℹ️  正常使用：改 .py 后执行 ./run.sh restart；开发时可用 ./run.sh dev 开启热重载")
+
+    # 由 /api/system/restart 拉起的继任实例 PID 已换，顺手刷新 PID 文件，
+    # 免得 ./run.sh status / stop 读到过期进程号（正常 start 时值与 run.sh 写的相同）
+    try:
+        _pid_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".run", "app.pid")
+        os.makedirs(os.path.dirname(_pid_file), exist_ok=True)
+        with open(_pid_file, "w") as _f:
+            _f.write(str(os.getpid()))
+    except Exception:
+        pass
 
     # use_debugger=False 彻底禁止外部或局域网访问 Werkzeug Debugger PIN 执行任意代码
     app.run(host=host, port=port, debug=is_debug, use_reloader=is_debug, use_debugger=False)

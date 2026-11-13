@@ -277,5 +277,180 @@ class TestScannedModelsCacheHeal(unittest.TestCase):
         self.assertIn('--tools "Read,Glob,Grep"', models[0]["cli_cmd"])
 
 
+class TestModelScanning(unittest.TestCase):
+    """本地模型扫描：按注册表发现已装 CLI、模型聚合、推理档位、旧缓存过期。"""
+
+    AGY_OUT = (
+        "gemini-3.8-flash-high\tGemini 3.8 Flash (High)\n"
+        "gemini-3.8-flash-low\tGemini 3.8 Flash (Low)\n"
+        "claude-sonnet-4-6\tClaude Sonnet 4.6 (Thinking)\n"
+    )
+    OPENCODE_OUT = (
+        "github-copilot/claude-opus-5.5\n"
+        "gitlab/duo-chat-gpt-5-4\n"
+        "opencode/glm-5.3-flash-free\n"
+        "opencode-go/beam-free\n"
+        "garbage line\n"
+    )
+    CODEBUDDY_HELP = (
+        "--model <model>  Model for the current session. "
+        "Currently supported: (hy4free, hy4std)\n"
+    )
+
+    def _fake_run(self, argv, timeout=None):
+        if argv[:2] == ["agy", "models"]:
+            return self.AGY_OUT
+        if argv[:2] == ["opencode", "models"]:
+            return self.OPENCODE_OUT
+        if argv[:2] == ["codebuddy", "--help"]:
+            return self.CODEBUDDY_HELP
+        return ""
+
+    def test_agy_variants_are_merged_and_have_reasoning_levels(self):
+        from core import scanner
+        from core.cli_registry import SPEC_BY_NAME
+        with mock.patch.object(scanner, "_run", return_value=self.AGY_OUT):
+            models = scanner._scan_one(SPEC_BY_NAME["agy"])
+        self.assertEqual([m["model_id"] for m in models],
+                         ["gemini-3.8-flash", "claude-sonnet-4-6"])
+        gem = models[0]
+        self.assertEqual(gem["display_name"], "Gemini 3.8 Flash")
+        self.assertEqual([l["id"] for l in gem["reasoning_levels"]], ["low", "high"])
+        self.assertEqual(gem["default_reasoning"], "high")
+        self.assertEqual(gem["cli_cmd"], 'agy --model gemini-3.8-flash-high -p "{prompt}"')
+        self.assertNotIn("default", [m["model_id"] for m in models])
+
+    def test_agy_falls_back_when_models_command_fails(self):
+        from core import scanner
+        from core.cli_registry import SPEC_BY_NAME
+        with mock.patch.object(scanner, "_run", return_value=""):
+            models = scanner._scan_one(SPEC_BY_NAME["agy"])
+        self.assertEqual(len(models), 1)
+        self.assertEqual(models[0]["key"], "agy:default")
+
+    def test_opencode_only_keeps_own_providers(self):
+        from core import scanner
+        from core.cli_registry import SPEC_BY_NAME
+        with mock.patch.object(scanner, "_run", return_value=self.OPENCODE_OUT):
+            models = scanner._scan_one(SPEC_BY_NAME["opencode"])
+        ids = [m["model_id"] for m in models]
+        self.assertEqual(ids, ["opencode/glm-5.3-flash-free", "opencode-go/beam-free"])
+        self.assertFalse(any("github" in x or "gitlab" in x for x in ids))
+        self.assertTrue(models[0]["is_free"])
+        levels = models[0]["reasoning_levels"]
+        self.assertEqual([l["id"] for l in levels], ["low", "medium", "high"])
+        self.assertIn("#high", levels[-1]["cli_cmd"])
+
+    def test_scan_discovers_every_installed_cli(self):
+        import os
+        import tempfile
+        from core import scanner
+        installed = {"agy", "codebuddy", "opencode", "claude", "codex", "cursor-agent"}
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = os.path.join(tmp, "scanned_models.json")
+            with mock.patch.object(scanner, "CACHE_FILE", cache), \
+                 mock.patch.object(scanner.shutil, "which",
+                                   side_effect=lambda n: "/usr/bin/fake" if n in installed else None), \
+                 mock.patch.object(scanner, "_run", side_effect=self._fake_run):
+                models = scanner.scan_local_models(force_refresh=True)
+        by_cli = {}
+        for m in models:
+            by_cli[m["cli"]] = by_cli.get(m["cli"], 0) + 1
+        self.assertEqual(set(by_cli), installed)
+        self.assertTrue(any(m["is_free"] for m in models if m["model_id"] == "hy4free"))
+        self.assertFalse(any(m["is_free"] for m in models if m["model_id"] == "hy4std"))
+
+    def test_reasoning_modes_build_valid_commands(self):
+        from core.cli_registry import CLI_SPECS, build_cli_cmd
+        from core.executor import validate_cli_template
+        for spec in CLI_SPECS:
+            cmd = build_cli_cmd(spec["name"], "sample-model", "high")
+            ok, err = validate_cli_template(cmd)
+            self.assertTrue(ok, f"{spec['name']}: {err}")
+        self.assertIn("--effort high", build_cli_cmd("codebuddy", "hy4std", "high"))
+        self.assertIn("model_reasoning_effort=low", build_cli_cmd("codex", "gpt-5", "low"))
+        self.assertIn("#high", build_cli_cmd("opencode", "opencode/beam-free", "high"))
+        self.assertIn("--model sonnet", build_cli_cmd("claude", "sonnet", "default"))
+
+    def test_session_reasoning_override_replaces_cli_cmd(self):
+        from core.tasks import TaskManager
+        high = 'agy --model gemini-3.8-flash-high -p "{prompt}"'
+        low = 'agy --model gemini-3.8-flash-low -p "{prompt}"'
+        settings = {"employees": [{"id": "emp_agy", "name": "agy", "cli_cmd": high}]}
+        session = {"member_models": {"emp_agy": {
+            "model_key": "agy:gemini-3.8-flash", "reasoning": "low", "cli_cmd": low}}}
+        out = TaskManager._settings_for_session(None, session, settings)
+        self.assertEqual(out["employees"][0]["cli_cmd"], low)
+        self.assertEqual(out["employees"][0]["reasoning"], "low")
+        self.assertEqual(settings["employees"][0]["cli_cmd"], high)  # 全局配置不被改脏
+
+        bad = {"member_models": {"emp_agy": {"cli_cmd": "bash -c 'rm -rf /'"}}}
+        out2 = TaskManager._settings_for_session(None, bad, settings)
+        self.assertEqual(out2["employees"][0]["cli_cmd"], high)
+
+    def test_member_models_api_rejects_unsafe_commands(self):
+        from app import _clean_member_models
+        ok, err = _clean_member_models({"emp_agy": {
+            "model_key": "agy:gemini-3.8-flash", "reasoning": "high",
+            "cli_cmd": 'agy --model gemini-3.8-flash-high -p "{prompt}"'}})
+        self.assertIsNone(err)
+        self.assertEqual(ok["emp_agy"]["reasoning"], "high")
+        bad, err = _clean_member_models({"emp_agy": {"cli_cmd": "bash -c 'rm -rf /'"}})
+        self.assertIsNotNone(err)
+        self.assertIsNone(bad)
+
+    def test_shipped_roles_use_high_reasoning(self):
+        import json
+        import os
+        from core import scanner
+        from core.executor import validate_cli_template
+        path = os.path.join(scanner.BASE_DIR, "data", "settings.json")
+        with open(path, encoding="utf-8") as f:
+            emps = json.load(f)["employees"]
+        self.assertTrue(emps)
+        for e in emps:
+            self.assertTrue(validate_cli_template(e["cli_cmd"])[0], e["id"])
+            self.assertEqual(e.get("reasoning"), "high", e["id"])
+        agy = next(e for e in emps if e["id"] == "emp_agy")
+        self.assertIn("gemini-3.8-flash-high", agy["cli_cmd"])
+
+    def test_legacy_list_cache_expires_by_mtime(self):
+        import json
+        import os
+        import tempfile
+        import time
+        from core import scanner
+
+        legacy = [{
+            "key": "codebuddy:hy4free",
+            "cli": "codebuddy",
+            "model_id": "hy4free",
+            "display_name": "hy4free",
+            "cli_cmd": 'codebuddy --model hy4free --tools "" -p "{prompt}"',
+        }]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "scanned_models.json")
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(legacy, f)
+            old = time.time() - 2 * 24 * 3600
+            os.utime(path, (old, old))
+            with mock.patch.object(scanner, "CACHE_FILE", path):
+                self.assertEqual(scanner._load_cache(), [])
+                os.utime(path, None)  # 恢复成「刚刚写入」
+                healed = scanner._load_cache()
+        self.assertEqual(len(healed), 1)
+        self.assertTrue(healed[0]["is_free"])  # 老缓存也要补上免费标记
+
+    def test_opencode_template_allowed_and_plain_text(self):
+        from core.executor import validate_cli_template, stream_flags, apply_access_mode
+        tpl = 'opencode run --model opencode/beam-free "{prompt}"'
+        ok, _ = validate_cli_template(tpl)
+        self.assertTrue(ok)
+        args = ["opencode", "run", "--model", "opencode/beam-free", "hi"]
+        self.assertEqual(stream_flags(args), [])  # 不能塞 agy/codebuddy 的 stream-json
+        self.assertIn("--auto", apply_access_mode(args, True, True))
+        self.assertNotIn("--auto", apply_access_mode(args, False, True))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -17,6 +17,7 @@ import sys
 import threading
 import time
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -389,3 +390,52 @@ class TestTaskManagerStreaming(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class FailingStreamingRunner(StreamingRunner):
+    """吐了半截正文就失败：模拟执行中被中断（崩溃 / 超时 / 被取消）。"""
+
+    def __call__(self, employee, prompt, session_id, workspace_dir, on_chunk=None):
+        if on_chunk:
+            on_chunk("第三章写到一半", {"phase": "writing", "chars": 7, "activity": ""})
+        return SimpleNamespace(status="error", output="调用失败", raw_output="调用失败", elapsed=0)
+
+
+class TestInterruptHandoff(unittest.TestCase):
+    """中断时把半成品留下来：重试靠它告诉成员「你写到哪了」。"""
+
+    def setUp(self):
+        streaming.clear_all()
+        self.store = FakeStore(make_session())
+        self.runner = FailingStreamingRunner()
+        self.runner.release.set()  # 不需要真挂在流式中途
+        self.manager = T.TaskManager(store=self.store, runner=self.runner)
+        self.settings = make_settings()
+        T.CANCELLED_KEYS.clear()
+
+    def tearDown(self):
+        self.runner.release.set()
+        self.manager.wait_idle(timeout=5)
+        streaming.clear_all()
+        T.CANCELLED_KEYS.clear()
+
+    def test_partial_text_survives_failure(self):
+        result = self.manager.submit_message("s1", "@agy 写第三章", self.settings)
+        # wait_idle 只保证队列空了，终态与「输入输出」的落库还差一拍
+        deadline = time.time() + 5
+        task = {}
+        while time.time() < deadline:
+            task = self.store.get_session("s1")["tasks"][result["task_id"]]
+            if task.get("status") in (T.STATUS_FAILED, T.STATUS_TIMEOUT, T.STATUS_CANCELLED):
+                break
+            time.sleep(0.02)
+        self.manager.wait_idle(timeout=5)
+        session = self.store.get_session("s1")
+        task = session["tasks"][result["task_id"]]
+        self.assertEqual(task["status"], T.STATUS_FAILED)
+        self.assertEqual((task.get("interrupt") or {}).get("partial"), "第三章写到一半")
+        # 聊天正文仍是失败说明，但「输入输出」里能看到中断前写到哪
+        record = [m for m in session["messages"] if m.get("kind") == "task_record"][0]
+        self.assertIn("第三章写到一半", record["raw_response"])
+        self.assertIn("中断前已输出", record["raw_response"])
+        # 暂存区照常清空，界面上不会挂着上一轮的「正在写」
+        self.assertEqual(streaming.for_session("s1"), {})

@@ -12,10 +12,17 @@ from typing import Callable, Dict, Any, Tuple, Optional, List
 from urllib.parse import urlsplit
 from dataclasses import dataclass
 
-# 白名单只允许「AI CLI 客户端」。
+from core.cli_registry import (
+    KNOWN_CLI_NAMES,
+    WRITE_FLAGS as REGISTRY_WRITE_FLAGS,
+    CLI_ENV_KEYS,
+)
+
+# 白名单只允许「AI CLI 客户端」，清单与扫描器共用 core/cli_registry.py：
+# 新增一个已登记的 CLI，扫描得到它的同时也能真正执行，不会出现「能选不能跑」。
 # 严禁加入 python/python3/bash/sh 等通用解释器：它们带 -c/-m 参数即可执行任意代码，
 # 会让 validate_cli_template 与路径校验形同虚设（等价于本地 RCE）。
-ALLOWED_BINARIES = {"agy", "codebuddy"}
+ALLOWED_BINARIES = set(KNOWN_CLI_NAMES)
 
 # 单条 prompt 的长度上限：prompt 通过 argv 传递，超长会触发 E2BIG 并让 CLI 直接失败
 MAX_PROMPT_CHARS = 100_000
@@ -42,7 +49,8 @@ def sanitize_model_output(text: str) -> str:
     if not text:
         return ""
 
-    cleaned = text
+    # opencode 等 CLI 偶尔会把终端颜色控制符带进 stdout，先剥掉再解析
+    cleaned = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", text)
     for tag in _TOOL_TAGS:
         cleaned = re.sub(rf"<{tag}\b[^>]*>.*?</{tag}>", "", cleaned, flags=re.S | re.I)
         cleaned = re.sub(rf"<{tag}\b[^>]*>.*\Z", "", cleaned, flags=re.S | re.I)
@@ -395,12 +403,16 @@ class StreamJsonParser:
 def stream_flags(args: List[str]) -> List[str]:
     """这份 CLI 参数要补哪些流式开关；不支持就返回空列表。
 
-    - 只对白名单里的两家 CLI 动手，且必须是 print 模式（stream-json 只在 -p 下生效）
+    - 只对 agy / codebuddy 动手，且必须是 print 模式（stream-json 只在 -p 下生效）
     - 模板自己写了 --output-format 就不覆盖（可能就是要 json / text）
+    - opencode 没有等价的 stream-json：它的 stdout 是纯文本，走 _stream_process
+      的 parser=None 分支一样可以边生成边显示，别给它塞 agy/codebuddy 的开关
     """
     if not args:
         return []
     base = os.path.basename(args[0]).lower()
+    if base == "opencode":
+        return []
     if "--output-format" in args:
         return []
     if not any(a in ("-p", "--print") for a in args):
@@ -472,7 +484,10 @@ _CLI_ENV_ALLOW = {
     # 用户自己配的凭据 / 服务地址：不带过去 CLI 会连不上
     "CODEBUDDY_API_KEY", "CODEBUDDY_BASE_URL", "CODEBUDDY_CONFIG_DIR",
     "CLAUDE_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY",
-}
+    # opencode 的 auth.json 走 HOME 下的用户目录（HOME 已放行）；这里补的是
+    # 用户可能改用环境变量配置的 provider 凭据
+    "OPENCODE_API_KEY", "OPENCODE_CONFIG", "GITHUB_TOKEN", "GEMINI_API_KEY",
+} | set(CLI_ENV_KEYS)  # 注册表登记的凭据（claude / codex / cursor / gemini / qwen ...）
 
 # 代理单独处理：宿主会把自己的沙箱代理（实测 127.0.0.1:62616，属于 sandbox-client 进程）
 # 塞进 HTTP_PROXY/HTTPS_PROXY，让所有子进程的网络请求经它转发，CLI 走它就会时好时坏。
@@ -535,7 +550,7 @@ def _unregister_process(session_id: str, proc: Optional[subprocess.Popen]) -> No
 def validate_cli_template(cmd_template: str) -> Tuple[bool, str]:
     """
     安全校验 CLI 执行模板：
-    1. 必须以白名单命令开头 (agy, codebuddy)
+    1. 必须以白名单命令开头 (agy, codebuddy, opencode)
     2. 必须包含 {prompt} 占位符
     3. 严禁包含危险的 Shell 管道、重定向、分号及命令拼接符
     """
@@ -566,15 +581,15 @@ def validate_cli_template(cmd_template: str) -> Tuple[bool, str]:
     return True, "验证通过"
 
 
-# 写权限（写文件 / 跑命令）在两家 CLI 上是不同开关：
-#   agy        --dangerously-skip-permissions   自动放行所有工具权限询问
-#   codebuddy  -y / --dangerously-skip-permissions
+# 写权限（写文件 / 跑命令）在各家 CLI 上是不同开关，统一由注册表提供：
+#   agy / claude     --dangerously-skip-permissions
+#   codebuddy        -y
+#   opencode         --auto
+#   codex            --dangerously-bypass-approvals-and-sandbox
+#   cursor-agent     -f
 # 光加开关还不够：codebuddy 的 --tools 会把可用工具裁成白名单，
 # 只给了 Read,Glob,Grep 时即使放行权限也没有写的能力，必须把写工具补进去。
-_WRITE_FLAGS = {
-    "agy": ["--dangerously-skip-permissions"],
-    "codebuddy": ["-y"],
-}
+_WRITE_FLAGS = {k: list(v) for k, v in REGISTRY_WRITE_FLAGS.items()}
 # 缺一不可：只给 Write 不给 Edit，模型改现有文件时会退化成「重写整个文件」或直接失败
 # （读工具见 _READ_TOOLS：写权限不再顺带把读关掉，两者由 UI 的两个勾选框分别控制）
 
@@ -588,6 +603,7 @@ def apply_access_mode(
     按角色的读/写权限给 CLI 参数补上对应开关（对同一份模板可重复调用，不会叠加）。
 
     - write_access：加自动放行开关，并把 Write/Edit/Bash 补进 --tools 白名单
+      （opencode 没有 --tools，只补 --auto）
     - read_access：默认 True。只读角色也必须能 Read/Glob/Grep，否则成员读不到产物，
       只会回一句「我先读取一下」就结束本轮（模板遗留 --tools "" 是历史 bug）。
     - 两项都关：--tools 收敛成 ""，即完全不借助工具。
@@ -952,6 +968,9 @@ class Executor:
                 cwd=cwd,
                 # 不清环境的话，CLI 会拿宿主注入的 SERVER__PORT 当自己的监听端口，启动即失败
                 env=build_cli_env(),
+                # prompt 全部走 argv；stdin 必须关掉，否则 codex 等 CLI 会停下来等输入
+                # （实测出现 "Reading additional input from stdin..." 然后卡住）
+                stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,

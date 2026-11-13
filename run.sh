@@ -8,6 +8,7 @@
 #   ./run.sh stop       优雅停止（先走 API，失败再按端口 / PID 兜底）
 #   ./run.sh restart    重启（进行中的任务标记为已取消，可在卡片里重试）
 #   ./run.sh status     查看服务状态
+#   ./run.sh logs       跟踪重启后的服务日志（.run/service.log）
 # -------------------------------------------------------------
 
 cd "$(dirname "$0")" || exit 1
@@ -16,6 +17,7 @@ PORT="${PORT:-5050}"
 HOST="${HOST:-127.0.0.1}"
 BASE="http://${HOST}:${PORT}"
 PID_FILE=".run/app.pid"
+SERVICE_LOG=".run/service.log"
 
 # 这类接口能杀掉整个服务，必须带确认头（与前端一致，防跨站表单误触发）
 ACTION_HEADER="X-Meeting-Action: 1"
@@ -209,6 +211,8 @@ do_restart() {
                 echo "$new_pid" > "$PID_FILE" 2>/dev/null
                 echo "✅ 服务已重启：${BASE}（新 PID: ${new_pid}）"
                 echo "   被打断的任务已标记为已取消，可在任务卡片里重试。"
+                # 继任实例的输出不接终端（见 app.py _spawn_successor 的说明），只写日志文件
+                echo "   启动日志：${SERVICE_LOG}（跟踪：./run.sh logs）"
                 return 0
             fi
         fi
@@ -216,8 +220,23 @@ do_restart() {
     done
 
     echo "❌ 重启超时：30 秒内没等到新进程接管端口 ${PORT}"
-    echo "   查看启动终端是否有报错；必要时 ./run.sh stop 后再 ./run.sh start"
+    if [ -f "$SERVICE_LOG" ]; then
+        echo "--- ${SERVICE_LOG} 最后 20 行 ---"
+        tail -n 20 "$SERVICE_LOG" 2>/dev/null
+        echo "-------------------------------"
+    fi
+    echo "   若端口已空闲，可直接 ./run.sh start 前台启动。"
     return 1
+}
+
+do_logs() {
+    if [ ! -f "$SERVICE_LOG" ]; then
+        echo "ℹ️  还没有日志文件（${SERVICE_LOG}）。"
+        echo "   它只在 ./run.sh restart 拉起继任实例后产生；前台启动的输出直接打在终端。"
+        return 1
+    fi
+    echo "📄 跟踪 ${SERVICE_LOG}（Ctrl+C 退出）"
+    tail -n 80 -f "$SERVICE_LOG"
 }
 
 resolve_python
@@ -241,12 +260,15 @@ case "$CMD" in
     status)
         do_status
         ;;
+    logs)
+        do_logs
+        ;;
     -h|--help|help)
-        sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'
+        sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'
         ;;
     *)
         echo "未知命令: $CMD"
-        echo "用法: ./run.sh [start|dev|stop|restart|status]"
+        echo "用法: ./run.sh [start|dev|stop|restart|status|logs]"
         exit 2
         ;;
 esac

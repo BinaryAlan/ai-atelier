@@ -731,11 +731,17 @@ class TestCancelRetry(TaskCase):
             time.sleep(0.02)
         self.manager.wait_idle()
         self.assertEqual(reviews, 2)
-        with self.runner.lock:
-            self.assertEqual(
-                len([c for c in self.runner.calls if ":deliver:" in c["key"]]),
-                before_deliver + 1,
-            )
+        # 自动补交付是重试线程收尾时才起的另一段，wait_idle 之后可能还没进到执行器：
+        # 这里等它真的跑起来再数，否则偶发少一次（1 != 2）
+        deadline = time.time() + 8
+        delivers = before_deliver
+        while time.time() < deadline:
+            with self.runner.lock:
+                delivers = len([c for c in self.runner.calls if ":deliver:" in c["key"]])
+            if delivers >= before_deliver + 1:
+                break
+            time.sleep(0.02)
+        self.assertEqual(delivers, before_deliver + 1)
         task = self._wait(result["task_id"], timeout=5) or self._task(result["task_id"])
         self.assertEqual(task["status"], T.STATUS_DELIVERED)
         self.assertEqual(
@@ -1781,5 +1787,279 @@ class TestDefaultRouteToLastAi(TaskCase):
         self.assertNotIn("task_id", result)
 
 
+class TestResumeAfterInterrupt(unittest.TestCase):
+    """中断续跑：模型是新进程，上一轮的思路没了，只能靠「写了什么 + 改了哪些文件」接上。
+
+    覆盖两件事：①失败/超时/取消时把这些物证留进 task["interrupt"]；
+    ②下一轮 Prompt（重试 / 新指令）真的把它交到成员手里。
+    """
+
+    def setUp(self):
+        self.workspace = tempfile.mkdtemp(prefix="aim-resume-")
+        self.store = FakeStore(make_session(workspace_dir=self.workspace))
+        self.runner = FakeRunner()
+        self.manager = T.TaskManager(store=self.store, runner=self.runner)
+        self.settings = self.store.load_settings()
+        T.CANCELLED_KEYS.clear()
+
+    def tearDown(self):
+        self.manager.wait_idle(timeout=5)
+        T.CANCELLED_KEYS.clear()
+
+    def _submit(self, content):
+        return self.manager.submit_message("s1", content, self.settings)
+
+    def _wait(self, tid, timeout=6):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            task = self.store.get_session("s1")["tasks"].get(tid)
+            if task and task.get("status") in (T.STATUS_DELIVERED, T.STATUS_CANCELLED,
+                                               T.STATUS_FAILED, T.STATUS_TIMEOUT):
+                return task
+            time.sleep(0.02)
+        return self.store.get_session("s1")["tasks"].get(tid)
+
+    def _write(self, name, text="第二章已经写完"):
+        path = os.path.join(self.workspace, name)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        return path
+
+    def test_prompt_section_carries_partial_and_files(self):
+        prompt = T.build_prompt(
+            T.STAGE_EXEC, "把第三章写完", T.TYPE_SINGLE,
+            resume={
+                "same_task": True, "status": T.STATUS_FAILED,
+                "at": int(time.time()), "elapsed": 42,
+                "partial": "第二章已写完，第三章开头两段如下…",
+                "files": [{"path": "book.md", "bytes": 2048}],
+            },
+        )
+        self.assertIn("【上次中断的进度】", prompt)
+        self.assertIn("第三章开头两段", prompt)
+        self.assertIn("book.md（2.0 KB）", prompt)
+        self.assertIn("【续跑要求】", prompt)
+        self.assertIn("不要重做", prompt)
+        # 交接条排在「用户原话」之后：先看要做什么，再看做到哪
+        self.assertLess(prompt.index("【用户原话】"), prompt.index("【上次中断的进度】"))
+
+    def test_failure_records_interrupt_with_changed_files(self):
+        self._write("book.md")
+        self.runner.fail_for = [":exec:"]
+        result = self._submit("@agy 把第三章写完")
+        task = self._wait(result["task_id"])
+        self.assertEqual(task["status"], T.STATUS_FAILED)
+        interrupt = task.get("interrupt") or {}
+        self.assertEqual(interrupt.get("stage"), T.STAGE_EXEC)
+        self.assertEqual(interrupt.get("status"), T.STATUS_FAILED)
+        self.assertEqual([f["path"] for f in interrupt.get("files") or []], ["book.md"])
+
+    def test_cancel_records_interrupt_too(self):
+        self._write("book.md")
+        gate = threading.Event()
+        original = self.runner
+
+        def gated(employee, prompt, session_id, workspace_dir):
+            original.gates.setdefault(session_id, gate)
+            return original(employee, prompt, session_id, workspace_dir)
+
+        self.manager.runner = gated
+        result = self._submit("@agy 把第三章写完")
+        deadline = time.time() + 6
+        while time.time() < deadline and not original.calls:
+            time.sleep(0.01)
+        self.manager.cancel("s1", result["task_id"], T.STAGE_EXEC)
+        gate.set()
+        # cancel() 是同步改状态的，但交接条由 worker 线程在进程返回后才写：
+        # 只等「终态」会抢跑，这里等交接条落库
+        deadline = time.time() + 5
+        interrupt = {}
+        while time.time() < deadline:
+            interrupt = self.store.get_session("s1")["tasks"][result["task_id"]].get("interrupt") or {}
+            if interrupt:
+                break
+            time.sleep(0.02)
+        task = self._wait(result["task_id"])
+        self.assertEqual(task["status"], T.STATUS_CANCELLED)
+        # 被取消同样算中断：下一轮重试也要知道半成品在哪
+        self.assertEqual(interrupt.get("status"), T.STATUS_CANCELLED)
+        self.assertTrue(interrupt.get("files"))
+
+    def test_retry_prompt_tells_member_to_continue(self):
+        self._write("book.md")
+        self.runner.fail_for = [":exec:"]
+        result = self._submit("@agy 把第三章写完")
+        self._wait(result["task_id"])
+
+        self.runner.fail_for = []
+        self.manager.retry("s1", result["task_id"], T.STAGE_EXEC)
+        task = self._wait(result["task_id"])
+        self.assertEqual(task["status"], T.STATUS_DELIVERED)
+
+        second_prompt = self.runner.calls[-1]["prompt"]
+        self.assertIn("【上次中断的进度】", second_prompt)
+        self.assertIn("book.md", second_prompt)
+        self.assertIn("【续跑要求】", second_prompt)
+        # 跑成功之后交接条没用了，留着会让下次重试误以为没成
+        self.assertNotIn("interrupt", task)
+
+    def test_new_instruction_gets_handoff_without_old_answer(self):
+        self._write("book.md")
+        self.runner.fail_for = [":exec:"]
+        first = self._submit("@agy 把第三章写完")
+        self._wait(first["task_id"])
+
+        self.runner.fail_for = []
+        second = self._submit("@agy 接着上次的继续写")
+        self._wait(second["task_id"])
+
+        prompt = self.runner.calls[-1]["prompt"]
+        self.assertIn("【上一条任务留下的半成品】", prompt)
+        self.assertIn("book.md", prompt)
+        # 换了任务：只给文件线索，不冒充「同一任务的上一轮」
+        self.assertNotIn("【上次中断的进度】", prompt)
+        self.assertNotIn("【续跑要求】", prompt)
+
+    def test_success_leaves_no_interrupt(self):
+        result = self._submit("@agy 写点东西")
+        task = self._wait(result["task_id"])
+        self.assertNotIn("interrupt", task)
+
+    def test_handoff_ignores_other_members_and_stale_runs(self):
+        """交接条只给「同一位成员 + 两小时内」的新指令，换人/太旧就不塞噪音。"""
+        self._write("book.md")
+        self.runner.fail_for = [":exec:"]
+        first = self._submit("@agy 把第三章写完")
+        self._wait(first["task_id"])
+
+        # 手动把时间拨到 3 小时前：超过复用窗口
+        session = self.store.get_session("s1")
+        session["tasks"][first["task_id"]]["interrupt"]["at"] = int(time.time()) - 3 * 3600
+        self.store.save_session(session)
+
+        self.runner.fail_for = []
+        second = self._submit("@DS4 换你看一下")
+        self._wait(second["task_id"])
+        prompt = self.runner.calls[-1]["prompt"]
+        self.assertNotIn("【上一条任务留下的半成品】", prompt)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestFanout(TaskCase):
+    """一条消息 @ 多位 → 并行分工：每位各一条单任务、各出一条回答。
+
+    以前只认第一个 @，其余人静默收不到任何东西；现在要求「三份独立产出」。
+    """
+
+    def _tasks(self):
+        return list(self.store.get_session("s1")["tasks"].values())
+
+    def _results(self):
+        return [m for m in self.store.get_session("s1")["messages"]
+                if m.get("kind") == "task_result"]
+
+    def test_three_mentions_create_three_tasks(self):
+        result = self._submit("@agy @DS4 @HY4 请帮我整理一份去北京的攻略")
+        self.assertEqual(result["type"], T.TYPE_SINGLE)
+        self.assertEqual(len(result["task_ids"]), 3)
+        self.assertTrue(result.get("fanout_id"))
+
+        tasks = self._tasks()
+        self.assertEqual(len(tasks), 3)
+        self.assertEqual({t["owner_id"] for t in tasks}, {"emp_agy", "emp_ds4", "emp_hy4"})
+        self.assertEqual({t["goal"] for t in tasks},
+                         {"@agy @DS4 @HY4 请帮我整理一份去北京的攻略"})
+        # 三条回答气泡，各自带 owner，互不覆盖
+        self.assertEqual(len(self._results()), 3)
+        self.assertEqual({m["sender"] for m in self._results()},
+                         {"emp_agy", "emp_ds4", "emp_hy4"})
+
+        for tid in result["task_ids"]:
+            self._wait(tid)
+        for tid in result["task_ids"]:
+            task = self._task(tid)
+            self.assertEqual(task["status"], T.STATUS_DELIVERED)
+        self.assertTrue(all(t.get("fanout_id") == result["fanout_id"] for t in self._tasks()))
+
+    def test_each_prompt_carries_own_file_prefix(self):
+        result = self._submit("@agy @DS4 @HY4 整理北京攻略")
+        for tid in result["task_ids"]:
+            self._wait(tid)
+        prompts = {t["owner_id"]: t["part_a"]["sent_prompt"] for t in self._tasks()}
+        self.assertEqual(len(prompts), 3)
+        expected = {"emp_agy": "agy", "emp_ds4": "DS4", "emp_hy4": "HY4"}
+        for owner, prefix in expected.items():
+            prompt = prompts[owner]
+            self.assertIn("【并行分工】", prompt)
+            self.assertIn(f"「{prefix}-」", prompt)
+            # 同批其他成员要写清名字：模型才知道自己这份跟谁不重名
+            for other in set(expected.values()) - {prefix}:
+                self.assertIn(other, prompt)
+        self.manager.wait_idle()
+
+    def test_single_mention_keeps_single_task(self):
+        result = self._submit("@agy 整理北京攻略")
+        self.assertNotIn("task_ids", result)
+        self.assertEqual(len(self._tasks()), 1)
+        prompt = self._tasks()[0]["part_a"]["sent_prompt"]
+        self.assertNotIn("【并行分工】", prompt)
+        self.manager.wait_idle()
+
+    def test_duplicate_mention_is_deduped(self):
+        result = self._submit("@agy @agy 整理北京攻略")
+        self.assertNotIn("task_ids", result)
+        self.assertEqual(len(self._tasks()), 1)
+        self.manager.wait_idle()
+
+    def test_disabled_member_blocks_the_whole_fanout(self):
+        settings = copy.deepcopy(self.settings)
+        for emp in settings["employees"]:
+            if emp["id"] == "emp_hy4":
+                emp["enabled"] = False
+        self.manager.auto_start = False
+        result = self.manager.submit_message("s1", "@agy @DS4 @HY4 整理北京攻略", settings)
+        self.assertTrue(result.get("validation_error"))
+        self.assertIn("HY4", result["error"])
+        # 少发一份比发错更难发现，所以宁可一条都不建
+        self.assertEqual(self._tasks(), [])
+
+    def test_one_member_failure_does_not_touch_siblings(self):
+        self.runner.fail_for = [":exec:emp_ds4"]
+        result = self._submit("@agy @DS4 @HY4 整理北京攻略")
+        for tid in result["task_ids"]:
+            self._wait(tid)
+        statuses = {t["owner_id"]: t["status"] for t in self._tasks()}
+        self.assertEqual(statuses["emp_agy"], T.STATUS_DELIVERED)
+        self.assertEqual(statuses["emp_ds4"], T.STATUS_FAILED)
+        self.assertEqual(statuses["emp_hy4"], T.STATUS_DELIVERED)
+
+        # 重试只重跑失败那一位，另外两位不再被调用
+        self.runner.fail_for = []
+        T.CANCELLED_KEYS.clear()
+        ds4_task = next(t for t in self._tasks() if t["owner_id"] == "emp_ds4")
+        self.manager.retry("s1", ds4_task["task_id"], T.STAGE_EXEC)
+        task = self._wait(ds4_task["task_id"])
+        self.assertEqual(task["status"], T.STATUS_DELIVERED)
+        calls = [(c["key"]) for c in self.runner.calls if ":exec:" in c["key"]]
+        self.assertEqual(len([k for k in calls if "emp_ds4" in k]), 2)
+        self.assertEqual(len([k for k in calls if "emp_agy" in k]), 1)
+        self.assertEqual(len([k for k in calls if "emp_hy4" in k]), 1)
+
+    def test_collab_still_takes_the_collab_path(self):
+        result = self._submit("/collab @agy @DS4 @HY4 整理北京攻略")
+        self.assertEqual(result["type"], T.TYPE_COLLAB)
+        self.assertNotIn("task_ids", result)
+        self.assertEqual(len(self._tasks()), 1)
+        self.manager.wait_idle()
+
+    def test_file_prefix_prefers_bracket_short_name(self):
+        """文件名前缀用括号里的短名：`DeepSeek-V4 (DS4)` → `DS4-攻略.md`。"""
+        self.assertEqual(T._safe_prefix("agy"), "agy")
+        self.assertEqual(T._safe_prefix("DeepSeek-V4 (DS4)"), "DS4")
+        self.assertEqual(T._safe_prefix("混元-4 （HY4）"), "HY4")
+        # 路径分隔符、空白、冒号不能进文件名
+        self.assertEqual(T._safe_prefix("a/b:c d"), "a-b-c-d")
+        self.assertEqual(T._safe_prefix(""), "member")

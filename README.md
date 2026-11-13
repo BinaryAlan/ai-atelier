@@ -31,7 +31,7 @@
 
 - [What It Is](#about)
 - [Quick Start](#start)
-- [Two Kinds of Tasks](#tasks)
+- [Task Types and Dispatch](#tasks)
 - [The Task Card in Chat](#card)
 - [Messages, Context and Deletion](#message)
 - [Workspace and File Preview](#workspace)
@@ -89,6 +89,7 @@ Open <http://127.0.0.1:5050>. On first run `run.sh` creates the virtual environm
 ./run.sh restart    # restart (running tasks are marked cancelled, retry from the card)
 ./run.sh stop       # graceful shutdown
 ./run.sh dev        # development mode: enables hot reload
+./run.sh logs       # follow the service log (restart-spawned instances write .run/service.log)
 ```
 
 ### Your first task
@@ -102,13 +103,15 @@ Open <http://127.0.0.1:5050>. On first run `run.sh` creates the virtual environm
 
 <a id="tasks"></a>
 
-## 🔄 Two Kinds of Tasks
+## 🔄 Task Types and Dispatch
 
 The instruction and the mentions decide the type.
 
 **Single task** — `@` one member and ask it to do something. The task joins that member's queue, runs independently, and produces one result message (Markdown body + artifact info). Cancel / Retry / Regenerate live directly on that message.
 
-You can also skip the `@`: the message goes to the member you last talked to in this session (shown as "Sent to X" on the bubble), so follow-up questions don't need re-mentioning. If no AI has spoken in the session yet, the message is kept as context only.
+You can also skip the `@`: the message goes to the member you last talked to in this session, so follow-up questions don't need re-mentioning. If no AI has spoken in the session yet, the message is kept as context only.
+
+**Fan-out** — when one plain message `@`s two or more members, each gets its own single task: one take each, one result message each. They run in parallel (different members never block each other), stay independent (one failing does not affect the others, and retries are per task), and cannot see each other's answers, so they do not converge. Artifacts share one workspace, so every task is told to prefix filenames with its own name (e.g. `DS4-beijing.md`). The composer shows "Will go to A, B, C separately: each answers independently" before sending; a disabled member blocks the whole message.
 
 **Collaborative task** — start with `/collab`. Exactly **one round** of three stages: owner executes → reviewers work in parallel → owner delivers. Input is validated strictly: one explicit owner, at least one reviewer after it, and a task description; anything missing is rejected with a hint. Mentions may appear anywhere in the sentence, and forms such as `@DS4`, `@//agy/` or `@DeepSeek-V4 (DS4)` are recognised.
 
@@ -116,10 +119,12 @@ You can also skip the `@`: the message goes to the member you last talked to in 
 flowchart TD
     U["User sends a message with mentions"] --> T{Instruction and mentions}
     T -->|"@ one member"| S["Single task · joins that member's queue"]
+    T -->|"@ several members"| F["Fan-out · one single task each"]
     T -->|"/collab @owner @reviewer…"| C{Input validation}
     C -->|"Owner / reviewer / text missing"| CE["Reject with a hint"]
     C -->|Valid| CQ["Collaborative task · joins owner's queue"]
     S --> Q["Per-member FIFO queues · different members run in parallel"]
+    F --> Q
     CQ --> Q
     Q --> S1["Member finishes → one result message"]
     Q --> C1["1 Owner executes → 2 Reviews in parallel → 3 Owner delivers"]
@@ -277,7 +282,7 @@ ai-meeting/
 │   └── acceptance.md            # Acceptance criteria and verification
 ├── tests/                       # Task system, executor, message deletion, file preview tests
 ├── requirements.txt             # Flask
-├── run.sh                       # start / dev / stop / restart / status
+├── run.sh                       # start / dev / stop / restart / status / logs
 └── LICENSE                      # PolyForm Noncommercial 1.0.0
 ```
 

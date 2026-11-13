@@ -28,6 +28,7 @@ from core.executor import (
     sanitize_model_output,
     looks_like_incomplete,
     capability_block,
+    validate_cli_template,
 )
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -306,6 +307,51 @@ def parse_single(content: str, settings: Dict[str, Any]) -> Optional[str]:
     return str(hits[0][0]["id"]) if hits else None
 
 
+def parse_fanout(content: str, settings: Dict[str, Any]) -> Tuple[List[str], str]:
+    """一条普通消息 @ 了多位成员：返回 (成员 id 列表, 错误说明)。
+
+    为什么需要这个：普通消息原先只认第一个 @，其余人静默收不到任何东西 ——
+    用户写「@a @b @c 各写一份攻略」时，另外两位连提示都没有。
+    现在 2 位以上就并行分工：每人一条独立单任务、各出一条回答。
+
+    停用 / 缺 CLI 配置的成员一律拦截而不是悄悄跳过：少发一份比发错更难发现。
+    """
+    owners: List[str] = []
+    unusable: List[str] = []
+    for emp, _start, _end in scan_mentions(content or "", settings):
+        eid = str(emp.get("id") or "")
+        if not eid or eid in owners or eid in unusable:
+            continue
+        if usable_member(settings, eid):
+            owners.append(eid)
+        else:
+            unusable.append(eid)
+    if len(owners) < 2:
+        return [], ""
+    if unusable:
+        names = "、".join(_member_label(settings, eid) or eid for eid in unusable)
+        return owners, (
+            f"被 @ 的 {names} 已停用或缺少 CLI 配置：请先在设置里启用，"
+            "或去掉对它的 @ 再发送"
+        )
+    return owners, ""
+
+
+def _safe_prefix(name: Any) -> str:
+    """文件名前缀：优先用括号里的短名（「DeepSeek-V4 (DS4)」→ DS4），否则用全名。
+
+    全名直接当文件名前缀会得到 `DeepSeek-V4-DS4-攻略.md` 这种又长又难读的名字，
+    而用户写在括号里的那个短名（DS4 / HY4）本来就是他们的叫法。
+    """
+    raw = str(name or "").strip()
+    short = re.search(r"[（(]([^（）()]{1,20})[）)]", raw)
+    if short:
+        raw = short.group(1)
+    cleaned = re.sub(r'[\\/:*?"<>|\s]+', "-", raw).strip("-")
+    return cleaned or "member"
+
+
+
 def last_ai_member(messages: List[Dict[str, Any]], settings: Dict[str, Any]) -> Optional[str]:
     """最近一个跟用户说过话、并且现在还能用的 AI 成员。
 
@@ -437,10 +483,14 @@ def build_prompt(
     workspace_dir: str = "",
     quoted: str = "",
     context: Optional[Dict[str, Any]] = None,
+    resume: Optional[Dict[str, Any]] = None,
+    fanout: Optional[Dict[str, Any]] = None,
 ) -> str:
     """拼装某环节的完整输入；规程文件随软件提供，服务端读取后注入。
 
     context 见 build_context()：会话背景 + 产物清单一起构成规格 4.2 的「会话背景、产物索引」。
+    resume 见 render_resume()：上一次中断留下的交接条（半成品正文 + 改动文件）。
+    fanout 见 _execute_unit：一条消息 @ 多位时的并行分工说明（文件名前缀靠它约束）。
     """
     if stage == STAGE_REVIEW:
         role_key = STAGE_REVIEW
@@ -458,6 +508,21 @@ def build_prompt(
     parts = [_read_protocol("protocol/task-flow.md"), _read_protocol(ROLE_FILES[role_key])]
     parts.append(f"【当前环节】{stage_label}")
     parts.append(f"【工作目录】{workspace_dir or '（未指定）'}")
+    if fanout and fanout.get("prefix"):
+        others = [str(n) for n in (fanout.get("others") or []) if str(n)]
+        head = (
+            f"【并行分工】这条消息同时发给了{'、'.join(others)}和你，"
+            "每位各自独立完成一份，互不参考、互不等待。"
+            if others else
+            "【并行分工】这条消息同时发给了多位成员，每位各自独立完成一份。"
+        )
+        parts.append("\n".join([
+            head,
+            "- 只交付你自己这一份，不要等其他成员，也不要替别人写。",
+            f"- 产出的每个文件都以「{fanout['prefix']}-」开头（例如 "
+            f"{fanout['prefix']}-攻略.md），否则会和同批其他成员的文件重名、互相覆盖。",
+            "- 正文里简要说明你这一份的侧重与做法，方便用户横向比较。",
+        ]))
     if context and context.get("messages"):
         head = f"【会话背景（最近 {len(context['messages'])} 条）】"
         if context.get("dropped"):
@@ -469,6 +534,9 @@ def build_prompt(
     parts.append(f"【用户原话】\n{goal}")
     if quoted:
         parts.append(f"【被引用的原话】\n{quoted}")
+    resume_block = render_resume(resume)
+    if resume_block:
+        parts.append(resume_block)
     if artifacts:
         parts.append("【主创产物清单】\n" + json.dumps(artifacts, ensure_ascii=False, indent=2))
     if opinions:
@@ -660,6 +728,176 @@ def _review_needs_retry(res: Any) -> bool:
     return looks_like_incomplete(cleaned)
 
 
+# 中断续跑：模型每次都是新进程，上一轮想过什么、读过什么它自己不知道。
+# 能补的只有两样物证——中断前已经吐出来的正文、和那次执行里被改过的文件。
+# 把它写进下一轮 Prompt，等于给新进程一份「你上次做到这里」的交接条。
+INTERRUPT_PARTIAL_CHARS = 4000
+INTERRUPT_FILE_LIMIT = 20
+INTERRUPT_REUSE_SECONDS = 2 * 3600
+INTERRUPT_SCAN_BUDGET = 4000
+INTERRUPT_SCAN_DEPTH = 6
+INTERRUPT_SKIP_DIRS = {
+    ".git", ".hg", ".svn", "node_modules", "__pycache__", ".venv", "venv",
+    ".mypy_cache", ".pytest_cache", ".ruff_cache", ".next", "dist", "build",
+    ".idea", ".vscode", ".workbuddy", ".run",
+}
+INTERRUPT_STATUS_LABELS = {
+    STATUS_FAILED: "失败", STATUS_TIMEOUT: "超时", STATUS_CANCELLED: "已取消",
+}
+
+
+def scan_recent_files(
+    workspace_dir: str,
+    since_ts: float,
+    limit: int = INTERRUPT_FILE_LIMIT,
+) -> List[Dict[str, Any]]:
+    """那次执行期间被改动过的文件（按修改时间倒序）。
+
+    只做有界遍历：跳过依赖 / 缓存目录、最多看 4000 个条目、6 层深，
+    免得在用户的大目录（整个 Documents 之类）上为了重试卡住几秒。
+    """
+    if not workspace_dir or not os.path.isdir(workspace_dir):
+        return []
+    base = os.path.abspath(workspace_dir)
+    found: List[Dict[str, Any]] = []
+    budget = INTERRUPT_SCAN_BUDGET
+    for root, dirs, files in os.walk(base):
+        depth = root[len(base):].count(os.sep)
+        dirs[:] = [] if depth >= INTERRUPT_SCAN_DEPTH else [
+            d for d in dirs if d not in INTERRUPT_SKIP_DIRS and not d.startswith(".")
+        ]
+        for name in files:
+            budget -= 1
+            if budget <= 0 or name.startswith("."):
+                break
+            full = os.path.join(root, name)
+            try:
+                stat = os.stat(full)
+            except OSError:
+                continue
+            if stat.st_mtime + 1 < since_ts:
+                continue
+            found.append({
+                "path": os.path.relpath(full, base),
+                "bytes": stat.st_size,
+                "mtime": int(stat.st_mtime),
+            })
+        if budget <= 0:
+            break
+    found.sort(key=lambda item: item["mtime"], reverse=True)
+    return found[:limit]
+
+
+def recent_interrupt(
+    session: Dict[str, Any],
+    owner_id: str,
+    exclude_tid: str = "",
+    within: int = INTERRUPT_REUSE_SECONDS,
+) -> Optional[Dict[str, Any]]:
+    """同一成员最近一次中断留下的交接条（不含当前任务）。
+
+    用于「不点重试、直接发下一句」的场景：用户说「接着写」，成员至少知道
+    半成品埋在工作目录的哪些文件里，而不是从零再猜一遍。
+    """
+    now = time.time()
+    best: Optional[Dict[str, Any]] = None
+    for tid, task in (session.get("tasks") or {}).items():
+        if tid == exclude_tid or not isinstance(task, dict):
+            continue
+        item = task.get("interrupt") or {}
+        at = item.get("at") or 0
+        if not at or now - at > within:
+            continue
+        if (task.get("owner_id") or "") != (owner_id or ""):
+            continue
+        if best is None or at > (best.get("at") or 0):
+            best = dict(item)
+    return best
+
+
+def _format_size(value: Any) -> str:
+    try:
+        size = int(value or 0)
+    except (TypeError, ValueError):
+        return ""
+    if size <= 0:
+        return ""
+    if size < 1024:
+        return f"{size} B"
+    if size < 1024 * 1024:
+        return f"{size / 1024:.1f} KB"
+    return f"{size / 1024 / 1024:.1f} MB"
+
+
+def _clock_text(ts: Any) -> str:
+    try:
+        return time.strftime("%H:%M", time.localtime(int(ts)))
+    except (TypeError, ValueError, OSError):
+        return ""
+
+
+def render_resume(resume: Optional[Dict[str, Any]]) -> str:
+    """把「上次中断到哪」写成交接条；没有可交接的东西就返回空串。"""
+    if not isinstance(resume, dict):
+        return ""
+    same_task = bool(resume.get("same_task"))
+    files = [f for f in (resume.get("files") or []) if isinstance(f, dict) and f.get("path")]
+    partial = str(resume.get("partial") or "").strip()
+    if not same_task and not files:
+        # 换了任务、又没有文件线索：只剩一句「上次失败了」，属于噪音，不写
+        return ""
+
+    label = INTERRUPT_STATUS_LABELS.get(str(resume.get("status") or ""), "中断")
+    at = _clock_text(resume.get("at"))
+    lines: List[str] = []
+    if same_task:
+        try:
+            seconds = int(float(resume.get("elapsed") or 0))
+        except (TypeError, ValueError):
+            seconds = 0
+        when = f"{at} 开始" if at else "上一次"
+        lines.append(
+            "【上次中断的进度】"
+        )
+        lines.append(
+            f"同一任务的上一轮执行到「{label}」（{when}，跑了 {seconds} 秒）。"
+            "模型换了新进程，上一轮的思路已经没了，只能靠下面这些物证接上。"
+        )
+        if partial:
+            lines.append("中断前已经写出的内容（可能不完整，别当成终稿）：")
+            lines.append("<<<")
+            lines.append(partial)
+            lines.append(">>>")
+    else:
+        goal = str(resume.get("goal") or "").strip()
+        lines.append("【上一条任务留下的半成品】")
+        lines.append(
+            f"同一工作目录里，上一条任务{('（目标：' + _truncate(goal, 120) + '）') if goal else ''}"
+            f"执行到「{label}」{'（' + at + '）' if at else ''}。"
+        )
+
+    if files:
+        listed = [f"- {f['path']}" + (f"（{_format_size(f.get('bytes'))}）" if _format_size(f.get('bytes')) else "")
+                  for f in files]
+        lines.append("那次执行中被改动过的文件（按修改时间倒序）：")
+        lines.extend(listed)
+
+    if same_task:
+        lines.append("【续跑要求】")
+        lines.append(
+            "- 先读上面这些文件确认现状，在已有基础上接着做：已经写完的部分不要重做，"
+            "也不要把整篇推倒重写。"
+        )
+        lines.append("- 若判断已有内容确实不可用、必须重写，在正文里说清理由。")
+        lines.append("- 缺什么自己用 Read / Glob / Grep 查，不要反问。")
+    else:
+        lines.append(
+            "如果本条要求是接着上次做，先读这些文件、在已有内容上继续；"
+            "与本条无关就忽略这一段。"
+        )
+    return "\n".join(lines)
+
+
 def scan_artifacts(workspace_dir: str, artifacts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """产物清单里没写大小时从工作目录补齐；文件不存在也照实列出。"""
     result = []
@@ -826,6 +1064,8 @@ class TaskManager:
                 user_msg["quote"] = {"id": reply_to, "sender_name": "原消息", "excerpt": quoted[:200]}
             messages.append(user_msg)
 
+            # 并行分工的成员列表（普通消息 @ 了多位才有；/collab 走另一套语义）
+            fanout_ids: List[str] = []
             is_collab = bool(re.match(r"^/collab(\s|$)", content, flags=re.I))
             if is_collab:
                 parsed = parse_collab(content, settings)
@@ -842,6 +1082,12 @@ class TaskManager:
                 reviewer_ids = []
                 goal = content
                 task_type = TYPE_SINGLE
+                if not forced_owner_id:
+                    # 一条消息 @ 了多位：不是「第一位干活」，而是每位各做一份
+                    fanout_ids, fanout_error = parse_fanout(content, settings)
+                    if fanout_error:
+                        self._save(session)
+                        return {"error": fanout_error, "validation_error": True}
                 if not owner_id:
                     # 没 @ 任何人：默认接着「最近一位回过话的成员」说（微信式对话习惯）。
                     # 只取本场会话里现存、可用的成员；一个都没有才退回「仅作上下文」。
@@ -863,91 +1109,130 @@ class TaskManager:
                 self._save(session)
                 return {"error": "被点名的成员不可用（已停用或缺少 CLI 配置）"}
 
-            tid = task_id()
+            # 并行分工：一条消息 @ 了多位，每位各建一条单任务。
+            # 共享同一条用户原话（source_msg_id），彼此的答案互不可见——否则会趋同，
+            # 也会被最慢那位拖成串行，失去「三份独立方案」的意义。
+            owners = list(fanout_ids) if len(fanout_ids) >= 2 else [owner_id]
+            fanout_id = task_id() if len(owners) > 1 else ""
+            fanout_names = [
+                (self._employee(settings, oid) or {}).get("name") or oid for oid in owners
+            ]
+            created: List[str] = []
             now = int(time.time())
-            task: Dict[str, Any] = {
-                "task_id": tid,
-                "type": task_type,
-                "source_msg_id": user_msg["id"],
-                "goal": goal,
-                "owner_id": owner_id,
-                "owner_name": emp.get("name") or owner_id,
-                "reviewer_ids": reviewer_ids,
-                "reviewer_names": [
-                    (self._employee(settings, rid) or {}).get("name") or rid for rid in reviewer_ids
-                ],
-                "status": STATUS_QUEUED,
-                "step": 1,
-                "artifacts": [],
-                "card_msg_id": "",
-                "created_at": now,
-                "started_at": None,
-                "finished_at": None,
-                "quoted": quoted,
-                "flow": [{"at": now, "text": "任务已创建，进入队列"}],
-                "part_a": {
-                    "brief": "", "artifacts": [], "final": {},
-                    "status": MEMBER_WAITING, "final_status": MEMBER_WAITING,
-                    "elapsed": 0, "final_elapsed": 0,
-                    # 每个环节自己的起止时刻：任务级别的 started_at/finished_at
-                    # 分不到三段上，卡片和「输入输出」要显示「几点开始、几点返回」
-                    "started_at": None, "finished_at": None,
-                    "final_started_at": None, "final_finished_at": None,
-                    "msg_id": "", "sent_prompt": "", "raw_output": "",
-                    "final_sent_prompt": "", "final_raw_output": "",
-                },
-                "part_b": [],
-                "attempts": {},
-            }
-
-            if task_type == TYPE_COLLAB:
-                for rid in reviewer_ids:
-                    rname = (self._employee(settings, rid) or {}).get("name") or rid
-                    task["part_b"].append({
-                        "member_id": rid, "name": rname, "status": MEMBER_WAITING,
-                        "summary": "", "raw_output": "", "sent_prompt": "", "msg_id": "",
-                        "elapsed": 0, "started_at": None, "finished_at": None,
-                    })
-                card_msg = {
-                    "id": msg_id(),
-                    "sender": "system",
-                    "sender_name": "任务卡片",
-                    "content": goal,
-                    "kind": "task_card",
+            for index, oid in enumerate(owners):
+                owner_emp = emp if oid == owner_id else self._employee(settings, oid)
+                if not owner_emp:
+                    continue
+                tid = task_id()
+                task: Dict[str, Any] = {
                     "task_id": tid,
-                    "in_chat": True,
+                    "type": task_type,
+                    "source_msg_id": user_msg["id"],
+                    "goal": goal,
+                    "owner_id": oid,
+                    "owner_name": owner_emp.get("name") or oid,
+                    "reviewer_ids": reviewer_ids,
+                    "reviewer_names": [
+                        (self._employee(settings, rid) or {}).get("name") or rid
+                        for rid in reviewer_ids
+                    ],
                     "status": STATUS_QUEUED,
-                    "created_at": now,
-                    "card": build_card(task),
-                }
-                messages.append(card_msg)
-                task["card_msg_id"] = card_msg["id"]
-            else:
-                result_msg = {
-                    "id": msg_id(),
-                    "sender": owner_id,
-                    "sender_name": emp.get("name") or owner_id,
-                    "content": "",
-                    "kind": "task_result",
-                    "task_id": tid,
-                    "in_chat": True,
-                    "status": STATUS_QUEUED,
-                    "created_at": now,
-                    "sent_prompt": "",
-                    "raw_response": "",
+                    "step": 1,
                     "artifacts": [],
+                    "card_msg_id": "",
+                    "created_at": now,
+                    "started_at": None,
+                    "finished_at": None,
+                    "quoted": quoted,
+                    "flow": [{"at": now, "text": "任务已创建，进入队列"}],
+                    "part_a": {
+                        "brief": "", "artifacts": [], "final": {},
+                        "status": MEMBER_WAITING, "final_status": MEMBER_WAITING,
+                        "elapsed": 0, "final_elapsed": 0,
+                        # 每个环节自己的起止时刻：任务级别的 started_at/finished_at
+                        # 分不到三段上，卡片和「输入输出」要显示「几点开始、几点返回」
+                        "started_at": None, "finished_at": None,
+                        "final_started_at": None, "final_finished_at": None,
+                        "msg_id": "", "sent_prompt": "", "raw_output": "",
+                        "final_sent_prompt": "", "final_raw_output": "",
+                    },
+                    "part_b": [],
+                    "attempts": {},
                 }
-                messages.append(result_msg)
-                task["result_msg_id"] = result_msg["id"]
+                if fanout_id:
+                    # 归组 + 互通姓名：Prompt 里要告诉成员「这条同时发给了谁」，
+                    # 才能要求文件名带自己的前缀，避免三人写出同名文件互相覆盖
+                    task["fanout_id"] = fanout_id
+                    task["fanout_names"] = list(fanout_names)
+                    task["flow"][0]["text"] = (
+                        f"任务已创建，进入队列（并行分工 {index + 1}/{len(owners)}："
+                        f"{'、'.join(fanout_names)}）"
+                    )
 
-            session["tasks"][tid] = task
-            session["task_queues"].setdefault(owner_id, []).append(tid)
-            session["active_task_id"] = tid
+                if task_type == TYPE_COLLAB:
+                    for rid in reviewer_ids:
+                        rname = (self._employee(settings, rid) or {}).get("name") or rid
+                        task["part_b"].append({
+                            "member_id": rid, "name": rname, "status": MEMBER_WAITING,
+                            "summary": "", "raw_output": "", "sent_prompt": "", "msg_id": "",
+                            "elapsed": 0, "started_at": None, "finished_at": None,
+                        })
+                    card_msg = {
+                        "id": msg_id(),
+                        "sender": "system",
+                        "sender_name": "任务卡片",
+                        "content": goal,
+                        "kind": "task_card",
+                        "task_id": tid,
+                        "in_chat": True,
+                        "status": STATUS_QUEUED,
+                        "created_at": now,
+                        "card": build_card(task),
+                    }
+                    messages.append(card_msg)
+                    task["card_msg_id"] = card_msg["id"]
+                else:
+                    # 每位成员各一条结果消息：聊天里就是三条并列的回答，
+                    # 各自带取消 / 重试 / 重新生成，互不牵连
+                    result_msg = {
+                        "id": msg_id(),
+                        "sender": oid,
+                        "sender_name": owner_emp.get("name") or oid,
+                        "content": "",
+                        "kind": "task_result",
+                        "task_id": tid,
+                        "in_chat": True,
+                        "status": STATUS_QUEUED,
+                        "created_at": now,
+                        "sent_prompt": "",
+                        "raw_response": "",
+                        "artifacts": [],
+                    }
+                    messages.append(result_msg)
+                    task["result_msg_id"] = result_msg["id"]
+                if fanout_id:
+                    result_msg_id = task.get("result_msg_id") or task.get("card_msg_id")
+                    for msg in messages:
+                        if isinstance(msg, dict) and msg.get("id") == result_msg_id:
+                            msg["fanout_id"] = fanout_id
+                            break
+
+                session["tasks"][tid] = task
+                session["task_queues"].setdefault(oid, []).append(tid)
+                session["active_task_id"] = tid
+                created.append(tid)
+
             self._save(session)
 
         if self.auto_start:
-            self.ensure_worker(sid, owner_id)
-        return {"task_id": tid, "type": task_type}
+            for oid in owners:
+                self.ensure_worker(sid, oid)
+        result: Dict[str, Any] = {"task_id": created[0], "type": task_type}
+        if len(created) > 1:
+            # 并行分工：前端只刷新整份会话，多给的 id 供调用方/日志核对
+            result["task_ids"] = created
+            result["fanout_id"] = fanout_id
+        return result
 
     @staticmethod
     def _employee(settings: Dict[str, Any], emp_id: str) -> Optional[Dict[str, Any]]:
@@ -1128,6 +1413,36 @@ class TaskManager:
                 self._update_card(session, task)
                 self._save(session)
 
+    def _settings_for_session(
+        self, session: Dict[str, Any], settings: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """把会话级「成员 → 推理档位」覆盖到成员配置上。
+
+        执行阶段会重新 load_settings()，所以必须在这里替换 cli_cmd；
+        只改本次执行的副本，全局 data/settings.json 保持不变。
+        """
+        base = settings or self.store.load_settings()
+        overrides = (session or {}).get("member_models") or {}
+        if not isinstance(overrides, dict) or not overrides:
+            return base
+
+        out = dict(base)
+        merged = []
+        for emp in (base.get("employees") or []):
+            e = dict(emp)
+            ov = overrides.get(e.get("id"))
+            if isinstance(ov, dict):
+                cmd = str(ov.get("cli_cmd") or "")
+                # 会话文件也是本机可写的：再校验一次，别绕过 CLI 白名单
+                ok, _ = validate_cli_template(cmd)
+                if ok:
+                    e["cli_cmd"] = cmd
+                    e["model_key"] = str(ov.get("model_key") or "")
+                    e["reasoning"] = str(ov.get("reasoning") or "")
+            merged.append(e)
+        out["employees"] = merged
+        return out
+
     def _run_task(self, sid: str, tid: str) -> None:
         with self.store.session_lock(sid):
             session = self._get(sid)
@@ -1137,7 +1452,7 @@ class TaskManager:
             if not task:
                 return
             task_type = task.get("type")
-            settings = self.store.load_settings()
+            settings = self._settings_for_session(session)
             workspace_dir = session.get("workspace_dir", "")
 
         if task_type == TYPE_SINGLE:
@@ -1513,6 +1828,24 @@ class TaskManager:
             attempt_key = f"{stage}:{member_id or task.get('owner_id')}"
             # 重试沿用的是最初的用户原话，但那之后用户补充的约束必须一起带上
             is_retry = task.setdefault("attempts", {}).get(attempt_key, 0) > 0
+            # 上一轮中断留下的交接条：同一环节重试 → 同一任务的续跑；
+            # 换了新指令 → 只交代「上一条任务在同一目录留了哪些半成品」，不塞旧正文
+            resume: Optional[Dict[str, Any]] = None
+            last_break = task.get("interrupt") or {}
+            if last_break.get("stage") == stage:
+                resume = dict(last_break, same_task=True)
+            elif stage == STAGE_EXEC and not is_retry and task.get("type") == TYPE_SINGLE:
+                hint = recent_interrupt(session, emp_id or "", exclude_tid=tid)
+                if hint:
+                    resume = dict(hint, same_task=False)
+            fanout: Optional[Dict[str, Any]] = None
+            group_names = task.get("fanout_names") or []
+            if len(group_names) >= 2:
+                my_name = emp.get("name") or emp_id or ""
+                fanout = {
+                    "prefix": _safe_prefix(my_name),
+                    "others": [n for n in group_names if str(n) != str(my_name)],
+                }
             prompt = build_prompt(
                 stage=stage,
                 goal=task.get("goal", ""),
@@ -1526,6 +1859,8 @@ class TaskManager:
                     task.get("source_msg_id") or "",
                     include_after=is_retry,
                 ),
+                resume=resume,
+                fanout=fanout,
             )
             if read_only:
                 # 只读环节（审核）把「到底能不能读文件」如实写进 prompt：
@@ -1621,6 +1956,7 @@ class TaskManager:
 
         started = time.time()
         cancelled_flag = False
+        partial = ""
         try:
             res = self.runner(runner_emp, prompt, **run_kwargs)
             # 语义层重试（仅审核环节）：模型只回了「我先读取…」这类开场白、没给任何结论时，
@@ -1660,8 +1996,12 @@ class TaskManager:
                 cancelled_flag = key in CANCELLED_KEYS
                 CANCELLED_KEYS.discard(key)
             # 这一轮已结束：暂存的半成品立刻撤掉，结果马上会以正式记录落库。
-            # 不清理的话，界面会一直显示上一轮的「正在写」文本
+            # 不清理的话，界面会一直显示上一轮的「正在写」文本。
+            # 但先留一份：中断时这就是唯一的物证，重试要靠它告诉成员「你写到哪了」。
             if sink:
+                snap = streaming.get(live_key)
+                if snap:
+                    partial = str(snap.get("text") or "").strip()
                 streaming.clear(live_key)
 
         status = str(getattr(res, "status", "") or "")
@@ -1680,6 +2020,16 @@ class TaskManager:
             # 执行记录代表「这一次执行完成」，不是整个任务已交付；任务终态由各环节写回
             mapped = STATUS_DONE
 
+        # 中断时把「写到哪」的物证留下：暂存区的半成品正文 + 这次执行改动过的文件。
+        # 成功则不扫盘（没有续跑需求，扫描纯属浪费）。
+        interrupted = mapped != STATUS_DONE
+        if interrupted and partial:
+            # 半成品正文别丢：挂到记录的 raw_response 前面，点「输入输出」还能看到
+            raw = partial + (
+                "\n\n--- 以上为中断前已输出，下面是进程输出 ---\n\n" + raw if raw else ""
+            )
+        interrupt_files = scan_recent_files(workspace_dir, started - 1) if interrupted else []
+
         with self.store.session_lock(sid):
             session = self._get(sid)
             if session:
@@ -1691,6 +2041,27 @@ class TaskManager:
                     "started_at": started_ts,
                     "finished_at": finished_ts,
                 })
+                task = (session.get("tasks") or {}).get(tid)
+                if isinstance(task, dict):
+                    if not interrupted:
+                        # 这一环跑成功了：上一轮的半成品不再需要，留着会让下次重试误以为没跑
+                        if (task.get("interrupt") or {}).get("stage") == stage:
+                            task.pop("interrupt", None)
+                    else:
+                        task["interrupt"] = {
+                            "stage": stage,
+                            "task_id": tid,
+                            "member_id": emp_id or "",
+                            "status": mapped,
+                            "goal": task.get("goal") or "",
+                            "at": finished_ts,
+                            "started_at": started_ts,
+                            "elapsed": elapsed,
+                            "partial": partial[-INTERRUPT_PARTIAL_CHARS:] if partial else "",
+                            "files": interrupt_files,
+                        }
+                        if partial or interrupt_files:
+                            self._add_flow(task, "已保留中断前的输出与改动文件，重试可接着做")
                 self._save(session)
 
         return {
@@ -1967,11 +2338,12 @@ class TaskManager:
                 self._retries.discard(retry_key)
 
     def _retry_worker(self, sid: str, tid: str, stage: str, member_id: str) -> None:
-        settings = self.store.load_settings()
         with self.store.session_lock(sid):
             session = self._get(sid)
             if not session:
                 return
+            # 重试同样要套用会话级推理档位，否则会用回全局配置
+            settings = self._settings_for_session(session)
             task = (session.get("tasks") or {}).get(tid) or {}
             workspace_dir = session.get("workspace_dir", "")
             task_type = task.get("type")
