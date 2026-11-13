@@ -976,3 +976,25 @@ agy（单任务）结果消息头部的耗时此前两种显示不一致：运�
 - 已知保留项（不影响使用）：`.venv` 之外的 `data/sessions/*.json` 消息正文里仍有历史 `file://` 旧路径；
   `.run/service.log` 是历史日志，含旧路径，已被 git 忽略；前端 `localStorage` 的键前缀仍是 `aim.`
   （改前缀会让用户已保存的语言与面板布局重置，故不改）。
+
+## A86 · 404 不再无限轮询（会话被删 / 文件被改名）
+
+- 现象：服务日志里每秒钟刷出成对的 404 —— `GET /api/sessions/demo-session/live` 与
+  `GET /api/workspace/file?meta=1&path=/demo/workspace/...`，看着像「启动报一堆错」，
+  实际是前端三个轮询在目标不存在时只 `return`、不断重试。
+  （本次的直接触发源是录屏脚本残留的无头 Chrome，页面还停在虚构会话上；见下条。）
+- 修复（`static/js/app.js`）：
+  - `refreshSession()`：`GET /api/sessions/<id>` 返回 404 → 调 `handleSessionGone(sid)`；
+  - `pollLiveStreams()`：`/api/sessions/<id>/live` 返回 404 → 同上；
+  - `pollPreviewFile()`：`/api/workspace/file?meta=1` 返回 404 → 置 `filePreview.error`
+    「文件已不存在（可能被改名或删除）」，函数开头的 `pv.error` 短路会让轮询自然停下；
+  - 新增 `handleSessionGone(sid)`：只在仍是当前会话时生效，清 `currentSessionId` /
+    `currentSession` / 流式缓冲 / 工作目录栈，删 `localStorage.aim.lastSession`，
+    提示「这个会话已不存在，已停止刷新」，并重新拉一次会话列表。
+  - `i18n.js` 补两条英文；`?v=` 升到 `20261113r7`。
+- 录屏脚本收尾（`/tmp/cdp.mjs`）：新增 `killChrome()` —— 先 `/json/close/<id>` 关掉所有页面，
+  再按 9333 端口杀掉 headless Chrome；`make_demo_atelier.mjs` 退出前调用。
+  之前只 `app.close()` 关 WebSocket，浏览器留着，页面继续每秒轮询本地服务，正是刷屏源头。
+- 验证：`node --check` 三个前端文件；临时起服务 + 无头浏览器加载页面后手动触发
+  `refreshSession()`（会话不存在）：`currentSessionId` 变 `null`、提示文本正确、消息清空、
+  工作目录清空；全量 `Ran 189 tests — OK`；验证后端口 5050 / 9333 均已释放。

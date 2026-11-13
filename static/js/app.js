@@ -985,9 +985,14 @@ createApp({
       return this._taskAction(msg, stage, memberId, "retry");
     },
     async refreshSession() {
-      if (!this.currentSessionId) return;
-      const res = await fetch(`/api/sessions/${this.currentSessionId}`);
-      if (!res.ok) return;
+      const sid = this.currentSessionId;
+      if (!sid) return;
+      const res = await fetch(`/api/sessions/${sid}`);
+      if (!res.ok) {
+        // 会话被删掉后不要再每秒重试，否则 /api/sessions/<id> 会一直 404
+        if (res.status === 404) this.handleSessionGone(sid);
+        return;
+      }
       const latest = await res.json();
       if (latest.id !== this.currentSessionId) return;
       this.currentSession = latest;
@@ -2679,7 +2684,12 @@ createApp({
       }
       try {
         const res = await fetch(`/api/sessions/${sid}/live`);
-        if (!res.ok) return;
+        if (!res.ok) {
+          // 会话已经在服务端不存在（在另一个窗口被删、或服务重启后数据被清理）：
+          // 不能只是静默 return，否则这里会一直每秒打一次 /live，404 把服务日志刷满。
+          if (res.status === 404) this.handleSessionGone(sid);
+          return;
+        }
         const data = await res.json();
         if (sid !== this.currentSessionId) return;
         const streams = data.streams || {};
@@ -2702,6 +2712,25 @@ createApp({
       } catch (e) {
         // 静默容错：拿不到就继续显示上一份
       }
+    },
+
+    // 会话在服务端已不存在：停止轮询并回到空态（否则每秒一次的 /live 会一直 404）。
+    handleSessionGone(sid) {
+      if (sid !== this.currentSessionId) return;
+      this.currentSessionId = null;
+      this.currentSession = {
+        id: "", title: "", messages: [], employee_ids: [],
+        workspace_dir: "", tasks: {}, task_queues: {}, active_task_id: null
+      };
+      this.liveStreams = {};
+      this.liveLast = {};
+      this.selectedWorkspaceFile = null;
+      this.selectedFileContent = "";
+      this.workspaceCurrentDir = "";
+      this.workspacePathStack = [];
+      try { localStorage.removeItem("aim.lastSession"); } catch (e) { /* 隐私模式忽略 */ }
+      this.showToast(this.t("这个会话已不存在，已停止刷新"));
+      this.loadSessions().catch(() => {});
     },
 
     insertMention(name) {      this.suggest = null;
@@ -2969,7 +2998,12 @@ createApp({
       if (pv.too_large) return;
       try {
         const res = await fetch(`/api/workspace/file?meta=1&path=${encodeURIComponent(pv.path)}`);
-        if (!res.ok) return;
+        if (!res.ok) {
+          // 文件已经被改名 / 删除：标成错误态即可停止轮询（本函数开头遇到 pv.error 直接返回），
+          // 否则会每秒一次 404 打满服务日志。
+          if (res.status === 404) pv.error = this.t("文件已不存在（可能被改名或删除）");
+          return;
+        }
         const meta = await res.json();
         // 期间可能已经切到别的文件 / 关了面板
         if (!this.filePreview || this.filePreview.path !== pv.path) return;

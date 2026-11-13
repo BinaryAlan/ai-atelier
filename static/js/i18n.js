@@ -13,6 +13,8 @@ window.AIM_I18N = {
     "删除": "Delete",
     "暂无收藏会话": "No favorite sessions",
     "暂无会话，点击上方新建": "No sessions yet — create one above",
+    "这个会话已不存在，已停止刷新": "This session no longer exists — refresh stopped",
+    "文件已不存在（可能被改名或删除）": "File is gone (renamed or deleted)",
     "展开左侧列表": "Expand sidebar",
     "收起左侧列表": "Collapse sidebar",
     "未选择会话": "No session selected",
