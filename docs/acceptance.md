@@ -950,3 +950,29 @@ agy（单任务）结果消息头部的耗时此前两种显示不一致：运�
   Mermaid 预览、片尾）无空白帧与错误字幕。
 - 删除三个未跟踪的项目命名建议 md（`ds-4.1-项目命名建议.md`、
   `gemini-3.8-项目重命名提案.md`、`hy4-free-命名建议.md`）。
+
+## A85 · 本地目录改名为 ai-atelier
+
+- 本地工作目录 `~/Code/ai-meeting` → **`~/Code/ai-atelier`**（`mv`，同一卷内原子改名），
+  与远端仓库名、README 里的 `git clone … && cd ai-atelier` 保持一致。
+- 改名会带走一路硬编码的绝对路径，逐项核对并修掉：
+  - `.venv/bin/{flask,pip,pip3,pip3.12,activate,activate.fish,activate.csh}` 的 shebang / 前缀、
+    `.venv/pyvenv.cfg` 的 `command =` 全部指向旧目录 → 替换为新路径；旧 `__pycache__/*.pyc`
+    里的 `co_filename` 一并清掉（删目录，由解释器重新生成）。改后 `.venv/bin/python`、
+    `pip --version`、`flask --version` 均正常，venv 无需重建。
+  - `data/sessions/97117ff4.json` 的 `workspace_dir` 存的是旧的绝对路径，改名后该目录不存在，
+    右侧工作目录面板会失效 → 先备份到 `.run/rename-backup-<ts>/`，再改为新路径
+    （只改这一个结构字段；消息正文里的历史路径属于历史记录，不动）。另两个会话的
+    工作目录是 `~/Documents/social skill`，不受影响。
+- 全仓库复查：`prompts/protocol/task-flow.md`、`README.md` / `README_zh.md`、`docs/task-review-protocol.md`、
+  `static/index.html`（`<title>` 与左栏 `h1`）、`static/js/app.js`（语言切换改 `document.title`）、
+  `app.py` 启动横幅、`run.sh` 注释与回显、`LICENSE`、`tests/test_tasks.py` 断言均为 `AI Atelier`，
+  无旧名残留；`docs/acceptance.md` 中旧名只出现在描述「改名前后」的历史记录里（A81 / A84 / 本条目）。
+- `.git` 侧无需变动：`origin` 上一轮已指向 `https://github.com/BinaryAlan/ai-atelier.git`。
+- 验证：新路径下 `Ran 189 tests — OK`；`core.storage.BASE_DIR` 解析为 `/Users/lc/Code/ai-atelier`；
+  `py_compile app.py` 通过；临时启动 `app.py` 后 `/api/system/status` 返回 200、
+  `cwd` 为 `/Users/lc/Code/ai-atelier`、`session_count` 为 3，随后立即关闭（未用 `run.sh start`，
+  避免沙箱进程随会话结束消失造成假故障）。
+- 已知保留项（不影响使用）：`.venv` 之外的 `data/sessions/*.json` 消息正文里仍有历史 `file://` 旧路径；
+  `.run/service.log` 是历史日志，含旧路径，已被 git 忽略；前端 `localStorage` 的键前缀仍是 `aim.`
+  （改前缀会让用户已保存的语言与面板布局重置，故不改）。
