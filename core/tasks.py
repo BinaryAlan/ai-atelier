@@ -395,6 +395,10 @@ ROLE_FILES = {
 # 全量历史既不必要也太贵，按主流 agent 的做法取「最近若干条 + 更早的摘要 + 产物指针」。
 CONTEXT_MAX_MSGS = 8
 CONTEXT_MSG_CHARS = 600
+# 最近一条成员产出单独放宽：用户常在它之后直接说「接着改」，砍掉它就等于让成员断片
+CONTEXT_LATEST_CHARS = 1600
+# 截断时尾部占比：方案/报告的结论几乎都在末尾，头尾都得留，尾部多分一点
+CONTEXT_TAIL_RATIO = 0.62
 CONTEXT_TOTAL_CHARS = 3000
 CONTEXT_SUMMARY_CHARS = 400
 
@@ -404,6 +408,25 @@ def _truncate(text: Any, limit: int) -> str:
     if len(text) <= limit:
         return text
     return text[:limit].rstrip() + "…"
+
+
+def _truncate_middle(
+    text: Any, limit: int, tail_ratio: float = CONTEXT_TAIL_RATIO
+) -> str:
+    """保留开头与结尾、砍中间，而不是只留开头。
+
+    成员产出（方案、报告、审核意见）的结论几乎都在末尾：「所以最终建议是 X」
+    「改完了，文件在 Y」。只截前面会让下一位成员看不到结论，于是要么重复劳动，
+    要么拿着开头自己猜。头尾都留，分界处用 `…` 标出来。
+    """
+    text = str(text or "").strip()
+    if len(text) <= limit:
+        return text
+    if limit < 8:  # 预算太小，头尾各留一点没有意义，退回只留开头
+        return _truncate(text, limit)
+    tail = int((limit - 1) * tail_ratio)
+    head = (limit - 1) - tail
+    return text[:head].rstrip() + "…" + text[-tail:].lstrip()
 
 
 def context_eligible(msg: Any) -> bool:
@@ -454,7 +477,10 @@ def build_context(
     picked: List[Dict[str, str]] = []
     total = 0
     for msg in reversed(before[-CONTEXT_MAX_MSGS:]):
-        content = _truncate(msg.get("content"), CONTEXT_MSG_CHARS)
+        is_member = msg.get("sender") not in ("user", "system")
+        # 最近一条成员产出放宽上限：用户常在它之后直接说「接着改」，砍掉就等于断片
+        limit = CONTEXT_LATEST_CHARS if (not picked and is_member) else CONTEXT_MSG_CHARS
+        content = _truncate_middle(msg.get("content"), limit)
         if picked and total + len(content) > CONTEXT_TOTAL_CHARS:
             break
         picked.append({
@@ -470,7 +496,7 @@ def build_context(
         # 复用成员已经产出过的内容当摘要，不额外调一次模型
         produced = [m for m in dropped if m.get("sender") not in ("user", "system")]
         if produced:
-            summary = _truncate(produced[-1].get("content"), CONTEXT_SUMMARY_CHARS)
+            summary = _truncate_middle(produced[-1].get("content"), CONTEXT_SUMMARY_CHARS)
     return {"messages": picked, "dropped": len(dropped), "summary": summary}
 
 

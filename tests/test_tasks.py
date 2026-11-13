@@ -1182,6 +1182,32 @@ class TestPromptContext(unittest.TestCase):
         # 用户原话仍然单独成段
         self.assertIn("【用户原话】\n接着做", prompt)
 
+    def test_truncation_keeps_both_ends(self):
+        """方案/报告的结论在末尾，截断必须头尾都留（只留开头会丢掉「所以结论是…」）。"""
+        body = "开头说明。" + "过程描述。" * 200 + "结论：建议采用 AI Atelier，已落盘。"
+        text = T._truncate_middle(body, 200)
+        self.assertLessEqual(len(text), 200)
+        self.assertTrue(text.startswith("开头说明"))
+        self.assertIn("结论：建议采用 AI Atelier，已落盘。", text)
+        self.assertIn("…", text)
+
+    def test_short_text_is_not_truncated(self):
+        self.assertEqual(T._truncate_middle("很短的一段", 600), "很短的一段")
+
+    def test_latest_member_output_gets_bigger_budget(self):
+        """最近一条成员产出放宽上限：用户常在它之后说「接着改」，砍掉就断片。"""
+        latest_body = "最新结论。" + "细" * 1200
+        older_body = "旧结论。" + "旧" * 1200
+        context = T.build_context([
+            self._msg(1, "emp_agy", older_body),
+            self._msg(2, "user", "再改改"),
+            self._msg(3, "emp_ds4", latest_body),
+        ])
+        by_name = {m["name"]: m["content"] for m in context["messages"]}
+        self.assertEqual(len(by_name["emp_ds4"]), len(latest_body))
+        self.assertLessEqual(len(by_name["emp_agy"]), T.CONTEXT_MSG_CHARS)
+        self.assertIn("旧结论", by_name["emp_agy"])
+
 
 class TestBusinessInvariants(TaskCase):
     """按业务不变量回归（business-code-review）：
