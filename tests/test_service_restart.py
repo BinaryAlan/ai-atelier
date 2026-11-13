@@ -112,12 +112,20 @@ class TestRestartEndpoint(unittest.TestCase):
     def test_schedules_restart_and_reports_log_path(self):
         with mock.patch.object(flask_app, "_schedule_exit") as schedule:
             r = self.client.post("/api/system/restart",
-                                 headers={"X-Meeting-Action": "1"})
+                                 headers={"X-Atelier-Action": "1"})
         self.assertEqual(r.status_code, 200)
         data = r.get_json()
         self.assertTrue(data["success"])
         self.assertTrue(data["log_file"].endswith("service.log"))
         schedule.assert_called_once_with("restart")
+
+    def test_legacy_meeting_header_also_accepted(self):
+        with mock.patch.object(flask_app, "_schedule_exit") as schedule:
+            r = self.client.post("/api/system/restart",
+                                 headers={"X-Meeting-Action": "1"})
+        self.assertEqual(r.status_code, 200)
+        data = r.get_json()
+        self.assertTrue(data["success"])
 
 
 if __name__ == "__main__":

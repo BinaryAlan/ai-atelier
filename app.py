@@ -615,7 +615,7 @@ def api_session_live(session_id):
     return jsonify({"streams": streaming.for_session(session_id)})
 
 
-# ----------------- Meeting Controls API -----------------
+# ----------------- Message & Task Controls API -----------------
 @app.route("/api/sessions/<session_id>/message", methods=["POST"])
 def api_send_message(session_id):
     if not is_valid_session_id(session_id):
@@ -750,12 +750,13 @@ def _find_message(session: dict, msg_id: str) -> Optional[dict]:
 _RELOADER_RESTART_CODE = 3
 
 # 这类接口能杀掉整个服务，必须挡住跨站表单提交：
-# 自定义请求头无法由 <form> 或跨域 JS 直接发出（会触发预检且本服务不返回 CORS 头）
-_ACTION_HEADER = "X-Meeting-Action"
+# 自定义请求头无法由 <form> 或跨域 JS 直接发出（会触发预检且本服务不返回 CORS 头）。
+# 兼容新命名 X-Atelier-Action 与历史命名 X-Meeting-Action
+_ACTION_HEADERS = ("X-Atelier-Action", "X-Meeting-Action")
 
 
 def _require_action_header() -> bool:
-    return request.headers.get(_ACTION_HEADER) == "1"
+    return any(request.headers.get(h) == "1" for h in _ACTION_HEADERS)
 
 
 def _prepare_shutdown(action: str = "shutdown") -> int:
@@ -934,7 +935,7 @@ if __name__ == "__main__":
     host = os.environ.get("HOST", "127.0.0.1")  # 默认仅绑定本地，杜绝局域网调试器暴露
     is_debug = os.environ.get("FLASK_DEBUG", "0") in ["1", "true"]
 
-    print(f"\n🚀 AI-Meeting（多 AI 协同任务工作台）启动中...")
+    print(f"\n🚀 AI Atelier（多 AI 协同任务工作台）启动中...")
     print(f"👉 访问地址: http://127.0.0.1:{port}")
     if is_debug:
         print(f"⚡ 开发模式：代码热重载已启用 (无交互调试器暴露，安全模式)")

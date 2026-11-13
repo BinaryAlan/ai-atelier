@@ -1,6 +1,6 @@
 <div align="center">
 
-# AI-Meeting
+# AI Atelier
 
 ### Multi-AI Task Workspace
 
@@ -19,7 +19,7 @@
 
 <br/>
 
-<img src="docs/demo-en.gif" alt="AI-Meeting demo: single-task result, collaborative task card, input/output inspector, file preview" width="880">
+<img src="docs/demo-en.gif" alt="AI Atelier demo: single-task result, collaborative task card, input/output inspector, file preview" width="880">
 
 <sub>The demo covers **both a single task and a collaborative task**. Each scene holds for ~3s and scrolling takes ~3s so nothing flashes by (51s total). All sessions, members, tasks and files shown are fictional sample data.</sub>
 
@@ -47,7 +47,7 @@
 
 ## 💡 What It Is
 
-AI-Meeting is a **local, single-user workspace for multiple AI agents**. In a chat session you hand a task to AI team members; they work in their roles, review each other, and deliver a final version. The point is not to produce meeting minutes — it is to let several AIs actually finish work. A run yields both a short explanation in chat and real files written into the workspace.
+AI Atelier is a **local, single-user workspace for multiple AI agents**. In a chat session you hand a task to AI team members; they work in their roles, review each other, and deliver a final version. The point is not to produce meeting minutes — it is to let several AIs actually finish work. A run yields both a short explanation in chat and real files written into the workspace.
 
 Three panes, no global control bar:
 
@@ -76,8 +76,8 @@ Members currently run as **local CLI subprocesses** (defaults assume `agy` / `co
 ### Install and run
 
 ```bash
-git clone https://github.com/BinaryAlan/ai-meeting.git
-cd ai-meeting
+git clone https://github.com/BinaryAlan/ai-atelier.git
+cd ai-atelier
 ./run.sh          # creates .venv, installs dependencies, starts the server
 ```
 
@@ -257,7 +257,7 @@ All **105 tests pass**, covering instruction parsing, queues and parallelism, th
 ## 📁 Repository Layout
 
 ```text
-ai-meeting/
+ai-atelier/
 ├── app.py                       # Flask app: endpoints, Host guard, static assets, cache policy
 ├── core/
 │   ├── tasks.py                 # Task state machine, per-member FIFO queues, context assembly, card builder

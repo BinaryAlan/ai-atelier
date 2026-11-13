@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>AI-Meeting · 多 AI 协同任务工作台</title>
+  <title>AI Atelier · 多 AI 协同任务工作台</title>
   <!-- 全部依赖本地化（static/vendor）：内网/断网也能用，不再依赖任何 CDN。
        版本变更时改这里的 ?v= 让浏览器丢掉旧缓存即可。 -->
   <script src="/static/vendor/tailwind.js?v=3.4.16"></script>
@@ -255,7 +255,7 @@
         <div class="flex items-center gap-2">
           <span class="text-2xl">🏛️</span>
           <div>
-            <h1 class="font-bold text-gray-900 leading-tight">AI-Meeting</h1>
+            <h1 class="font-bold text-gray-900 leading-tight">AI Atelier</h1>
             <p class="text-xs text-gray-500">{{ t('多 AI 协同任务工作台') }}</p>
           </div>
         </div>
@@ -558,6 +558,10 @@
                         <span v-if="liveForRow(msg.card, row).text" class="text-[10px] text-gray-400 font-mono">{{ liveForRow(msg.card, row).chars || 0 }} {{ t('字') }}</span>
                       </div>
                       <div v-if="liveForRow(msg.card, row).text" class="stream-live text-gray-500">{{ liveTail(liveForRow(msg.card, row).text) }}<span class="typing-caret"></span></div>
+                      <!-- 与聊天气泡一致：这一段没出新字时也给个跳动的点 -->
+                      <div class="mt-0.5 flex items-center leading-none text-blue-500/70">
+                        <span class="thinking-dots" aria-hidden="true"><i></i><i></i><i></i></span>
+                      </div>
                     </div>
                     <div
                       v-else-if="briefLivePlaceholder(row)"
@@ -735,6 +739,11 @@
                     <span v-if="liveForMsg(msg).text" class="text-[10px] text-gray-400 font-mono">{{ liveForMsg(msg).chars || 0 }} {{ t('字') }}</span>
                   </div>
                   <div v-if="liveForMsg(msg).text" class="stream-live text-gray-600">{{ liveTail(liveForMsg(msg).text) }}<span class="typing-caret"></span></div>
+                  <!-- 底部三个跳动的点：即使这一秒没有新字符（模型在想事 / 在读文件），
+                       也能看到「还在推进」，不会让人以为卡死 -->
+                  <div class="mt-0.5 flex items-center leading-none text-blue-500/80">
+                    <span class="thinking-dots" aria-hidden="true"><i></i><i></i><i></i></span>
+                  </div>
                 </div>
                 <!-- 单任务结果消息：模型还没回内容时，气泡里给出「正在思考中」提示，
                      顶部（行 540 附近）同步实时计时，让人知道这一轮在跑、跑了多久 -->
@@ -1106,9 +1115,26 @@
             </div>
           </div>
 
-          <!-- 会话成员名单 -->
+          <!-- 会话成员名单：默认一个都不选，右侧提供全选 / 反选 -->
           <div>
-            <label class="block text-xs font-semibold text-gray-600 mb-1.5">{{ t('会话成员名单:') }}</label>
+            <div class="flex items-center justify-between gap-2 mb-1.5">
+              <label class="block text-xs font-semibold text-gray-600">{{ t('会话成员名单:') }}</label>
+              <div class="flex items-center gap-1.5 shrink-0">
+                <span class="text-[10px] text-gray-400 whitespace-nowrap">
+                  {{ t('已选') }} {{ newSessionForm.employee_ids.length }}/{{ availableEmployees.length }}
+                </span>
+                <button
+                  type="button"
+                  @click="selectAllNewSessionMembers()"
+                  class="px-2 py-1 text-[11px] leading-none border border-gray-300 rounded-md bg-white text-gray-600 hover:bg-gray-100 transition"
+                >{{ t('全选') }}</button>
+                <button
+                  type="button"
+                  @click="invertNewSessionMembers()"
+                  class="px-2 py-1 text-[11px] leading-none border border-gray-300 rounded-md bg-white text-gray-600 hover:bg-gray-100 transition"
+                >{{ t('反选') }}</button>
+              </div>
+            </div>
             <div class="space-y-1.5 max-h-48 overflow-y-auto">
               <div class="grid grid-cols-2 gap-2">
                 <label
@@ -1985,7 +2011,7 @@
 
   </div>
 
-  <script src="/static/js/i18n.js?v=20261113r2"></script>
-  <script src="/static/js/app.js?v=20261113r2"></script>
+  <script src="/static/js/i18n.js?v=20261113r5"></script>
+  <script src="/static/js/app.js?v=20261113r5"></script>
 </body>
 </html>

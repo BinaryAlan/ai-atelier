@@ -1,6 +1,6 @@
 #!/bin/bash
 # -------------------------------------------------------------
-# AI-Meeting 服务管理脚本
+# AI Atelier 服务管理脚本
 #
 #   ./run.sh            同 ./run.sh start
 #   ./run.sh start      前台启动（正常使用，默认不开热重载）
@@ -20,7 +20,7 @@ PID_FILE=".run/app.pid"
 SERVICE_LOG=".run/service.log"
 
 # 这类接口能杀掉整个服务，必须带确认头（与前端一致，防跨站表单误触发）
-ACTION_HEADER="X-Meeting-Action: 1"
+ACTION_HEADER="X-Atelier-Action: 1"
 
 # 依赖目录：优先使用项目内 .venv，避免污染系统 Python（PEP 668 环境会拒绝全局 pip install）
 VENV_DIR=".venv"
@@ -178,7 +178,7 @@ do_start() {
     echo "$$" > "$PID_FILE"
 
     echo "=========================================================="
-    echo "🚀 正在启动 AI-Meeting（多 AI 协同任务工作台）..."
+    echo "🚀 正在启动 AI Atelier（多 AI 协同任务工作台）..."
     echo "🌐 访问地址: ${BASE}"
     echo "🛠️  命令行管理: ./run.sh status | ./run.sh restart | ./run.sh stop"
     echo "按 Ctrl+C 停止服务"

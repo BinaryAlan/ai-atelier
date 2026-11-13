@@ -2491,6 +2491,22 @@ class TaskManager:
                         touched = True
                     if touched:
                         self._add_flow(task, "服务重启，进行中的环节已取消，可重试")
+                        # 结果消息必须一起转终态：只改任务不改消息，气泡会永远停在
+                        # 「正在思考中」——界面是按任务状态判断还要不要继续轮询的，
+                        # 任务一终态就停止轮询，那条空消息再没人更新，只能刷新页面
+                        if task.get("result_msg_id") and task.get("status") == STATUS_CANCELLED:
+                            msg = next(
+                                (m for m in session.get("messages") or []
+                                 if isinstance(m, dict) and m.get("id") == task["result_msg_id"]),
+                                None,
+                            )
+                            if msg and msg.get("status") in (
+                                STATUS_QUEUED, STATUS_RUNNING, MEMBER_WAITING, MEMBER_IN_PROGRESS,
+                            ):
+                                patch: Dict[str, Any] = {"status": STATUS_CANCELLED}
+                                if not str(msg.get("content") or "").strip():
+                                    patch["content"] = "已取消（服务重启，进程已终止）"
+                                self._update_message(session, task["result_msg_id"], patch)
                         self._update_card(session, task)
                         changed = True
                 if changed:

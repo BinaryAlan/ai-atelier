@@ -371,9 +371,16 @@ createApp({
         if (a.status === "in_progress" || a.final_status === "in_progress") return true;
         return (t.part_b || []).some(i => i && i.status === "in_progress");
       };
-      return Object.values(tasks).some(t => t && (
+      if (Object.values(tasks).some(t => t && (
         t.status === "running" || t.status === "queued" || inflight(t)
-      ));
+      ))) return true;
+      // 还有一种「任务已终态、气泡却还挂着」的组合：任务被别的进程（服务重启恢复、
+      // 另一个实例点了取消）改了状态，落库时没同步到结果消息。只看任务状态的话轮询会
+      // 立刻停掉，气泡永远停在「正在思考中」，只能刷新页面才看到结果——正是这个坑。
+      return (this.currentSession?.messages || []).some(
+        m => m && m.kind === "task_result"
+          && (m.status === "running" || m.status === "queued")
+      );
     },
     // 输入时的 /collab 校验：交给服务端 /api/collab/validate，前后端用同一套解析。
     // 本地再写一套「谁被 @ 了」的判断必然会和 Python 那边越走越偏（现在已支持
@@ -1133,7 +1140,7 @@ createApp({
     applyLanguage() {
       const en = this.lang === "en";
       document.documentElement.setAttribute("lang", en ? "en" : "zh-CN");
-      document.title = en ? "AI-Meeting · Multi-AI Task Workspace" : "AI-Meeting · 多 AI 协同任务工作台";
+      document.title = en ? "AI Atelier · Multi-AI Task Workspace" : "AI Atelier · 多 AI 协同任务工作台";
       try { localStorage.setItem("aim.lang", this.lang); } catch (e) { /* 隐私模式忽略 */ }
     },
     async setLanguage(lang) {
@@ -1456,9 +1463,21 @@ createApp({
       this.newSessionForm = {
         title: "",
         workspace_dir: defaultDir,
-        employee_ids: this.availableEmployees.map(e => e.id)
+        // 默认一位成员都不选：新建会话要显式挑人，需要批量时用右侧「全选 / 反选」
+        employee_ids: []
       };
       this.showNewSessionModal = true;
+    },
+
+    // 新建会话成员的批量操作：只作用于当前弹窗，不碰已有会话
+    selectAllNewSessionMembers() {
+      this.newSessionForm.employee_ids = this.availableEmployees.map(e => e.id);
+    },
+    invertNewSessionMembers() {
+      const picked = new Set(this.newSessionForm.employee_ids || []);
+      this.newSessionForm.employee_ids = this.availableEmployees
+        .map(e => e.id)
+        .filter(id => !picked.has(id));
     },
 
     async confirmCreateSession() {
@@ -2517,7 +2536,7 @@ createApp({
       try {
         await fetch("/api/system/restart", {
           method: "POST",
-          headers: { "X-Meeting-Action": "1" }
+          headers: { "X-Atelier-Action": "1", "X-Meeting-Action": "1" }
         });
       } catch (e) {
         // 连接被切断属于预期：服务正在退出
@@ -2544,7 +2563,7 @@ createApp({
       try {
         await fetch("/api/system/shutdown", {
           method: "POST",
-          headers: { "X-Meeting-Action": "1" }
+          headers: { "X-Atelier-Action": "1", "X-Meeting-Action": "1" }
         });
       } catch (e) {
         // 同上

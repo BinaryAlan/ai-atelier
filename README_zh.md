@@ -1,6 +1,6 @@
 <div align="center">
 
-# AI-Meeting
+# AI Atelier
 
 ### 多 AI 协同任务工作台
 
@@ -19,7 +19,7 @@
 
 <br/>
 
-<img src="docs/demo.gif" alt="AI-Meeting 演示：单任务结果消息、协助任务卡片、输入输出弹窗、文件预览" width="880">
+<img src="docs/demo.gif" alt="AI Atelier 演示：单任务结果消息、协助任务卡片、输入输出弹窗、文件预览" width="880">
 
 <sub>演示动图同时包含**单任务**与**协助任务**；为方便阅读，每个场景停留约 3 秒、滚动用约 3 秒走完（全片 51 秒）。画面中的会话、成员、任务与文件均为虚构示例。</sub>
 
@@ -47,7 +47,7 @@
 
 ## 💡 这是什么
 
-AI-Meeting 是一个**跑在本机的单用户多 AI 工作台**。你在一个会话里把任务交给 AI 团队成员，成员按角色分工完成工作、互相审核、交付终版。软件的目的不是生成一份「会议纪要」，而是让几个 AI 真正把活干完：结果既包括聊天里的说明，也包括它们写进工作目录的文件。
+AI Atelier 是一个**跑在本机的单用户多 AI 工作台**。你在一个会话里把任务交给 AI 团队成员，成员按角色分工完成工作、互相审核、交付终版。软件的目的不是生成一份「会议纪要」，而是让几个 AI 真正把活干完：结果既包括聊天里的说明，也包括它们写进工作目录的文件。
 
 界面只有三栏，没有全局控制条：
 
@@ -76,8 +76,8 @@ AI-Meeting 是一个**跑在本机的单用户多 AI 工作台**。你在一个�
 ### 安装与运行
 
 ```bash
-git clone https://github.com/BinaryAlan/ai-meeting.git
-cd ai-meeting
+git clone https://github.com/BinaryAlan/ai-atelier.git
+cd ai-atelier
 ./run.sh          # 自动创建 .venv、安装依赖、启动服务
 ```
 
@@ -257,7 +257,7 @@ CLI 子进程使用**环境变量白名单**启动：宿主机注入的 `SERVER_
 ## 📁 目录结构
 
 ```text
-ai-meeting/
+ai-atelier/
 ├── app.py                       # Flask 服务：接口、Host 守卫、静态资源与缓存策略
 ├── core/
 │   ├── tasks.py                 # 任务状态机、成员 FIFO 队列、上下文拼装、卡片构建

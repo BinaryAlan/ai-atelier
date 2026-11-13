@@ -947,6 +947,28 @@ class TestRecoveryAndProtocol(TaskCase):
         self.assertEqual(task["status"], T.STATUS_CANCELLED)
         self.assertTrue(any("重启" in f["text"] for f in task["flow"]))
 
+    def test_recover_syncs_result_message_status(self):
+        """恢复时任务转了已取消，结果消息也必须跟着转，否则气泡永远停在「正在思考中」。"""
+        session = self.store.get_session("s1")
+        session["messages"].append({
+            "id": "m_res", "sender": "emp_agy", "sender_name": "agy",
+            "content": "", "kind": "task_result", "status": T.STATUS_RUNNING,
+            "task_id": "t_run", "in_chat": True, "created_at": int(time.time()),
+        })
+        session["tasks"]["t_run"] = {
+            "task_id": "t_run", "type": T.TYPE_SINGLE, "status": T.STATUS_RUNNING,
+            "owner_id": "emp_agy", "card_msg_id": "", "result_msg_id": "m_res",
+            "flow": [], "part_a": {"status": T.MEMBER_IN_PROGRESS}, "part_b": [],
+        }
+        session["task_queues"] = {}
+        session["active_task_id"] = None
+        self.store.save_session(session)
+
+        self.assertEqual(self.manager.recover_on_startup(), 1)
+        msg = next(m for m in self.store.get_session("s1")["messages"] if m["id"] == "m_res")
+        self.assertEqual(msg["status"], T.STATUS_CANCELLED)
+        self.assertIn("重启", msg["content"])
+
     def test_old_sessions_get_task_fields(self):
         session = self.store.get_session("s1")
         del session["tasks"]
@@ -962,7 +984,7 @@ class TestRecoveryAndProtocol(TaskCase):
             T.STAGE_REVIEW, "写方案", T.TYPE_COLLAB,
             artifacts=[{"path": "a.md", "summary": "正文", "bytes": 10}],
         )
-        self.assertIn("AI-Meeting 协作流程", prompt)
+        self.assertIn("AI Atelier 协作流程", prompt)
         self.assertIn("协助审核成员", prompt)
         self.assertIn("写方案", prompt)
         self.assertIn("a.md", prompt)

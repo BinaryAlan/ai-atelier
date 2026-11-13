@@ -1,7 +1,7 @@
-# AI-Meeting 任务系统 · 验收标准与核对表
+# AI Atelier 任务系统 · 验收标准与核对表
 
-对应规格：`docs/task-review-protocol.md`。验收范围是软件的最终形态：任务系统行为，以及旧圆桌代码、
-旧接口、旧数据、旧设置字段和旧界面文案是否清除干净。规格文档本身不改动。
+> 项目原名 AI-Meeting。对应规格：`docs/task-review-protocol.md`。验收范围是软件的最终形态：任务系统行为，以及旧圆桌代码、
+旧接口、旧数据、旧设置字段和旧界面文案是否清除干净；A81 为项目重命名验收项。规格文档本身不改动。
 
 ## 验证方式
 
@@ -804,3 +804,76 @@ agy（单任务）结果消息头部的耗时此前两种显示不一致：运�
   `/static/js/app.js?v=20261113r2` 返回 200 且包含新方法。
 - 边界：`@agy` 仍不匹配（别名随名字变化，现为 `gemini 3.8` / `emp_agy` / 括号短名）。
   按用户意愿不动别名与配置，需要时自行改名或写成 `gemini 3.8 (agy)`。
+
+## A79 · 新建会话成员默认全不勾选，右侧提供全选 / 反选
+
+- 现象：新建会话弹窗一打开就把 `availableEmployees` 全部塞进 `employee_ids`，
+  每次都要先手动取消不需要的成员。
+- 修法：
+  - `openNewSessionModal()` 的 `employee_ids` 改为 `[]`（`data` 初始态本来就是空）。
+  - 「会话成员名单」标题行右侧加「已选 N/M」计数与「全选」「反选」两个按钮；
+    `selectAllNewSessionMembers()` 取全部启用成员，`invertNewSessionMembers()`
+    取启用成员的补集，停用成员永远不入列；批量操作只作用于当前弹窗，不碰已有会话。
+  - `i18n.js` 补「已选 / 全选 / 反选」英文词条；`?v=` 升到 `20261113r3`。
+- 后端配合确认：`_clean_employee_ids([])` 返回 `[]`（不是 None），
+  `storage.create_session` 只在 `employee_ids is None` 时才回退默认启用名单 ——
+  所以「一位都不选」创建的会话确实是空成员，不会被偷偷全选；之后可在
+  「编辑会话配置」里补人。编辑会话弹窗保持原样（回显当前成员）。
+- 验证：`node --check` 两个 JS、`git diff --check`；Node `vm` 13 项交互全 PASS
+  （默认空、全选、全选后反选、空态反选、部分选中反选补集、停用成员排除、
+  创建请求体带 `employee_ids: []`、i18n 词条、Vue 模板编译）；全量 unittest OK；
+  线上 `/static/js/{app,i18n}.js?v=20261113r3` 均 200 且含新代码。
+
+## A80 · 气泡不再卡在「正在思考中」；流式块补动点；确认 agy 可流式
+
+- 现象（用户报的三条）：
+  1. 并发任务里 gemini-3.8 没有提前输出，怀疑不能流式；
+  2. 思考中的气泡里虽然有流式文本，但底部没有「正在思考中」后面那种会跳的点；
+  3. 「ai meeting重命名」会话里气泡一直停在「正在思考中」，刷新页面才看到结果。
+- 排查结论：
+  - **agy 能流式**。实测 `agy --model gemini-3.8-flash-high -p ... --output-format stream-json`
+    会按 `step_update.text_delta` 逐段吐字；执行器 `stream_flags()` 确实给它补了
+    `--output-format stream-json`，`{tid}:exec:{emp_id}` 与前端拼的 key 完全一致。
+    真正的差别是**首个字很晚**：`agy` 的思考 / 工具阶段一个字的 `text_delta` 都没有，
+    实测一句话任务 13.1 秒才出第一个字（带读文件的 29 秒任务里，前 24.8 秒全是
+    `phase=tool`）。用户看到的「只有 gemini 没提前输出」就是这个空窗。
+  - 气泡卡住的真因是**前端轮询提前停摆**：11:49:14 有进程执行了
+    `recover_on_startup()`（把 3 个 running 任务写成 cancelled，见 A79 末尾记录），
+    而 `hasActiveTasks` 只按任务状态判断「还要不要轮询」，任务一转终态轮询就停，
+    之后真实结果落库也没人取 → 只能刷新。`_run_single` 收尾时看到任务已 cancelled，
+    还把完成的结果一并标成已取消。
+- 修法：
+  - `static/js/app.js` `hasActiveTasks`：任务状态之外，再加一条「有 `task_result`
+    消息仍是 running / queued 就继续轮询」，把「任务终态、气泡没转」这种组合兜住。
+  - `core/tasks.py` `recover_on_startup()`：任务转已取消时，同步把结果消息也转成
+    cancelled，内容为空时补一句「已取消（服务重启，进程已终止）」—— 从源头消灭
+    「任务终态、消息还在 running」的不一致状态。
+  - `static/index.html`：聊天气泡的流式块与卡片简报的流式块底部各加一组
+    `thinking-dots`，这一秒没有新字符时也能看到还在推进；`?v=` 升到 `20261113r4`。
+  - 数据修复：`0ccb9ad6`（ai meeting重命名）3 条 + `6373f3ce` 1 条结果内容完整、
+    却被误标 cancelled 的任务改回 delivered（含结果消息状态），备份在
+    `.run/session-backup-20261113/`。
+- 验证：全量 `Ran 185 tests — OK`（新增 `test_recover_syncs_result_message_status`）；
+  Node `vm` 6 项 `hasActiveTasks` 场景 + 3 段模板编译 PASS（编译器要 stub
+  `document.createElement().children[0].getAttribute`，否则属性里的 `&&` 会
+  报 `undefined[0]`）；agy 端到端 live 快照 `t=4.5s chars=0` → `t=13.1s chars=24`，
+  任务 `delivered`、消息 `delivered`。
+- 已知限制：agy 没有 `--include-partial-messages` 之类的更细开关（`agy --help` 只有
+  `--output-format text|json|stream-json`），思考阶段注定无字可显示，只能靠
+  ⏱ 计时 + 动点维持「在跑」的观感。
+
+## A81 · 项目重命名为 AI Atelier（中文「AI 工坊」，ai-atelier）
+
+- 动机：原名 `AI-Meeting` 存在心智偏差（非讨论/会议工具，而是本机多 AI 任务执行与交付工坊）。
+  参考团队提案与建议，正式确定英文名称为 `AI Atelier`（短名/仓库名 `ai-atelier`），中文名称为 `AI 工坊`，保留副标题 `多 AI 协同任务工作台`（`Multi-AI Task Workspace`）。
+- 落地改动：
+  - 核心协议与注入 Prompt：`prompts/protocol/task-flow.md` 首行改为 `# AI Atelier 协作流程`；
+  - 联动测试断言：`tests/test_tasks.py` 第 987 行同步断言 `self.assertIn("AI Atelier 协作流程", prompt)`；
+  - Web 界面与元数据：`static/index.html` 标题与左栏 `h1` 改为 `AI Atelier`，更新静态资源版本号为 `?v=20261113r5`；`static/js/app.js` 语言切换 `document.title` 同步支持中英新名称；
+  - 启动与运维脚本：`app.py` 启动横幅更新为 `AI Atelier（多 AI 协同任务工作台）`；`run.sh` 脚本注释与启动回显同步更新；
+  - 跨站防护动作头：`app.py` 双向兼容 `X-Atelier-Action` 与 `X-Meeting-Action`，前端和 `run.sh` 升级为 `X-Atelier-Action`，`tests/test_service_restart.py` 补充新旧头双向覆盖用例；
+  - 文档与许可证：`README.md`、`README_zh.md`、`docs/task-review-protocol.md`、`LICENSE` 版权声明同步更新。
+- 验证：
+  - 全量 unittest 186 项测试全部通过（含新增兼容性测试）；
+  - `python3 -m py_compile app.py core/*.py` 语法检查 PASS；
+  - `node --check static/js/app.js && node --check static/js/i18n.js` 语法检查 PASS。
