@@ -641,16 +641,17 @@
                 :title="t('删除这条消息（删除后不再进入后续对话的上下文）')"
               >✕</button>
             </div>
-            <!-- 气泡头部 -->
-            <div v-if="msg.sender !== 'system'" class="flex items-center justify-between gap-3 mb-1 text-xs opacity-80">
-              <div class="flex items-center gap-1.5">
-                <span class="font-semibold">{{ displaySender(msg.sender_name) }}</span>
-                <span v-if="msg.kind === 'task_result'" class="px-1.5 py-0.2 rounded bg-emerald-100 text-emerald-800 font-bold text-[10px]">{{ t('任务结果') }}</span>
-                <span v-if="msg.created_at" class="text-[11px] opacity-70 font-mono shrink-0">{{ formatFlowTime(msg.created_at) }}</span>
+            <!-- 气泡头部：成员名较长（如 gemini-3.8）时整组换行，不把名字和标签拆成两行 -->
+            <div v-if="msg.sender !== 'system'" class="flex flex-wrap items-center justify-between gap-x-2 gap-y-1 mb-1 text-xs opacity-80">
+              <div class="flex items-center gap-1.5 shrink-0">
+                <span class="font-semibold whitespace-nowrap">{{ displaySender(msg.sender_name) }}</span>
+                <span v-if="msg.kind === 'task_result'" class="px-1.5 py-0.2 rounded bg-emerald-100 text-emerald-800 font-bold text-[10px] whitespace-nowrap">{{ t('任务结果') }}</span>
+                <span v-if="msg.created_at" class="text-[11px] opacity-70 font-mono shrink-0 whitespace-nowrap">{{ formatFlowTime(msg.created_at) }}</span>
+                <!-- 耗时跟着时间走，右侧只留操作按钮：名字长一点也不会把头部挤成两行 -->
+                <span v-if="msgElapsed(msg) !== ''" class="text-[11px] opacity-75 font-mono whitespace-nowrap">⏱ {{ msgElapsed(msg) }}</span>
               </div>
-              <div class="flex items-center gap-2">
-                <span v-if="msgElapsed(msg) !== ''" class="text-[11px] opacity-75 font-mono">⏱ {{ msgElapsed(msg) }}</span>
-                <span v-if="msg.kind === 'task_result' && queueHint(msg.task_id, msg.sender)" class="text-[11px] text-amber-600">
+              <div class="flex flex-wrap items-center justify-end gap-1 ml-auto">
+                <span v-if="msg.kind === 'task_result' && queueHint(msg.task_id, msg.sender)" class="text-[11px] text-amber-600 whitespace-nowrap">
                   ⏳ {{ queueHint(msg.task_id, msg.sender) }}
                 </span>
 
@@ -658,7 +659,7 @@
                 <button
                   v-if="canReplyMsg(msg)"
                   @click.stop="startReply(msg)"
-                  class="text-[10px] px-1.5 py-0.5 rounded bg-gray-50 text-gray-600 border border-gray-200 hover:bg-gray-100 transition shrink-0"
+                  class="text-[10px] px-1 py-0.5 rounded bg-gray-50 text-gray-600 border border-gray-200 hover:bg-gray-100 transition shrink-0"
                   :title="t('引用这条消息回复（发送后由该成员作答）')"
                 >💬 {{ t('回复') }}</button>
 
@@ -678,7 +679,7 @@
                 <button
                   v-if="msg.kind === 'task_result' && ['delivered', 'done'].includes(msg.status)"
                   @click.stop="retryTask(msg, 'exec')"
-                  class="text-[10px] px-1.5 py-0.5 rounded bg-blue-50 text-blue-700 border border-blue-200 hover:bg-blue-100 transition shrink-0"
+                  class="text-[10px] px-1 py-0.5 rounded bg-blue-50 text-blue-700 border border-blue-200 hover:bg-blue-100 transition shrink-0"
                   :title="t('按同一份输入重新生成这条回答')"
                 >🔄 {{ t('重新生成') }}</button>
 
@@ -2011,7 +2012,7 @@
 
   </div>
 
-  <script src="/static/js/i18n.js?v=20261113r5"></script>
-  <script src="/static/js/app.js?v=20261113r5"></script>
+  <script src="/static/js/i18n.js?v=20261113r6"></script>
+  <script src="/static/js/app.js?v=20261113r6"></script>
 </body>
 </html>

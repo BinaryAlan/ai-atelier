@@ -19,9 +19,9 @@
 
 <br/>
 
-<img src="docs/demo-en.gif" alt="AI Atelier demo: single-task result, collaborative task card, input/output inspector, file preview" width="880">
+<img src="docs/demo-en.gif" alt="AI Atelier demo: one message fanned out to three members, collaborative task card, input/output inspector, task details, file preview" width="880">
 
-<sub>The demo covers **both a single task and a collaborative task**. Each scene holds for ~3s and scrolling takes ~3s so nothing flashes by (51s total). All sessions, members, tasks and files shown are fictional sample data.</sub>
+<sub>The demo follows a real session: **one message fanned out to three members** (the last one is still writing), then a **/collab** three-stage card. Each scene holds for ~3s, scrolling takes ~4s, and scenes fade through a white cut for ~0.8s, so nothing flashes by (64s total). All sessions, members, tasks and files shown are fictional sample data.</sub>
 
 </div>
 
@@ -68,7 +68,7 @@ Members currently run as **local CLI subprocesses** (defaults assume `agy` / `co
 ### Prerequisites
 
 - **Python 3.8+** (developed and verified on 3.12)
-- At least one **local AI CLI** that accepts a prompt; configure its command template under Settings → Members
+- At least one **local AI CLI** that accepts a prompt; Settings → Members → Add member scans installed CLIs and models and fills in the command template for you (it stays editable)
 
 > [!NOTE]
 > The only execution backend today is a local CLI subprocess. Remote model APIs are not wired up yet.
@@ -96,7 +96,7 @@ Open <http://127.0.0.1:5050>. On first run `run.sh` creates the virtual environm
 
 1. **⚙️ Settings → Members**: make sure at least two members are available;
 2. **＋ New session**: pick members and a workspace directory (members can read files there);
-3. Send `@agy Outline this material for me` (single task), or `/collab @agy @DS4 @HY4 Turn this material into an actionable plan` (collaborative task);
+3. Send `@gemini-3.8 Outline this material for me` (single task), or `/collab @gemini-3.8 @ds-4.1 @hy4-free Turn this material into an actionable plan` (collaborative task);
 4. A single task returns a result message; a collaborative task shows its card right in chat. Produced files appear on the right.
 
 ---
@@ -210,7 +210,19 @@ CLI subprocesses start with an **environment allow-list**: host-injected `SERVER
 
 ## ⚙️ Settings and Run Protocol
 
-Settings have exactly three parts: **Members** (name, avatar, persona, CLI template, write access, per-run timeout, bulk write-access toggle), **Interface language** (简体中文 / English, applied immediately), and **Service** (PID, uptime, active tasks, hot reload, one-click restart / shutdown).
+Settings have exactly three parts: **Members**, **Interface language** (简体中文 / English, applied immediately), and **Service** (PID, uptime, active tasks, hot reload, one-click restart / shutdown).
+
+**Members** decides which model a member runs and how it is invoked:
+
+| Field | What it does |
+| :--- | :--- |
+| Name / avatar / persona | Names may contain spaces (`gemini-3.8`), and `@`-mentions still resolve |
+| Model | Adding a member scans installed CLIs and their models; the dropdown is searchable and can be filtered to free models only |
+| Reasoning level | High / medium / low are not separate model entries — pick one after choosing the model; each CLI gets its own flag (`agy` variant, `--effort`, `-c model_reasoning_effort=`, `opencode --model id#level`) |
+| CLI template | Generated from the two fields above with a `{prompt}` placeholder; editable, but the binary must stay on the allow-list |
+| Write access / timeout | Write access is off by default; per-member timeout; bulk write-access toggle |
+
+A session can override this: click the members chip at the top of the chat, pick a member and change its reasoning level — **that override only applies to the current session** and never touches the member itself.
 
 A set of protocol texts ships with the app; the server adds them to a member's input to describe the current stage and expected output:
 
@@ -248,7 +260,7 @@ Built as a **local-first, single-user** tool:
 .venv/bin/python -m unittest discover -s tests -v
 ```
 
-All **105 tests pass**, covering instruction parsing, queues and parallelism, the three-stage flow, cancel / retry, auto-supplemented delivery, the four review standards, the `[通过]` verdict path and prompts rebuilt from the current protocol, restart recovery, read-only reviews, the CLI environment allow-list, message deletion and context, file-preview endpoints and HTTP APIs. Line-by-line verification is in the [acceptance record](docs/acceptance.md) (A1–A59); design detail lives in the [design notes](docs/task-review-protocol.md).
+All **189 tests pass**, covering instruction parsing (including spaced member names), queues and parallelism, the three-stage flow, cancel / retry, auto-supplemented delivery, the four review standards, the `[通过]` verdict path and prompts rebuilt from the current protocol, restart recovery with result-message status, read-only reviews, the CLI registry and command templates, the CLI environment allow-list, message deletion and context (long content keeps its head, tail and latest entry), file-preview endpoints and HTTP APIs. Line-by-line verification is in the [acceptance record](docs/acceptance.md) (A1–A83); design detail lives in the [design notes](docs/task-review-protocol.md).
 
 ---
 
@@ -263,12 +275,14 @@ ai-atelier/
 │   ├── tasks.py                 # Task state machine, per-member FIFO queues, context assembly, card builder
 │   ├── executor.py              # CLI subprocess, command/env allow-lists, timeout, cancellation
 │   ├── storage.py               # Atomic session/settings persistence
-│   └── scanner.py               # Local AI CLI / model discovery
+│   ├── cli_registry.py          # CLI registry: discovery, command template, write flags, env allow-list
+│   └── scanner.py               # Installed CLI / model discovery (cached)
 ├── prompts/
 │   ├── protocol/task-flow.md    # Collaboration flow protocol
 │   └── roles/                   # Single-task / owner / reviewer protocols
 ├── data/
 │   ├── settings.json            # Interface language and member list
+│   ├── scanned_models.json      # Cached CLI / model scan (git-ignored)
 │   └── sessions/                # Sessions, messages, tasks, queues (git-ignored)
 ├── static/
 │   ├── index.html               # Single-page UI
